@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "html5-qrcode": "^2.3.8",
+    "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.7.76",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
