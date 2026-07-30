@@ -1,0 +1,14 @@
+{
+  "name": "printnow-project",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Root convenience scripts only - each module (module1-student-app, module2-shop-dashboard, module3-backend, module5-admin, module6-print-agent) is still its own independent app with its own package.json/node_modules. This file just saves you from opening 5 terminals and running npm install/npm run dev in each one by hand.",
+  "scripts": {
+    "install:all": "npm --prefix module3-backend install && npm --prefix module1-student-app install && npm --prefix module2-shop-dashboard install && npm --prefix module5-admin install && npm --prefix module6-print-agent install",
+    "dev": "concurrently -n backend,student,shop,admin -c blue,green,yellow,magenta \"npm --prefix module3-backend run dev\" \"npm --prefix module1-student-app run dev\" \"npm --prefix module2-shop-dashboard run dev\" \"npm --prefix module5-admin run dev\"",
+    "dev:agent": "npm --prefix module6-print-agent start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

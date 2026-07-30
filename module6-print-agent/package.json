@@ -1,0 +1,27 @@
+{
+  "name": "printnow-print-agent",
+  "version": "1.0.0",
+  "description": "Local agent that polls a PrintNow shop's queue and auto-prints new jobs when the shop owner has Auto-print turned on.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "bin": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "build:win": "pkg . --targets node18-win-x64 --output dist/PrintNowAgent.exe"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  }
+}

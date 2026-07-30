@@ -1,0 +1,25 @@
+{
+  "name": "printnow-backend",
+  "version": "1.0.0",
+  "description": "Module 3 - Print Queue Backend API (Express + node:sqlite)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed:shop": "node scripts/seedShop.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.2.0",
+    "pg": "^8.22.0",
+    "uuid": "^14.0.1"
+  }
+}
