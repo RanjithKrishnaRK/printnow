@@ -10,6 +10,7 @@ const uploadsRouter = require('./routes/uploads');
 const landmarksRouter = require('./routes/landmarks');
 const adminRouter = require('./routes/admin');
 const studentsRouter = require('./routes/students');
+const convertRouter = require('./routes/convert');
 
 const app = express();
 
@@ -33,6 +34,7 @@ app.use('/api/uploads', uploadsRouter);
 app.use('/api/landmarks', landmarksRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/students', studentsRouter);
+app.use('/api/convert', convertRouter);
 
 // 404 fallback
 app.use((req, res) => {
