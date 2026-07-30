@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfjsWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { PDFDocument } from "pdf-lib";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
@@ -20,6 +21,27 @@ async function countPdfPages(file) {
   } catch (err) {
     return null;
   }
+}
+
+// Wraps a photo (JPEG/PNG) in a single-page PDF sized to the image itself,
+// entirely in the browser. This is the ONLY place that needs to know about
+// non-PDF uploads - once this runs, the resulting File is a completely
+// normal PDF, so the backend, the print agent, and countPdfPages above all
+// keep working exactly as they already do, with zero changes anywhere else
+// in the pipeline. Deliberately scoped to JPEG/PNG only: those are what
+// pdf-lib can embed directly. Some phone cameras (iPhone default) save as
+// HEIC instead of JPEG - HEIC isn't supported here, so a student on iOS
+// may need to pick "Most Compatible" format in their camera settings, or
+// take a screenshot of the photo instead (screenshots are always PNG).
+async function imageFileToPdfFile(file) {
+  const bytes = await file.arrayBuffer();
+  const pdfDoc = await PDFDocument.create();
+  const image = file.type === "image/png" ? await pdfDoc.embedPng(bytes) : await pdfDoc.embedJpg(bytes);
+  const page = pdfDoc.addPage([image.width, image.height]);
+  page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+  const pdfBytes = await pdfDoc.save();
+  const pdfName = file.name.replace(/\.[^.]+$/, "") + ".pdf";
+  return new File([pdfBytes], pdfName, { type: "application/pdf" });
 }
 
 /*
@@ -179,6 +201,16 @@ const mockApi = {
     await delay(400);
     return { fileUrl: `mock://files/${Date.now()}-${file?.name || "file.pdf"}` };
   },
+  async convertDocxToPdf(file) {
+    await delay(500);
+    // Mock mode has no LibreOffice to actually convert with, so just wrap
+    // the bytes as-is with a PDF content type - good enough for exercising
+    // the UI flow (loading state, error handling, downstream page count)
+    // without a backend. Real conversion only happens via realApi.
+    return new File([await file.arrayBuffer()], file.name.replace(/\.docx$/i, ".pdf"), {
+      type: "application/pdf",
+    });
+  },
   async createJob(shopId, body) {
     await delay(600);
     const jobId = `job_${mockJobCounter++}`;
@@ -278,6 +310,25 @@ const realApi = {
       throw new Error(body.error || "File upload failed");
     }
     return res.json(); // { fileUrl }
+  },
+  // Hits the isolated /api/convert/docx-to-pdf endpoint (LibreOffice
+  // headless server-side - see module3-backend/src/routes/convert.js) and
+  // returns a real PDF File so the rest of the upload flow never has to
+  // know the original was a .docx.
+  async convertDocxToPdf(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+    const res = await fetch(`${API_BASE_URL}/api/convert/docx-to-pdf`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not convert that document to PDF");
+    }
+    const pdfBlob = await res.blob();
+    const pdfName = file.name.replace(/\.docx$/i, "") + ".pdf";
+    return new File([pdfBlob], pdfName, { type: "application/pdf" });
   },
   async createJob(shopId, body) {
     const res = await fetch(`${API_BASE_URL}/api/shops/${shopId}/jobs`, {
@@ -492,6 +543,7 @@ function RecentOrders({ onOpen }) {
 function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBack }) {
   const { file, pages, copies, sides, colorMode, colorPages, phone, detectedPages } = order;
   const [detecting, setDetecting] = useState(false);
+  const [converting, setConverting] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState(null);
   const [shopInfo, setShopInfo] = useState(null);
@@ -524,9 +576,37 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
 
   async function handleFileChosen(chosenFile) {
     if (!chosenFile) return;
-    patch({ file: chosenFile, detectedPages: null });
+    let fileToUse = chosenFile;
+    const isDocx =
+      chosenFile.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      /\.docx$/i.test(chosenFile.name);
+    const isImage = chosenFile.type === "image/jpeg" || chosenFile.type === "image/png";
+
+    if (isDocx) {
+      setConverting(true);
+      setError(null);
+      try {
+        fileToUse = await api.convertDocxToPdf(chosenFile);
+      } catch (err) {
+        setConverting(false);
+        setError(err.message || "Could not convert that document. Try saving it as a PDF instead.");
+        return;
+      }
+      setConverting(false);
+    } else if (isImage) {
+      setDetecting(true);
+      try {
+        fileToUse = await imageFileToPdfFile(chosenFile);
+      } catch (err) {
+        setDetecting(false);
+        setError("Could not process that photo. Try a different photo, or choose a PDF instead.");
+        return;
+      }
+    }
+
+    patch({ file: fileToUse, detectedPages: null });
     setDetecting(true);
-    const count = await countPdfPages(chosenFile);
+    const count = await countPdfPages(fileToUse);
     setDetecting(false);
     if (count) {
       // Default the page count to the PDF's real page count, and cap manual
@@ -564,6 +644,7 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
     copies > 0 &&
     /^[6-9]\d{9}$/.test(phone.trim()) &&
     !uploading &&
+    !converting &&
     (colorMode !== "mixed" || (colorPages.trim() && !rangeError));
 
   function handlePagesChange(e) {
@@ -640,27 +721,34 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
 
       <div>
         <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-          Document (PDF only)
+          Document (PDF, Word, or photo)
         </label>
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 text-left text-sm shadow-sm shadow-stone-900/[0.03] active:bg-stone-50"
+          disabled={converting}
+          className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 text-left text-sm shadow-sm shadow-stone-900/[0.03] active:bg-stone-50 disabled:opacity-60"
         >
           <span className={file ? "font-medium text-stone-900" : "text-stone-400"}>
-            {file ? file.name : "Choose a PDF from your phone"}
+            {converting ? "Converting to PDF…" : file ? file.name : "Choose a PDF, Word doc, or photo"}
           </span>
           <span className="ml-3 shrink-0 rounded-md bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-50">
-            Browse
+            {converting ? "…" : "Browse"}
           </span>
         </button>
         <input
           ref={fileInputRef}
           type="file"
-          accept="application/pdf"
+          accept="application/pdf,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
           className="hidden"
+          disabled={converting}
           onChange={(e) => handleFileChosen(e.target.files?.[0] || null)}
         />
+        {converting && (
+          <p className="mt-1 text-[11px] text-stone-500">
+            Converting your Word document to PDF — usually just a few seconds…
+          </p>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -676,7 +764,7 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
             value={pages}
             onChange={handlePagesChange}
             placeholder={detecting ? "Reading PDF…" : "e.g. 12"}
-            disabled={detecting}
+            disabled={detecting || converting}
             className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none disabled:bg-stone-100"
           />
           <p className="mt-1 text-[11px] text-stone-500">
