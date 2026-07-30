@@ -1256,9 +1256,11 @@ function extractShopIdFromScan(text) {
 function QrScanner({ onScan, onClose }) {
   const containerId = "qr-reader";
   const scannerRef = useRef(null);
+  const hasScannedRef = useRef(false);
   const [error, setError] = useState(null);
 
   useEffect(() => {
+    hasScannedRef.current = false;
     const scanner = new Html5Qrcode(containerId);
     scannerRef.current = scanner;
     scanner
@@ -1266,8 +1268,17 @@ function QrScanner({ onScan, onClose }) {
         { facingMode: "environment" },
         { fps: 10, qrbox: { width: 240, height: 240 } },
         (decodedText) => {
-          scanner.stop().catch(() => {});
+          // fps:10 keeps feeding frames while stop() is still resolving, so
+          // a successful decode can fire again for the same code before the
+          // camera actually stops. Without this guard that second callback
+          // re-triggers onScan and races the screen transition, which is
+          // what made live scanning look like it "did nothing" - hand off
+          // on the first hit only, and don't block the transition on stop()
+          // resolving.
+          if (hasScannedRef.current) return;
+          hasScannedRef.current = true;
           onScan(decodedText);
+          scanner.stop().catch(() => {});
         },
         () => {} // per-frame decode misses are normal while aiming - ignore
       )
@@ -1527,6 +1538,28 @@ export default function App() {
       api.getJob(initialJobId).then((j) => setShopName(j.shopName)).catch(() => {});
     }
   }, [initialJobId]);
+
+  // Header reads shopName from here, but until now nothing set it when a
+  // shop was chosen via scan/upload/list/direct link - it only got set
+  // later, after a job existed. That's why the header was stuck on
+  // "Loading shop..." right after picking a shop. UploadStep already
+  // fetches shop info separately for its own pricing display; this just
+  // makes sure the header's copy of the name gets filled in too.
+  useEffect(() => {
+    if (!shopId) return;
+    let cancelled = false;
+    api
+      .getShopPublicInfo(shopId)
+      .then((info) => {
+        if (!cancelled && info?.name) setShopName(info.name);
+      })
+      .catch(() => {
+        // Non-fatal: header just keeps showing "Loading shop..." if this fails.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shopId]);
 
   // Give the very first screen a history entry to land on. Without this,
   // the first Back press (before any phase change ever pushed an entry)
