@@ -39,6 +39,7 @@ const { randomUUID } = require('crypto');
 const agentConfig = require('./config');
 const { runSetupWizard } = require('./setupWizard');
 const autostart = require('./autostart');
+const { splitIntoColorSegments } = require('./pdfSplit');
 
 const {
   SHOP_EMAIL: ENV_SHOP_EMAIL,
@@ -147,28 +148,19 @@ async function downloadJobFile(job) {
 }
 
 // Turns a job's settings into the placeholder values PRINT_COMMAND can use.
-// "mixed" color mode (some pages color, some b&w) has no reliable way to be
-// expressed as a single print-settings switch across arbitrary printer
-// drivers - there's no generic command-line option for "print pages 3,7,9
-// in color and the rest in b&w". Best-effort: treat it as "color" (so at
-// least the color pages come out right) and flag it loudly in the log, so
-// the shop owner knows to double check a mixed job rather than assuming
-// it's exactly right.
-function jobPrintPlaceholders(job) {
+// colorOverride lets a caller force "color"/"monochrome" regardless of
+// job.colorMode - used for "mixed" jobs, which get split into single-color
+// segments and printed one at a time (see printMixedJob below); each
+// segment passes its own override in here rather than job.colorMode, since
+// job.colorMode for a mixed job is just "mixed", not printer-usable.
+function jobPrintPlaceholders(job, colorOverride) {
   const copies = Math.max(1, parseInt(job.copies, 10) || 1);
   const duplex = job.sides === 'double' ? 'duplex' : 'simplex';
-  const color = job.colorMode === 'bw' ? 'monochrome' : 'color';
-  if (job.colorMode === 'mixed') {
-    log(
-      `⚠ Job ${job.jobId} is "mixed" color (specific pages: ${job.colorPages || '?'}) - ` +
-        `no generic print command can selectively color just those pages, so this will print ` +
-        `entirely in color. Worth a manual check against what the student actually wanted.`
-    );
-  }
+  const color = colorOverride || (job.colorMode === 'bw' ? 'monochrome' : 'color');
   return { copies, duplex, color };
 }
 
-function printFile(localPath, job) {
+function printFile(localPath, job, colorOverride) {
   return new Promise((resolve, reject) => {
     // {file} is substituted in, quoted, so paths with spaces don't break
     // the command. {copies}/{duplex}/{color} come from the job's actual
@@ -177,7 +169,7 @@ function printFile(localPath, job) {
     // understands (see .env.example for SumatraPDF/CUPS examples).
     // PRINT_COMMAND itself is trusted local config the shop owner sets in
     // their own .env - not user/network input.
-    const { copies, duplex, color } = jobPrintPlaceholders(job);
+    const { copies, duplex, color } = jobPrintPlaceholders(job, colorOverride);
     const command = PRINT_COMMAND.replace('{file}', `"${localPath}"`)
       .replace(/{copies}/g, String(copies))
       .replace(/{duplex}/g, duplex)
@@ -187,6 +179,58 @@ function printFile(localPath, job) {
       resolve(stdout);
     });
   });
+}
+
+// "Mixed" jobs (some pages color, some b&w) get split into contiguous
+// same-color runs (see pdfSplit.js) and each run is printed as its own
+// single-color print job, sequentially, in original page order - so the
+// physical output comes out of the tray already collated, instead of two
+// stacks (all color, all b&w) the shop owner would have to reassemble by
+// hand. Each segment is written to its own temp file and cleaned up after.
+//
+// Known limitation: PRINT_COMMAND is invoked once per segment, i.e. as N
+// separate print jobs. On a duplex ("double-sided") job, most drivers
+// start every print job on a fresh sheet, so a segment boundary that falls
+// mid-sheet (e.g. page 3 color / page 4 b&w, printed double-sided) will
+// leave page 3's back side blank rather than actually printing page 4 on
+// it - the output is still fully correct and in order, just on one extra
+// sheet of paper at each boundary. Flagged in the log below so the shop
+// owner isn't caught off guard; there's no generic fix for this without a
+// print driver that supports true mid-document media/tray switching.
+async function printMixedJob(localPath, job) {
+  const pdfBytes = await fs.readFile(localPath);
+  const segments = await splitIntoColorSegments(pdfBytes, job.colorPages, job.pages);
+
+  if (job.sides === 'double' && segments.length > 1) {
+    log(
+      `⚠ Job ${job.jobId} is "mixed" color AND double-sided - each of the ${segments.length} ` +
+        `color/b&w segments prints as its own job, so a segment boundary that falls mid-sheet ` +
+        `will use an extra sheet there (blank on one side) rather than continuing the duplex ` +
+        `pairing across colors. Page order and content will still be correct.`
+    );
+  }
+
+  const tempPaths = [];
+  try {
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const segPath = path.join(
+        TMP_DIR,
+        `${job.jobId}-seg${i}-${segment.color ? 'color' : 'bw'}-${randomUUID().slice(0, 8)}.pdf`
+      );
+      await fs.writeFile(segPath, segment.bytes);
+      tempPaths.push(segPath);
+      log(
+        `Printing job ${job.jobId} segment ${i + 1}/${segments.length}: pages ${segment.pages[0]}` +
+          `${segment.pages.length > 1 ? `-${segment.pages[segment.pages.length - 1]}` : ''} (${
+            segment.color ? 'color' : 'b&w'
+          })...`
+      );
+      await printFile(segPath, job, segment.color ? 'color' : 'monochrome');
+    }
+  } finally {
+    for (const p of tempPaths) fs.unlink(p).catch(() => {});
+  }
 }
 
 async function markPrinting(jobId) {
@@ -225,7 +269,11 @@ async function processJob(job) {
     log(`Requesting a printing slot for job ${job.jobId}...`);
     await markPrinting(job.jobId);
     log(`Slot granted - printing (${job.copies}x, ${job.sides}, ${job.colorMode})...`);
-    await printFile(localPath, job);
+    if (job.colorMode === 'mixed') {
+      await printMixedJob(localPath, job);
+    } else {
+      await printFile(localPath, job);
+    }
     log(`Done: job ${job.jobId}`);
   } catch (err) {
     if (err.hourlyCapReached) {
