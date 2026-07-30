@@ -1376,7 +1376,20 @@ function HomeStep({ onShopSelected, onMyOrders }) {
 
   function handleScan(decodedText) {
     setScanning(false);
-    onShopSelected(extractShopIdFromScan(decodedText));
+    try {
+      const id = extractShopIdFromScan(decodedText);
+      if (!id) {
+        setError("Scanned code didn't contain a shop ID. Try again or use \"choose by location\" below.");
+        return;
+      }
+      onShopSelected(id);
+    } catch (err) {
+      // Whatever went wrong here was previously invisible - the screen just
+      // stayed put with no clue why. Surface it so we can actually see the
+      // failure instead of guessing at it blind.
+      console.error("QR scan handling failed:", err);
+      setError(`Could not process that code: ${err?.message || "unknown error"}. Please screenshot this and send it over.`);
+    }
   }
 
   async function handleFileSelected(e) {
