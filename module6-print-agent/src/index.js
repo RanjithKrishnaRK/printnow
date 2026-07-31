@@ -160,20 +160,24 @@ function jobPrintPlaceholders(job, colorOverride) {
   return { copies, duplex, color };
 }
 
+function buildPrintCommand(localPath, job, colorOverride) {
+  // {file} is substituted in, quoted, so paths with spaces don't break
+  // the command. {copies}/{duplex}/{color} come from the job's actual
+  // settings (see jobPrintPlaceholders) - not every printer/tool supports
+  // all of these; only include the tokens your PRINT_COMMAND actually
+  // understands (see .env.example for SumatraPDF/CUPS examples).
+  // PRINT_COMMAND itself is trusted local config the shop owner sets in
+  // their own .env - not user/network input.
+  const { copies, duplex, color } = jobPrintPlaceholders(job, colorOverride);
+  return PRINT_COMMAND.replace('{file}', `"${localPath}"`)
+    .replace(/{copies}/g, String(copies))
+    .replace(/{duplex}/g, duplex)
+    .replace(/{color}/g, color);
+}
+
 function printFile(localPath, job, colorOverride) {
   return new Promise((resolve, reject) => {
-    // {file} is substituted in, quoted, so paths with spaces don't break
-    // the command. {copies}/{duplex}/{color} come from the job's actual
-    // settings (see jobPrintPlaceholders) - not every printer/tool supports
-    // all of these; only include the tokens your PRINT_COMMAND actually
-    // understands (see .env.example for SumatraPDF/CUPS examples).
-    // PRINT_COMMAND itself is trusted local config the shop owner sets in
-    // their own .env - not user/network input.
-    const { copies, duplex, color } = jobPrintPlaceholders(job, colorOverride);
-    const command = PRINT_COMMAND.replace('{file}', `"${localPath}"`)
-      .replace(/{copies}/g, String(copies))
-      .replace(/{duplex}/g, duplex)
-      .replace(/{color}/g, color);
+    const command = buildPrintCommand(localPath, job, colorOverride);
     exec(command, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr?.trim() || err.message));
       resolve(stdout);
@@ -374,7 +378,99 @@ async function resolveSettings({ forceSetup = false } = {}) {
   };
 }
 
+// --test-print support: lets the shop owner (or a dev) verify duplex/color
+// settings against their ACTUAL printer driver without needing a real
+// queued job from the backend - point it at any local PDF and the job
+// settings you want to test. This is the tool for the "does duplex/color
+// actually come out right on my printer" question, since that depends
+// entirely on hardware/driver behavior this project can't verify itself.
+//
+// Usage:
+//   node src/index.js --test-print ./sample.pdf --copies 2 --sides double --color bw
+//   node src/index.js --test-print ./sample.pdf --color mixed --color-pages 2,4-5 --dry-run
+//
+// --dry-run prints the exact command(s) that WOULD run, without executing
+// them - use this first to sanity-check placeholder substitution (right
+// copies/duplex/color words, right file path) before spending real paper.
+function parseTestPrintArgs(argv) {
+  const idx = argv.indexOf('--test-print');
+  if (idx === -1) return null;
+  const get = (flag, def) => {
+    const i = argv.indexOf(flag);
+    return i !== -1 && argv[i + 1] !== undefined ? argv[i + 1] : def;
+  };
+  return {
+    filePath: argv[idx + 1],
+    dryRun: argv.includes('--dry-run'),
+    job: {
+      jobId: 'test-print',
+      copies: get('--copies', '1'),
+      sides: get('--sides', 'single'), // single | double
+      colorMode: get('--color', 'color'), // color | bw | mixed
+      colorPages: get('--color-pages', ''), // only used when --color mixed
+      pages: null, // filled in below once the PDF is read
+    },
+  };
+}
+
+async function runTestPrint({ filePath, dryRun, job }) {
+  if (!filePath || filePath.startsWith('--')) {
+    fail(
+      'Usage: --test-print <path-to.pdf> [--copies N] [--sides single|double] ' +
+        '[--color color|bw|mixed] [--color-pages "2,4-5"] [--dry-run]'
+    );
+  }
+  const resolved = path.resolve(filePath);
+  let pdfBytes;
+  try {
+    pdfBytes = await fs.readFile(resolved);
+  } catch {
+    fail(`Could not read "${resolved}" - check the path.`);
+  }
+  const { PDFDocument } = require('pdf-lib');
+  job.pages = (await PDFDocument.load(pdfBytes)).getPageCount();
+  job.copies = Math.max(1, parseInt(job.copies, 10) || 1);
+
+  log(`--- Test print: ${resolved} (${job.pages} page${job.pages === 1 ? '' : 's'}) ---`);
+  log(
+    `Settings: copies=${job.copies} sides=${job.sides} color=${job.colorMode}` +
+      (job.colorMode === 'mixed' ? ` colorPages="${job.colorPages}"` : '')
+  );
+  log(`PRINT_COMMAND template: ${PRINT_COMMAND}`);
+  if (dryRun) log('(--dry-run: showing the command(s) that would run - nothing will actually print)');
+
+  if (job.colorMode === 'mixed') {
+    if (dryRun) {
+      const segments = await splitIntoColorSegments(pdfBytes, job.colorPages, job.pages);
+      segments.forEach((segment, i) => {
+        const label = `<segment ${i + 1}/${segments.length}: pages ${segment.pages[0]}${
+          segment.pages.length > 1 ? `-${segment.pages[segment.pages.length - 1]}` : ''
+        }, ${segment.color ? 'color' : 'b&w'}>`;
+        log(buildPrintCommand(label, job, segment.color ? 'color' : 'monochrome'));
+      });
+    } else {
+      await printMixedJob(resolved, job);
+    }
+  } else if (dryRun) {
+    log(buildPrintCommand(resolved, job));
+  } else {
+    await printFile(resolved, job);
+  }
+  log('--- Test print done ---');
+}
+
 async function main() {
+  const testPrintArgs = parseTestPrintArgs(process.argv);
+  if (testPrintArgs) {
+    // Deliberately skips resolveSettings()/login()/the poll loop entirely -
+    // this mode only needs PRINT_COMMAND (from .env, or --setup's saved
+    // config if present) and a local file, not a live shop session.
+    const saved = await agentConfig.readConfig().catch(() => null);
+    PRINT_COMMAND = ENV_PRINT_COMMAND || saved?.printCommand || DEFAULT_PRINT_COMMAND;
+    await runTestPrint(testPrintArgs);
+    return;
+  }
+
   const forceSetup = process.argv.includes('--setup');
   const settings = await resolveSettings({ forceSetup });
   SHOP_EMAIL = settings.shopEmail;

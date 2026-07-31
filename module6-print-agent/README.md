@@ -91,6 +91,33 @@ worth testing by hand first). These are advanced/optional overrides read
 from a `.env` file sitting next to the exe if you want to change them from
 their defaults; the shop login itself no longer goes through this file.
 
+## Testing duplex/color against your real printer
+
+`duplex`/`color` support is genuinely driver-dependent — some
+printers/drivers silently ignore one or both even with correct command
+syntax. Worth verifying on your actual hardware once, rather than assuming
+it works because the syntax looks right. You don't need a live queued job
+to test this — point the agent at any local PDF directly:
+
+```bash
+node src/index.js --test-print ./sample.pdf --copies 2 --sides double --color bw
+```
+
+Add `--dry-run` first to just print the exact command(s) that would run,
+without using any paper, so you can sanity-check the placeholder
+substitution before testing against the real printer:
+
+```bash
+node src/index.js --test-print ./sample.pdf --copies 2 --sides double --color mixed --color-pages "2,4-5" --dry-run
+```
+
+Then run it again without `--dry-run` and physically check the output:
+right number of copies, actually double-sided (not two single-sided
+stacks), and color/b&w pages matching what you asked for. If something's
+off, the driver is likely ignoring that setting — try `duplexlong` or
+`duplexshort` instead of `duplex` in `PRINT_COMMAND`, or check the
+printer's own default settings/driver version.
+
 ## Where the saved settings live
 
 `%APPDATA%\PrintNowAgent\config.json` on Windows (or
@@ -125,11 +152,15 @@ next launch.
 - **Windows has no single built-in print-from-command-line tool** the way
   Mac/Linux have `lp`/`lpr` via CUPS. See `.env.example` for the
   SumatraPDF command (recommended, confirmed working).
-- **"Mixed" color jobs (some pages color, some b&w) can't be selectively
-  printed this way.** There's no generic command-line switch for "print
-  pages 3, 7, 9 in color and the rest in b&w" across arbitrary printer
-  drivers — the agent logs a warning and prints the whole job in color for
-  that case specifically, rather than silently guessing wrong.
+- **"Mixed" color jobs (some pages color, some b&w)** are split into
+  contiguous color/b&w runs and printed as separate single-color jobs, back
+  to back, in original page order (see `src/pdfSplit.js`) — so the output
+  comes out of the tray already collated. One caveat: on a **double-sided**
+  mixed job, each run starts on a fresh sheet, so a color/b&w boundary that
+  falls mid-sheet costs one extra sheet there (blank on one side) rather
+  than continuing the duplex pairing across the color change. Content and
+  page order are still correct either way; the agent logs a warning when
+  this applies to a given job.
 - **If printing succeeds but the status-update call fails** (e.g. a brief
   network blip right after printing), the job stays `queued` and will be
   picked up and printed *again* next cycle. A duplicate physical print is
