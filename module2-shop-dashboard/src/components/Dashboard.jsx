@@ -5,9 +5,33 @@ import { triggerBuzzer, isMuted, setMuted } from "../buzzer";
 import { openFileAndPrint } from "../printHelper";
 import StatusTabs from "./StatusTabs";
 import JobCard from "./JobCard";
+import BatchCard from "./BatchCard";
 import ShopQrCode from "./ShopQrCode";
 
 const POLL_MS = 15000;
+
+// Groups an already-sorted job list into { batchId, jobs } entries: jobs
+// sharing a batchId collapse into one entry (rendered as BatchCard), jobs
+// with no batchId (the single-document flow, unchanged) each get their own
+// entry (batchId: null, rendered as JobCard). Preserves the original sort
+// order by using each group's first-seen position.
+function groupByBatch(jobs) {
+  const entries = [];
+  const batchIndex = new Map(); // batchId -> index into entries[]
+  for (const job of jobs) {
+    if (!job.batchId) {
+      entries.push({ batchId: null, jobs: [job] });
+      continue;
+    }
+    if (batchIndex.has(job.batchId)) {
+      entries[batchIndex.get(job.batchId)].jobs.push(job);
+    } else {
+      batchIndex.set(job.batchId, entries.length);
+      entries.push({ batchId: job.batchId, jobs: [job] });
+    }
+  }
+  return entries;
+}
 
 // NOTE on the contract: GET /api/jobs?status=queued is documented with one
 // example status. This dashboard needs queued+printing+ready counts visible
@@ -163,6 +187,38 @@ export default function Dashboard({
     }
   }
 
+  // Bulk-advance every document in a batch together. No new backend
+  // endpoint needed - PATCH /api/jobs/:jobId/status already works per-job,
+  // so this just loops it client-side (same call handleAdvance makes),
+  // rather than adding a batch-status-cascade endpoint for one button.
+  async function handleAdvanceAll(jobsInBatch, nextStatus) {
+    const batchId = jobsInBatch[0].batchId;
+    setUpdatingJobId(batchId); // reuse the same busy-state field, keyed by batchId here
+
+    setJobs((prev) =>
+      prev.map((j) => (j.batchId === batchId ? { ...j, status: nextStatus } : j))
+    );
+
+    if (nextStatus === "printing") {
+      for (const job of jobsInBatch) {
+        try {
+          await openFileAndPrint(job.fileUrl);
+        } catch (err) {
+          setError(err.message || "Could not open the print dialog automatically for one of the files.");
+        }
+      }
+    }
+
+    try {
+      await Promise.all(jobsInBatch.map((job) => updateJobStatus(job.jobId, token, nextStatus)));
+    } catch (err) {
+      setError(err.message || "Could not update all documents in this order.");
+      loadJobs(); // roll back to server truth on failure
+    } finally {
+      setUpdatingJobId(null);
+    }
+  }
+
   const counts = {
     queued: jobs.filter((j) => j.status === "queued").length,
     printing: jobs.filter((j) => j.status === "printing").length,
@@ -285,14 +341,23 @@ export default function Dashboard({
           </div>
         ) : (
           <div className="space-y-3">
-            {visibleJobs.map((job) => (
-              <JobCard
-                key={job.jobId}
-                job={job}
-                onAdvance={handleAdvance}
-                busy={updatingJobId === job.jobId}
-              />
-            ))}
+            {groupByBatch(visibleJobs).map((entry) =>
+              entry.batchId ? (
+                <BatchCard
+                  key={entry.batchId}
+                  jobs={entry.jobs}
+                  onAdvanceAll={handleAdvanceAll}
+                  busy={updatingJobId === entry.batchId}
+                />
+              ) : (
+                <JobCard
+                  key={entry.jobs[0].jobId}
+                  job={entry.jobs[0]}
+                  onAdvance={handleAdvance}
+                  busy={updatingJobId === entry.jobs[0].jobId}
+                />
+              )
+            )}
           </div>
         )}
       </main>

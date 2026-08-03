@@ -1,6 +1,7 @@
 // A single job rendered as a "ticket stub" - the colored left edge mirrors
 // the physical colored paper stubs shops already use, so status is readable
 // at a glance from across the counter.
+import PrintDetails from "./PrintDetails";
 
 const STATUS_EDGE = {
   queued: "border-l-queued",
@@ -50,29 +51,12 @@ export default function JobCard({ job, onAdvance, busy }) {
         </div>
 
         <div className="min-w-0">
-          <div className="flex items-center gap-2 text-sm text-ink font-medium">
-            <span className="font-mono">
-              {job.pages}p × {job.copies}
-            </span>
-            <span
-              className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                job.colorMode === "color" || job.colorMode === "mixed"
-                  ? "bg-printing/10 text-printing"
-                  : "bg-ink/10 text-ink"
-              }`}
-            >
-              {job.colorMode === "color"
-                ? "Color"
-                : job.colorMode === "mixed"
-                ? `Mixed (pg ${job.colorPages})`
-                : "B&W"}
-            </span>
-            {job.sides === "double" && (
-              <span className="text-xs px-1.5 py-0.5 rounded font-medium bg-ink/10 text-ink">
-                2-sided
-              </span>
-            )}
-          </div>
+          <PrintDetails job={job} />
+          {job.fileName && (
+            <div className="text-xs text-ink/70 truncate mt-0.5" title={job.fileName}>
+              {job.fileName}
+            </div>
+          )}
           <div className="text-xs text-collected mt-0.5">
             {STATUS_LABEL[job.status]} · {timeAgo(job.createdAt)}
           </div>

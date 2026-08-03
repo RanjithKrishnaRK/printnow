@@ -44,6 +44,42 @@ async function imageFileToPdfFile(file) {
   return new File([pdfBytes], pdfName, { type: "application/pdf" });
 }
 
+// Runs the same docx-conversion / image-to-PDF / page-detection pipeline
+// UploadStep always ran for its single file, but as a standalone function so
+// it can be called once per document when a student adds several files at
+// once. Throws with a user-facing message on failure; caller decides how to
+// surface it (which document card gets the error).
+async function processChosenFile(chosenFile) {
+  let fileToUse = chosenFile;
+  const isDocx =
+    chosenFile.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    /\.docx$/i.test(chosenFile.name);
+  const isImage = chosenFile.type === "image/jpeg" || chosenFile.type === "image/png";
+
+  if (isDocx) {
+    try {
+      fileToUse = await api.convertDocxToPdf(chosenFile);
+    } catch (err) {
+      throw new Error(err.message || "Could not convert that document. Try saving it as a PDF instead.");
+    }
+  } else if (isImage) {
+    try {
+      fileToUse = await imageFileToPdfFile(chosenFile);
+    } catch (err) {
+      throw new Error("Could not process that photo. Try a different photo, or choose a PDF instead.");
+    }
+  }
+
+  const detectedPages = await countPdfPages(fileToUse);
+  return { file: fileToUse, detectedPages };
+}
+
+let docIdCounter = 0;
+function makeDocId() {
+  docIdCounter += 1;
+  return `doc_${Date.now()}_${docIdCounter}`;
+}
+
 /*
   ============================================================================
   MODULE 1 — STUDENT-FACING APP
@@ -278,6 +314,104 @@ const mockApi = {
         createdAt: j.createdAt,
       }));
   },
+  // Multi-document upload: one combined payment/token for several documents,
+  // each keeping its own pages/copies/color/sides. Mirrors createJob/payJob/
+  // getJob's shape but for a batch - see the real backend's
+  // routes/batches.js for the authoritative version this stands in for.
+  async createBatch(shopId, body) {
+    await delay(700);
+    const batchId = `batch_${mockJobCounter++}`;
+    const documents = body.documents.map((doc) => {
+      const jobId = `job_${mockJobCounter++}`;
+      const job = {
+        jobId,
+        shopId,
+        batchId,
+        shopName: "Sharma Xerox & Print Center",
+        status: "uploaded",
+        amountDue: doc.amountDueEstimate,
+        tokenNumber: null,
+        createdAt: new Date().toISOString(),
+        studentPhone: body.studentPhone,
+        ...doc,
+      };
+      mockDb.set(jobId, job);
+      return { jobId, fileName: doc.fileName, amountDue: job.amountDue };
+    });
+    const amountDue = documents.reduce((sum, d) => sum + d.amountDue, 0);
+    mockDb.set(batchId, {
+      batchId,
+      isBatch: true,
+      shopId,
+      shopName: "Sharma Xerox & Print Center",
+      status: "uploaded",
+      amountDue,
+      tokenNumber: null,
+      documentJobIds: documents.map((d) => d.jobId),
+      studentPhone: body.studentPhone,
+      createdAt: new Date().toISOString(),
+    });
+    return { batchId, amountDue, status: "uploaded", documents };
+  },
+  async payBatch(batchId) {
+    await delay(700);
+    const batch = mockDb.get(batchId);
+    if (!batch || !batch.isBatch) throw new Error("Batch not found");
+    batch.status = "paid";
+    batch.tokenNumber = String(Math.floor(100 + Math.random() * 800));
+    batch.paidAt = Date.now();
+    for (const jobId of batch.documentJobIds) {
+      const job = mockDb.get(jobId);
+      if (job) {
+        job.status = "paid";
+        job.tokenNumber = batch.tokenNumber;
+      }
+    }
+    mockDb.set(batchId, batch);
+    return { batchId, status: "paid", tokenNumber: batch.tokenNumber };
+  },
+  async getBatch(batchId) {
+    await delay(350);
+    const batch = mockDb.get(batchId);
+    if (!batch || !batch.isBatch) throw new Error("Batch not found");
+    if (batch.paidAt) {
+      const s = (Date.now() - batch.paidAt) / 1000;
+      if (s > 24) batch.status = "ready";
+      else if (s > 14) batch.status = "printing";
+      else if (s > 5) batch.status = "queued";
+      for (const jobId of batch.documentJobIds) {
+        const job = mockDb.get(jobId);
+        if (job) job.status = batch.status;
+      }
+    }
+    const documents = batch.documentJobIds
+      .map((jobId) => {
+        const job = mockDb.get(jobId);
+        return (
+          job && {
+            jobId: job.jobId,
+            fileName: job.fileName,
+            pages: job.pages,
+            copies: job.copies,
+            colorMode: job.colorMode,
+            colorPages: job.colorPages,
+            sides: job.sides,
+            amountDue: job.amountDue,
+            status: job.status,
+          }
+        );
+      })
+      .filter(Boolean);
+    return {
+      batchId: batch.batchId,
+      status: batch.status,
+      tokenNumber: batch.tokenNumber,
+      shopName: batch.shopName,
+      amountDue: batch.amountDue,
+      createdAt: batch.createdAt,
+      documents,
+    };
+  },
 };
 
 const realApi = {
@@ -362,6 +496,33 @@ const realApi = {
     }
     return res.json();
   },
+  // Multi-document upload — see module3-backend/src/routes/batches.js.
+  async createBatch(shopId, body) {
+    const res = await fetch(`${API_BASE_URL}/api/shops/${shopId}/batches`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || "Could not create order");
+    }
+    return res.json(); // { batchId, amountDue, status, documents }
+  },
+  async payBatch(batchId, paymentRef) {
+    const res = await fetch(`${API_BASE_URL}/api/batches/${batchId}/payment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paymentRef }),
+    });
+    if (!res.ok) throw new Error("Payment failed");
+    return res.json(); // { batchId, status, tokenNumber }
+  },
+  async getBatch(batchId) {
+    const res = await fetch(`${API_BASE_URL}/api/batches/${batchId}`);
+    if (!res.ok) throw new Error("Could not fetch order");
+    return res.json(); // { batchId, status, tokenNumber, shopName, amountDue, createdAt, documents }
+  },
 };
 
 const api = MOCK_MODE ? mockApi : realApi;
@@ -376,18 +537,27 @@ function getParam(name) {
 // the browser or a phone's hardware Back button pops one in-app screen at a
 // time via popstate (handled in App below), instead of exiting the SPA -
 // which is what was showing up as "back reloads the page".
-function pushPhase(phase, { shopId, jobId } = {}) {
+function pushPhase(phase, { shopId, jobId, batchId } = {}) {
   const url = new URL(window.location.href);
   shopId ? url.searchParams.set("shopId", shopId) : url.searchParams.delete("shopId");
   jobId ? url.searchParams.set("jobId", jobId) : url.searchParams.delete("jobId");
-  window.history.pushState({ phase, shopId: shopId || null, jobId: jobId || null }, "", url.toString());
+  batchId ? url.searchParams.set("batchId", batchId) : url.searchParams.delete("batchId");
+  window.history.pushState(
+    { phase, shopId: shopId || null, jobId: jobId || null, batchId: batchId || null },
+    "",
+    url.toString()
+  );
 }
-function rememberJob(jobId, shopId, label) {
+// kind: "job" | "batch" — a batch is a multi-document order, id is its
+// batchId. Stored under the same localStorage key as before (back-compat:
+// old entries have `jobId` but no `kind`/`id`; getRecentJobs() below
+// normalizes both shapes to { id, kind }).
+function rememberOrder(id, shopId, label, kind = "job") {
   try {
     const raw = window.localStorage.getItem("printq_jobs");
     const jobs = raw ? JSON.parse(raw) : [];
-    const filtered = jobs.filter((j) => j.jobId !== jobId);
-    filtered.unshift({ jobId, shopId, label, savedAt: Date.now() });
+    const filtered = jobs.filter((j) => (j.id || j.jobId) !== id);
+    filtered.unshift({ id, shopId, label, kind, savedAt: Date.now() });
     window.localStorage.setItem("printq_jobs", JSON.stringify(filtered.slice(0, 6)));
   } catch (e) {
     // localStorage unavailable — non-fatal
@@ -396,7 +566,13 @@ function rememberJob(jobId, shopId, label) {
 function getRecentJobs() {
   try {
     const raw = window.localStorage.getItem("printq_jobs");
-    return raw ? JSON.parse(raw) : [];
+    const jobs = raw ? JSON.parse(raw) : [];
+    return jobs.map((j) => ({
+      id: j.id || j.jobId,
+      shopId: j.shopId,
+      label: j.label,
+      kind: j.kind || "job",
+    }));
   } catch (e) {
     return [];
   }
@@ -525,11 +701,11 @@ function RecentOrders({ onOpen }) {
       <div className="flex flex-wrap gap-2">
         {jobs.map((j) => (
           <button type="button"
-            key={j.jobId}
-            onClick={() => onOpen(j.jobId)}
+            key={j.id}
+            onClick={() => onOpen(j.id, j.kind)}
             className="rounded-full border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-600 active:bg-stone-50"
           >
-            {j.label || j.jobId}
+            {j.label || j.id}
           </button>
         ))}
       </div>
@@ -537,15 +713,205 @@ function RecentOrders({ onOpen }) {
   );
 }
 
+function makeDefaultDocument() {
+  return {
+    id: makeDocId(),
+    file: null,
+    fileName: "",
+    pages: "",
+    detectedPages: null,
+    copies: 1,
+    sides: "single",
+    colorMode: "bw",
+    colorPages: "",
+  };
+}
+
+// Derives pagesNum/colorPageCount/rangeError/estimate for one document -
+// shared between DocumentSettingsCard (per-doc display) and UploadStep
+// (total estimate, submit validation).
+function deriveDocument(doc, rates) {
+  const pagesNum = parseInt(doc.pages, 10) || 0;
+  const rangeResult =
+    doc.colorMode === "mixed" && pagesNum > 0 ? parsePageRange(doc.colorPages, pagesNum) : null;
+  const colorPageCount = rangeResult ? rangeResult.pages.size : 0;
+  const rangeError = doc.colorMode === "mixed" && doc.colorPages.trim() ? rangeResult?.error : null;
+  const estimate =
+    pagesNum > 0
+      ? computeEstimate({ pages: pagesNum, copies: doc.copies, colorMode: doc.colorMode, colorPageCount, rates })
+      : 0;
+  return { pagesNum, colorPageCount, rangeError, estimate };
+}
+
+// One document's settings card within the multi-file upload flow - pages,
+// copies, sides, color mode/pages, plus a per-document price and a remove
+// button. Identical field set to what UploadStep used to render once for
+// its single file; now rendered once per document.
+function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRemove }) {
+  const { pagesNum, colorPageCount, rangeError, estimate } = deriveDocument(
+    doc,
+    shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null
+  );
+
+  function handlePagesChange(e) {
+    let n = parseInt(e.target.value, 10) || 0;
+    if (doc.detectedPages && n > doc.detectedPages) n = doc.detectedPages;
+    onChange({ pages: n ? String(n) : "" });
+  }
+
+  return (
+    <div className="rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 shadow-sm shadow-stone-900/[0.03]">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-stone-400">
+            Document {index + 1}
+          </p>
+          <p className="truncate text-sm font-medium text-stone-900">{doc.fileName}</p>
+        </div>
+        {showRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-stone-500 hover:bg-stone-100 hover:text-red-700"
+          >
+            Remove
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+            Pages
+          </label>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={doc.detectedPages || undefined}
+            value={doc.pages}
+            onChange={handlePagesChange}
+            placeholder="e.g. 12"
+            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
+          />
+          <p className="mt-1 text-[11px] text-stone-500">
+            {doc.detectedPages
+              ? `Detected ${doc.detectedPages} page${doc.detectedPages > 1 ? "s" : ""} — reduce if you only need some.`
+              : "Couldn't auto-detect page count — enter it manually."}
+          </p>
+        </div>
+        <div>
+          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+            Copies
+          </label>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            value={doc.copies}
+            onChange={(e) => onChange({ copies: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
+          />
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+          Sides
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { v: "single", label: "One-sided" },
+            { v: "double", label: "Double-sided" },
+          ].map((opt) => (
+            <button
+              key={opt.v}
+              type="button"
+              onClick={() => onChange({ sides: opt.v })}
+              className={`rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
+                doc.sides === opt.v
+                  ? "border-stone-900 bg-stone-900 text-stone-50"
+                  : "border-stone-300 bg-white text-stone-600"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+          Print type
+        </label>
+        <div className="grid grid-cols-3 gap-2">
+          {[
+            { v: "bw", label: "B & W" },
+            { v: "color", label: "Color" },
+            { v: "mixed", label: "Custom" },
+          ].map((opt) => (
+            <button
+              key={opt.v}
+              type="button"
+              onClick={() => onChange({ colorMode: opt.v })}
+              className={`rounded-lg border px-2 py-2.5 text-[13px] font-medium transition ${
+                doc.colorMode === opt.v
+                  ? "border-stone-900 bg-stone-900 text-stone-50"
+                  : "border-stone-300 bg-white text-stone-600"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
+        {doc.colorMode === "mixed" && (
+          <div className="mt-2.5 rounded-lg border border-dashed border-[#2F6E68]/40 bg-[#2F6E68]/5 px-3.5 py-3">
+            <label className="mb-1 block text-xs font-medium text-stone-600">
+              Which pages should print in color?
+            </label>
+            <input
+              type="text"
+              value={doc.colorPages}
+              onChange={(e) => onChange({ colorPages: e.target.value })}
+              placeholder="e.g. 1-3,7,10"
+              disabled={pagesNum === 0}
+              className="w-full rounded-md border border-stone-300 bg-white px-3 py-2 text-sm focus:border-stone-500 focus:outline-none disabled:bg-stone-100"
+            />
+            <p className="mt-1 text-[11px] text-stone-500">
+              {pagesNum === 0
+                ? "Enter the page count above first."
+                : rangeError
+                ? rangeError
+                : colorPageCount > 0
+                ? `${colorPageCount} page${colorPageCount > 1 ? "s" : ""} in color, ${
+                    pagesNum - colorPageCount
+                  } in black & white.`
+                : "All other pages print in black & white."}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {pagesNum > 0 && (
+        <div className="mt-3 flex items-center justify-between border-t border-dashed border-stone-200 pt-2.5 text-sm">
+          <span className="text-stone-500">This document</span>
+          <span className="font-mono font-semibold text-stone-900">₹{estimate}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 — Upload + print settings + estimate
 // ---------------------------------------------------------------------------
-function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBack }) {
-  const { file, pages, copies, sides, colorMode, colorPages, phone, detectedPages } = order;
-  const [detecting, setDetecting] = useState(false);
-  const [converting, setConverting] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState(null);
+function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onBack }) {
+  const { documents, phone } = order;
+  const [addingFile, setAddingFile] = useState(false);
+  const [addError, setAddError] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
   const [shopInfo, setShopInfo] = useState(null);
   const fileInputRef = useRef(null);
 
@@ -570,124 +936,101 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
     };
   }, [shopId]);
 
-  function patch(fields) {
-    setOrder((prev) => ({ ...prev, ...fields }));
+  function patchDoc(id, fields) {
+    setOrder((prev) => ({
+      ...prev,
+      documents: prev.documents.map((d) => (d.id === id ? { ...d, ...fields } : d)),
+    }));
   }
 
+  function removeDoc(id) {
+    setOrder((prev) => ({ ...prev, documents: prev.documents.filter((d) => d.id !== id) }));
+  }
+
+  // Adds one more document to the order - each upload picks a single file,
+  // gets processed (docx/photo -> PDF, page count detected), then joins the
+  // list with its own default settings. Students who want just one document
+  // never notice anything changed: pick a file, settings appear, submit.
   async function handleFileChosen(chosenFile) {
     if (!chosenFile) return;
-    let fileToUse = chosenFile;
-    const isDocx =
-      chosenFile.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-      /\.docx$/i.test(chosenFile.name);
-    const isImage = chosenFile.type === "image/jpeg" || chosenFile.type === "image/png";
-
-    if (isDocx) {
-      setConverting(true);
-      setError(null);
-      try {
-        fileToUse = await api.convertDocxToPdf(chosenFile);
-      } catch (err) {
-        setConverting(false);
-        setError(err.message || "Could not convert that document. Try saving it as a PDF instead.");
-        return;
-      }
-      setConverting(false);
-    } else if (isImage) {
-      setDetecting(true);
-      try {
-        fileToUse = await imageFileToPdfFile(chosenFile);
-      } catch (err) {
-        setDetecting(false);
-        setError("Could not process that photo. Try a different photo, or choose a PDF instead.");
-        return;
-      }
+    setAddingFile(true);
+    setAddError(null);
+    try {
+      const { file, detectedPages } = await processChosenFile(chosenFile);
+      const newDoc = {
+        ...makeDefaultDocument(),
+        file,
+        fileName: file.name,
+        detectedPages,
+        pages: detectedPages ? String(detectedPages) : "",
+      };
+      setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
+    } catch (err) {
+      setAddError(err.message || "Could not process that file.");
+    } finally {
+      setAddingFile(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-
-    patch({ file: fileToUse, detectedPages: null });
-    setDetecting(true);
-    const count = await countPdfPages(fileToUse);
-    setDetecting(false);
-    if (count) {
-      // Default the page count to the PDF's real page count, and cap manual
-      // entry at that same number - a student can print FEWER pages (e.g.
-      // just a couple of pages from a longer document) but can't
-      // accidentally under- or over-state how long their own file is.
-      patch({ detectedPages: count, pages: String(count) });
-    }
-    // count === null: not a well-formed PDF we could parse, or parsing
-    // failed for some other reason - fall back to manual entry with no cap
-    // (handled below via detectedPages staying null) rather than blocking
-    // the order over it.
   }
 
-  const pagesNum = parseInt(pages, 10) || 0;
-  const rangeResult =
-    colorMode === "mixed" && pagesNum > 0 ? parsePageRange(colorPages, pagesNum) : null;
-  const colorPageCount = rangeResult ? rangeResult.pages.size : 0;
-  const rangeError = colorMode === "mixed" && colorPages.trim() ? rangeResult?.error : null;
+  const rates = shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null;
+  const derivedDocs = documents.map((d) => deriveDocument(d, rates));
+  const totalEstimate = derivedDocs.reduce((sum, d) => sum + d.estimate, 0);
 
-  const estimate =
-    pagesNum > 0
-      ? computeEstimate({
-          pages: pagesNum,
-          copies,
-          colorMode,
-          colorPageCount,
-          rates: shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null,
-        })
-      : 0;
+  const allDocsValid =
+    documents.length > 0 &&
+    documents.every((d, i) => {
+      const { pagesNum, rangeError } = derivedDocs[i];
+      return d.file && pagesNum > 0 && d.copies > 0 && (d.colorMode !== "mixed" || (d.colorPages.trim() && !rangeError));
+    });
 
   const canSubmit =
-    file &&
-    pagesNum > 0 &&
-    copies > 0 &&
-    /^[6-9]\d{9}$/.test(phone.trim()) &&
-    !uploading &&
-    !converting &&
-    (colorMode !== "mixed" || (colorPages.trim() && !rangeError));
-
-  function handlePagesChange(e) {
-    let n = parseInt(e.target.value, 10) || 0;
-    // Cap at the PDF's real page count when we know it - a student can
-    // reduce it (print only the first N pages) but can't type in more
-    // pages than the document actually has.
-    if (detectedPages && n > detectedPages) n = detectedPages;
-    patch({ pages: n ? String(n) : "" });
-  }
+    allDocsValid && /^[6-9]\d{9}$/.test(phone.trim()) && !submitting && !addingFile;
 
   async function handleSubmit() {
-    setError(null);
-    setUploading(true);
+    setSubmitError(null);
+    setSubmitting(true);
     try {
-      const { fileUrl } = await api.uploadFile(file);
-
-      const payload = {
-        fileUrl,
-        pages: pagesNum,
-        copies,
-        colorMode,
-        studentPhone: phone.trim(),
-        sides, // ⚠️ beyond locked contract — see file header
-        amountDueEstimate: estimate,
-      };
-      if (colorMode === "mixed") {
-        payload.colorPages = colorPages.trim(); // ⚠️ beyond locked contract — see file header
+      // Upload every document's file first, keeping each one's own settings
+      // alongside the fileUrl it gets back.
+      const uploaded = [];
+      for (let i = 0; i < documents.length; i++) {
+        const doc = documents[i];
+        const { pagesNum, estimate } = derivedDocs[i];
+        const { fileUrl } = await api.uploadFile(doc.file);
+        uploaded.push({
+          fileUrl,
+          fileName: doc.fileName,
+          pages: pagesNum,
+          copies: doc.copies,
+          colorMode: doc.colorMode,
+          sides: doc.sides, // ⚠️ beyond locked contract — see file header
+          amountDueEstimate: estimate,
+          ...(doc.colorMode === "mixed" ? { colorPages: doc.colorPages.trim() } : {}), // ⚠️ beyond locked contract
+        });
       }
 
-      const job = await api.createJob(shopId, payload);
-      onJobCreated(job.jobId, {
-        fileName: file.name,
-        pages: pagesNum,
-        copies,
-        sides,
-        colorMode,
-        colorPages: colorMode === "mixed" ? colorPages.trim() : null,
-      });
+      const summaryDocs = uploaded.map((u) => ({
+        fileName: u.fileName,
+        pages: u.pages,
+        copies: u.copies,
+        sides: u.sides,
+        colorMode: u.colorMode,
+        colorPages: u.colorPages || null,
+      }));
+
+      if (uploaded.length === 1) {
+        const single = uploaded[0];
+        const job = await api.createJob(shopId, { ...single, studentPhone: phone.trim() });
+        onOrderCreated("job", job.jobId, { documents: summaryDocs, phone: phone.trim() });
+      } else {
+        const result = await api.createBatch(shopId, { studentPhone: phone.trim(), documents: uploaded });
+        onOrderCreated("batch", result.batchId, { documents: summaryDocs, phone: phone.trim() });
+      }
     } catch (e) {
-      setError(e.message || "Upload failed. Check your connection and try again.");
+      setSubmitError(e.message || "Upload failed. Check your connection and try again.");
     } finally {
-      setUploading(false);
+      setSubmitting(false);
     }
   }
 
@@ -719,21 +1062,43 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
         </div>
       )}
 
+      {documents.length > 0 && (
+        <div className="space-y-3">
+          {documents.map((doc, i) => (
+            <DocumentSettingsCard
+              key={doc.id}
+              doc={doc}
+              index={i}
+              shopInfo={shopInfo}
+              onChange={(fields) => patchDoc(doc.id, fields)}
+              onRemove={() => removeDoc(doc.id)}
+              showRemove={documents.length > 1}
+            />
+          ))}
+        </div>
+      )}
+
       <div>
-        <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-          Document (PDF, Word, or photo)
-        </label>
+        {documents.length === 0 && (
+          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+            Document (PDF, Word, or photo)
+          </label>
+        )}
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={converting}
+          disabled={addingFile}
           className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 text-left text-sm shadow-sm shadow-stone-900/[0.03] active:bg-stone-50 disabled:opacity-60"
         >
-          <span className={file ? "font-medium text-stone-900" : "text-stone-400"}>
-            {converting ? "Converting to PDF…" : file ? file.name : "Choose a PDF, Word doc, or photo"}
+          <span className={documents.length > 0 ? "font-medium text-stone-700" : "text-stone-400"}>
+            {addingFile
+              ? "Processing…"
+              : documents.length > 0
+              ? "+ Add another document"
+              : "Choose a PDF, Word doc, or photo"}
           </span>
           <span className="ml-3 shrink-0 rounded-md bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-50">
-            {converting ? "…" : "Browse"}
+            {addingFile ? "…" : "Browse"}
           </span>
         </button>
         <input
@@ -741,133 +1106,15 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
           type="file"
           accept="application/pdf,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
           className="hidden"
-          disabled={converting}
+          disabled={addingFile}
           onChange={(e) => handleFileChosen(e.target.files?.[0] || null)}
         />
-        {converting && (
+        {addingFile && (
           <p className="mt-1 text-[11px] text-stone-500">
-            Converting your Word document to PDF — usually just a few seconds…
+            Reading your file and detecting pages — usually just a few seconds…
           </p>
         )}
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-            Pages
-          </label>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={detectedPages || undefined}
-            value={pages}
-            onChange={handlePagesChange}
-            placeholder={detecting ? "Reading PDF…" : "e.g. 12"}
-            disabled={detecting || converting}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none disabled:bg-stone-100"
-          />
-          <p className="mt-1 text-[11px] text-stone-500">
-            {detecting
-              ? "Detecting page count…"
-              : detectedPages
-              ? `Detected ${detectedPages} page${detectedPages > 1 ? "s" : ""} — reduce if you only need some.`
-              : file
-              ? "Couldn't auto-detect page count — enter it manually."
-              : ""}
-          </p>
-        </div>
-        <div>
-          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-            Copies
-          </label>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            value={copies}
-            onChange={(e) => patch({ copies: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
-          />
-        </div>
-      </div>
-
-      <div>
-        <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-          Sides
-        </label>
-        <div className="grid grid-cols-2 gap-2">
-          {[
-            { v: "single", label: "One-sided" },
-            { v: "double", label: "Double-sided" },
-          ].map((opt) => (
-            <button
-              key={opt.v}
-              type="button"
-              onClick={() => patch({ sides: opt.v })}
-              className={`rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
-                sides === opt.v
-                  ? "border-stone-900 bg-stone-900 text-stone-50"
-                  : "border-stone-300 bg-white text-stone-600"
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div>
-        <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-          Print type
-        </label>
-        <div className="grid grid-cols-3 gap-2">
-          {[
-            { v: "bw", label: "B & W" },
-            { v: "color", label: "Color" },
-            { v: "mixed", label: "Custom" },
-          ].map((opt) => (
-            <button
-              key={opt.v}
-              type="button"
-              onClick={() => patch({ colorMode: opt.v })}
-              className={`rounded-lg border px-2 py-2.5 text-[13px] font-medium transition ${
-                colorMode === opt.v
-                  ? "border-stone-900 bg-stone-900 text-stone-50"
-                  : "border-stone-300 bg-white text-stone-600"
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-
-        {colorMode === "mixed" && (
-          <div className="mt-2.5 rounded-lg border border-dashed border-[#2F6E68]/40 bg-[#2F6E68]/5 px-3.5 py-3">
-            <label className="mb-1 block text-xs font-medium text-stone-600">
-              Which pages should print in color?
-            </label>
-            <input
-              type="text"
-              value={colorPages}
-              onChange={(e) => patch({ colorPages: e.target.value })}
-              placeholder="e.g. 1-3,7,10"
-              disabled={pagesNum === 0}
-              className="w-full rounded-md border border-stone-300 bg-white px-3 py-2 text-sm focus:border-stone-500 focus:outline-none disabled:bg-stone-100"
-            />
-            <p className="mt-1 text-[11px] text-stone-500">
-              {pagesNum === 0
-                ? "Enter the page count above first."
-                : rangeError
-                ? rangeError
-                : colorPageCount > 0
-                ? `${colorPageCount} page${colorPageCount > 1 ? "s" : ""} in color, ${
-                    pagesNum - colorPageCount
-                  } in black & white.`
-                : "All other pages print in black & white."}
-            </p>
-          </div>
-        )}
+        {addError && <p className="mt-1 text-[11px] text-red-700">{addError}</p>}
       </div>
 
       <div>
@@ -878,28 +1125,32 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
           type="tel"
           inputMode="numeric"
           value={phone}
-          onChange={(e) => patch({ phone: e.target.value.replace(/\D/g, "").slice(0, 10) })}
+          onChange={(e) =>
+            setOrder((prev) => ({ ...prev, phone: e.target.value.replace(/\D/g, "").slice(0, 10) }))
+          }
           placeholder="10-digit mobile number"
           className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
         />
         <p className="mt-1 text-xs text-stone-500">We'll text you when it's ready to collect.</p>
       </div>
 
-      {pagesNum > 0 && (
+      {documents.length > 0 && totalEstimate > 0 && (
         <div className="flex items-center justify-between rounded-lg border border-dashed border-stone-300 px-4 py-3">
-          <span className="text-sm text-stone-600">Estimated price</span>
-          <span className="font-mono text-base font-semibold text-stone-900">₹{estimate}</span>
+          <span className="text-sm text-stone-600">
+            Estimated total{documents.length > 1 ? ` (${documents.length} documents)` : ""}
+          </span>
+          <span className="font-mono text-base font-semibold text-stone-900">₹{totalEstimate}</span>
         </div>
       )}
 
-      {error && <ErrorBanner message={error} onRetry={handleSubmit} />}
+      {submitError && <ErrorBanner message={submitError} onRetry={handleSubmit} />}
 
       <button type="button"
         onClick={handleSubmit}
         disabled={!canSubmit}
         className="w-full rounded-lg bg-[#A63A2C] py-3.5 text-sm font-semibold text-white shadow-sm shadow-[#A63A2C]/20 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
       >
-        {uploading ? "Uploading\u2026" : "Review order"}
+        {submitting ? "Uploading\u2026" : "Review order"}
       </button>
     </div>
   );
@@ -908,16 +1159,29 @@ function UploadStep({ shopId, order, setOrder, onJobCreated, onOpenRecent, onBac
 // ---------------------------------------------------------------------------
 // Step 2 — Order review (receipt preview) + payment
 // ---------------------------------------------------------------------------
-function ReviewPaymentStep({ jobId, amountDue, order, onPaid, onBack }) {
+// kind: "job" | "batch". orderId is the jobId or batchId respectively - one
+// combined payment either way, mirrored by api.payJob/api.payBatch. order
+// always carries a `documents` array now (length 1 for the plain single-file
+// flow), so this renders a summary per document plus one combined total.
+function ReviewPaymentStep({ kind, orderId, amountDue, order, onPaid, onBack }) {
   const [paying, setPaying] = useState(false);
   const [error, setError] = useState(null);
+  const documents = order?.documents || [];
+
+  function describeColor(doc) {
+    return doc.colorMode === "mixed"
+      ? `Custom (pages ${doc.colorPages})`
+      : doc.colorMode === "color"
+      ? "Full color"
+      : "Black & white";
+  }
 
   async function handlePay() {
     setError(null);
     setPaying(true);
     try {
       const paymentRef = `simulated_${Date.now()}`;
-      const result = await api.payJob(jobId, paymentRef);
+      const result = kind === "batch" ? await api.payBatch(orderId, paymentRef) : await api.payJob(orderId, paymentRef);
       onPaid(result.tokenNumber);
     } catch (e) {
       setError(e.message || "Payment failed. Please try again.");
@@ -925,21 +1189,6 @@ function ReviewPaymentStep({ jobId, amountDue, order, onPaid, onBack }) {
       setPaying(false);
     }
   }
-
-  const rows = [
-    ["Document", order?.fileName],
-    ["Pages", order?.pages],
-    ["Copies", order?.copies],
-    ["Sides", order?.sides === "double" ? "Double-sided" : "One-sided"],
-    [
-      "Color",
-      order?.colorMode === "mixed"
-        ? `Custom (pages ${order.colorPages})`
-        : order?.colorMode === "color"
-        ? "Full color"
-        : "Black & white",
-    ],
-  ];
 
   return (
     <div className="space-y-5">
@@ -955,18 +1204,30 @@ function ReviewPaymentStep({ jobId, amountDue, order, onPaid, onBack }) {
 
       <div className="rounded-xl border border-stone-300 bg-white px-4 py-4 shadow-sm shadow-stone-900/[0.03]">
         <p className="mb-3 text-xs font-medium uppercase tracking-wide text-stone-500">
-          Order summary
+          Order summary{documents.length > 1 ? ` — ${documents.length} documents` : ""}
         </p>
-        <dl className="space-y-2">
-          {rows.map(([label, value]) => (
-            <div key={label} className="flex items-center justify-between text-sm">
-              <dt className="text-stone-500">{label}</dt>
-              <dd className="max-w-[60%] truncate text-right font-medium text-stone-800">
-                {value}
-              </dd>
+
+        <div className="space-y-3">
+          {documents.map((doc, i) => (
+            <div key={i} className={i > 0 ? "border-t border-dashed border-stone-200 pt-3" : ""}>
+              <p className="truncate text-sm font-medium text-stone-800">{doc.fileName}</p>
+              <dl className="mt-1.5 space-y-1">
+                {[
+                  ["Pages", doc.pages],
+                  ["Copies", doc.copies],
+                  ["Sides", doc.sides === "double" ? "Double-sided" : "One-sided"],
+                  ["Color", describeColor(doc)],
+                ].map(([label, value]) => (
+                  <div key={label} className="flex items-center justify-between text-xs">
+                    <dt className="text-stone-500">{label}</dt>
+                    <dd className="max-w-[60%] truncate text-right font-medium text-stone-700">{value}</dd>
+                  </div>
+                ))}
+              </dl>
             </div>
           ))}
-        </dl>
+        </div>
+
         <div className="my-3 border-t border-dashed border-stone-300" />
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-stone-700">Amount due</span>
@@ -995,15 +1256,16 @@ function ReviewPaymentStep({ jobId, amountDue, order, onPaid, onBack }) {
 // ---------------------------------------------------------------------------
 // Step 3 — Token + status page (polls GET /jobs/:jobId)
 // ---------------------------------------------------------------------------
-function StatusStep({ jobId, onBack }) {
+function StatusStep({ kind, orderId, onBack }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const isBatch = kind === "batch";
 
   const fetchStatus = useCallback(async () => {
     try {
-      const data = await api.getJob(jobId);
+      const data = isBatch ? await api.getBatch(orderId) : await api.getJob(orderId);
       setJob(data);
       setError(null);
     } catch (e) {
@@ -1011,7 +1273,7 @@ function StatusStep({ jobId, onBack }) {
     } finally {
       setLoading(false);
     }
-  }, [jobId]);
+  }, [orderId, isBatch]);
 
   useEffect(() => {
     fetchStatus();
@@ -1066,6 +1328,28 @@ function StatusStep({ jobId, onBack }) {
       </div>
 
       <div className="my-6 border-t border-dashed border-stone-300" />
+
+      {isBatch && job.documents?.length > 0 && (
+        <>
+          <div className="mb-4 space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-stone-500">
+              {job.documents.length} documents in this order
+            </p>
+            {job.documents.map((doc) => (
+              <div
+                key={doc.jobId}
+                className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs"
+              >
+                <span className="truncate font-medium text-stone-700">{doc.fileName}</span>
+                <span className="shrink-0 font-mono text-stone-500">
+                  {doc.pages}p × {doc.copies}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mb-6 border-t border-dashed border-stone-300" />
+        </>
+      )}
 
       {isCancelled ? (
         <div className="rounded-lg border border-red-800/25 bg-red-800/5 px-4 py-3 text-center text-sm text-red-900">
@@ -1605,13 +1889,7 @@ function HomeStep({ onShopSelected, onMyOrders }) {
 // ---------------------------------------------------------------------------
 function makeDefaultOrderForm() {
   return {
-    file: null,
-    pages: "",
-    detectedPages: null,
-    copies: 1,
-    sides: "single",
-    colorMode: "bw",
-    colorPages: "",
+    documents: [],
     phone: "",
   };
 }
@@ -1619,26 +1897,31 @@ function makeDefaultOrderForm() {
 export default function App() {
   const shopIdParam = getParam("shopId");
   const initialJobId = getParam("jobId");
+  const initialBatchId = getParam("batchId");
 
   const [shopId, setShopId] = useState(shopIdParam);
   const [phase, setPhase] = useState(
-    initialJobId ? "status" : shopIdParam ? "upload" : "home"
+    initialJobId || initialBatchId ? "status" : shopIdParam ? "upload" : "home"
   );
-  const [jobId, setJobId] = useState(initialJobId);
+  // kind: "job" | "batch" — which endpoint family orderId belongs to.
+  const [orderKind, setOrderKind] = useState(initialBatchId ? "batch" : "job");
+  const [orderId, setOrderId] = useState(initialBatchId || initialJobId);
   const [amountDue, setAmountDue] = useState(null);
   const [shopName, setShopName] = useState(null);
   const [order, setOrder] = useState(null);
   // The live upload form's own state, lifted up here (rather than kept
   // inside UploadStep) specifically so "← Back to edit order" from the
   // Review step doesn't lose what the student already filled in - the
-  // chosen file, page count, copies, etc. all survive the round trip.
+  // documents added, their settings, etc. all survive the round trip.
   const [orderForm, setOrderForm] = useState(makeDefaultOrderForm);
 
   useEffect(() => {
-    if (initialJobId) {
+    if (initialBatchId) {
+      api.getBatch(initialBatchId).then((b) => setShopName(b.shopName)).catch(() => {});
+    } else if (initialJobId) {
       api.getJob(initialJobId).then((j) => setShopName(j.shopName)).catch(() => {});
     }
-  }, [initialJobId]);
+  }, [initialJobId, initialBatchId]);
 
   // Header reads shopName from here, but until now nothing set it when a
   // shop was chosen via scan/upload/list/direct link - it only got set
@@ -1667,7 +1950,7 @@ export default function App() {
   // still walks the browser out of the app instead of back to "home".
   useEffect(() => {
     window.history.replaceState(
-      { phase, shopId: shopIdParam, jobId: initialJobId },
+      { phase, shopId: shopIdParam, jobId: initialJobId, batchId: initialBatchId },
       "",
       window.location.href
     );
@@ -1681,7 +1964,8 @@ export default function App() {
       const s = e.state || {};
       setPhase(s.phase || "home");
       setShopId(s.shopId || null);
-      setJobId(s.jobId || null);
+      setOrderKind(s.batchId ? "batch" : "job");
+      setOrderId(s.batchId || s.jobId || null);
       if (!s.shopId) setShopName(null);
     }
     window.addEventListener("popstate", handlePopState);
@@ -1703,10 +1987,13 @@ export default function App() {
   // Opening a job from order history: unlike handleOpenRecent (same shop
   // the student is already ordering from), this can jump to a job that
   // belongs to a completely different shop, so shopId/shopName both need
-  // to be set fresh here.
+  // to be set fresh here. Order history rows are always individual
+  // print_jobs (even documents that were part of a batch keep their own
+  // status/token via the batch payment), so this always opens as kind "job".
   function handleOpenHistoryJob(id, historyShopId) {
     setShopId(historyShopId || null);
-    setJobId(id);
+    setOrderKind("job");
+    setOrderId(id);
     setPhase("status");
     pushPhase("status", { shopId: historyShopId, jobId: id });
     api.getJob(id).then((j) => setShopName(j.shopName)).catch(() => {});
@@ -1720,22 +2007,39 @@ export default function App() {
     pushPhase("home", {});
   }
 
-  function handleJobCreated(newJobId, orderSummary) {
-    setJobId(newJobId);
+  // kind: "job" (single document, unchanged flow) or "batch" (multiple
+  // documents, one combined payment) - UploadStep decides which based on
+  // how many documents were added, and calls the matching create endpoint
+  // itself before handing back the resulting id here.
+  function handleOrderCreated(kind, id, orderSummary) {
+    setOrderKind(kind);
+    setOrderId(id);
     setOrder(orderSummary);
-    rememberJob(newJobId, shopId, orderSummary.fileName);
+    const label =
+      orderSummary.documents.length > 1
+        ? `${orderSummary.documents.length} documents`
+        : orderSummary.documents[0]?.fileName;
+    rememberOrder(id, shopId, label, kind);
     setPhase("review");
-    pushPhase("review", { shopId, jobId: newJobId });
-    api.getJob(newJobId).then((j) => {
-      setAmountDue(j.amountDue);
-      setShopName(j.shopName);
-    });
+    if (kind === "batch") {
+      pushPhase("review", { shopId, batchId: id });
+      api.getBatch(id).then((b) => {
+        setAmountDue(b.amountDue);
+        setShopName(b.shopName);
+      });
+    } else {
+      pushPhase("review", { shopId, jobId: id });
+      api.getJob(id).then((j) => {
+        setAmountDue(j.amountDue);
+        setShopName(j.shopName);
+      });
+    }
   }
 
   // Going back from Review re-opens Upload with everything the student
   // already entered still in place (orderForm is untouched). Known gap,
-  // flagged rather than hidden: the job created just before Review was
-  // shown already exists server-side in "uploaded" status - going back
+  // flagged rather than hidden: the job/batch created just before Review
+  // was shown already exists server-side in "uploaded" status - going back
   // doesn't cancel it, it's simply left unpaid and never queued. Same
   // category as an abandoned cart; nothing prints or charges from it.
   function handleBackFromReview() {
@@ -1745,13 +2049,14 @@ export default function App() {
 
   function handlePaid() {
     setPhase("status");
-    pushPhase("status", { shopId, jobId });
+    pushPhase("status", orderKind === "batch" ? { shopId, batchId: orderId } : { shopId, jobId: orderId });
   }
 
-  function handleOpenRecent(id) {
-    setJobId(id);
+  function handleOpenRecent(id, kind = "job") {
+    setOrderKind(kind);
+    setOrderId(id);
     setPhase("status");
-    pushPhase("status", { shopId, jobId: id });
+    pushPhase("status", kind === "batch" ? { shopId, batchId: id } : { shopId, jobId: id });
   }
 
   // New: the status page previously had no way back at all except leaving
@@ -1759,7 +2064,8 @@ export default function App() {
   function handleBackToHome() {
     setShopId(null);
     setShopName(null);
-    setJobId(null);
+    setOrderId(null);
+    setOrderKind("job");
     setOrder(null);
     setAmountDue(null);
     setOrderForm(makeDefaultOrderForm());
@@ -1788,21 +2094,24 @@ export default function App() {
           shopId={shopId}
           order={orderForm}
           setOrder={setOrderForm}
-          onJobCreated={handleJobCreated}
+          onOrderCreated={handleOrderCreated}
           onOpenRecent={handleOpenRecent}
           onBack={handleChangeShop}
         />
       )}
-      {phase === "review" && jobId && (
+      {phase === "review" && orderId && (
         <ReviewPaymentStep
-          jobId={jobId}
+          kind={orderKind}
+          orderId={orderId}
           amountDue={amountDue}
           order={order}
           onPaid={handlePaid}
           onBack={handleBackFromReview}
         />
       )}
-      {phase === "status" && jobId && <StatusStep jobId={jobId} onBack={handleBackToHome} />}
+      {phase === "status" && orderId && (
+        <StatusStep kind={orderKind} orderId={orderId} onBack={handleBackToHome} />
+      )}
       <p className="mt-8 text-center text-[11px] text-stone-400">
         {MOCK_MODE ? "Running in mock mode — no real backend connected yet." : ""}
       </p>

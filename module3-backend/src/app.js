@@ -11,6 +11,7 @@ const landmarksRouter = require('./routes/landmarks');
 const adminRouter = require('./routes/admin');
 const studentsRouter = require('./routes/students');
 const convertRouter = require('./routes/convert');
+const batchesRouter = require('./routes/batches');
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use('/api/landmarks', landmarksRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/students', studentsRouter);
 app.use('/api/convert', convertRouter);
+app.use('/api/batches', batchesRouter);
 
 // 404 fallback
 app.use((req, res) => {

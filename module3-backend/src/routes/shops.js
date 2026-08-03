@@ -123,7 +123,7 @@ router.post('/signup', async (req, res, next) => {
 router.post('/:shopId/jobs', async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { fileUrl, pages, copies, colorMode, studentPhone, sides, colorPages } = req.body || {};
+    const { fileUrl, pages, copies, colorMode, studentPhone, sides, colorPages, fileName } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
       'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
@@ -174,16 +174,145 @@ router.post('/:shopId/jobs', async (req, res, next) => {
       rates: { bw: shop.priceBw, color: shop.priceColor },
     });
     const jobId = randomUUID();
+    const fileNameValue = typeof fileName === 'string' && fileName.trim() ? fileName.trim() : null;
 
     await pool.query(
       `INSERT INTO print_jobs
-         (id, shop_id, file_url, pages, copies, color_mode, color_pages, sides,
+         (id, shop_id, file_url, file_name, pages, copies, color_mode, color_pages, sides,
           student_phone, status, token_number, amount_due, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'uploaded', NULL, $10, NOW(), NOW())`,
-      [jobId, shopId, fileUrl, pages, copies, colorMode, colorPagesValue, sidesValue, studentPhone, amountDue]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploaded', NULL, $11, NOW(), NOW())`,
+      [jobId, shopId, fileUrl, fileNameValue, pages, copies, colorMode, colorPagesValue, sidesValue, studentPhone, amountDue]
     );
 
     return res.status(201).json({ jobId, amountDue, status: 'uploaded' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/:shopId/batches
+// Public (student-facing, pre-auth). One combined order for multiple
+// documents uploaded together, each with its own print settings.
+// body: { studentPhone, documents: [{ fileUrl, fileName, pages, copies,
+//         colorMode, colorPages, sides }, ...] }
+// -> { batchId, amountDue, status: "uploaded",
+//      documents: [{ jobId, fileName, amountDue }] }
+// Each document becomes its own print_jobs row (batch_id set), so the shop
+// dashboard's existing per-job rendering keeps working unchanged - only the
+// grouping/payment is new. amount_due on the batch is the sum of every
+// document's own amount_due, computed the exact same way single-doc jobs
+// already are (per-shop price_bw/price_color, mixed-mode page splitting).
+router.post('/:shopId/batches', async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { studentPhone, documents } = req.body || {};
+
+    const { rows: shopRows } = await pool.query(
+      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
+      [shopId]
+    );
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const shop = shopRows[0];
+
+    if (!studentPhone || typeof studentPhone !== 'string') {
+      return res.status(400).json({ error: 'studentPhone is required' });
+    }
+    if (!Array.isArray(documents) || documents.length === 0) {
+      return res.status(400).json({ error: 'documents must be a non-empty array' });
+    }
+    if (documents.length === 1) {
+      return res.status(400).json({
+        error: 'documents has only one file - use POST /:shopId/jobs for a single document',
+      });
+    }
+
+    // Validate every document up front (same rules as the single-job route)
+    // before inserting anything, so a bad 4th document doesn't leave 3
+    // half-created jobs behind.
+    const prepared = [];
+    for (let i = 0; i < documents.length; i++) {
+      const doc = documents[i] || {};
+      const { fileUrl, pages, copies, colorMode, sides, colorPages, fileName } = doc;
+      const label = `documents[${i}]`;
+
+      if (!fileUrl || typeof fileUrl !== 'string') {
+        return res.status(400).json({ error: `${label}.fileUrl is required` });
+      }
+      if (!Number.isInteger(pages) || pages < 1) {
+        return res.status(400).json({ error: `${label}.pages must be a positive integer` });
+      }
+      if (!Number.isInteger(copies) || copies < 1) {
+        return res.status(400).json({ error: `${label}.copies must be a positive integer` });
+      }
+      if (!VALID_COLOR_MODES.includes(colorMode)) {
+        return res.status(400).json({ error: `${label}.colorMode must be "bw", "color", or "mixed"` });
+      }
+
+      const sidesValue = sides === undefined ? 'single' : sides;
+      if (!VALID_SIDES.includes(sidesValue)) {
+        return res.status(400).json({ error: `${label}.sides must be "single" or "double"` });
+      }
+
+      let colorPagesValue = null;
+      if (colorMode === 'mixed') {
+        const { error: rangeError } = parseColorPages(colorPages, pages);
+        if (rangeError) {
+          return res.status(400).json({ error: `${label}.colorPages: ${rangeError}` });
+        }
+        colorPagesValue = colorPages.trim();
+      }
+
+      const docAmountDue = calculateAmountDue({
+        pages,
+        copies,
+        colorMode,
+        colorPages: colorPagesValue,
+        rates: { bw: shop.priceBw, color: shop.priceColor },
+      });
+
+      prepared.push({
+        jobId: randomUUID(),
+        fileUrl,
+        fileName: typeof fileName === 'string' && fileName.trim() ? fileName.trim() : null,
+        pages,
+        copies,
+        colorMode,
+        colorPagesValue,
+        sidesValue,
+        amountDue: docAmountDue,
+      });
+    }
+
+    const batchId = randomUUID();
+    const totalAmountDue = prepared.reduce((sum, d) => sum + d.amountDue, 0);
+
+    await pool.query(
+      `INSERT INTO batches (id, shop_id, student_phone, status, token_number, amount_due, created_at, updated_at)
+       VALUES ($1, $2, $3, 'uploaded', NULL, $4, NOW(), NOW())`,
+      [batchId, shopId, studentPhone, totalAmountDue]
+    );
+
+    for (const doc of prepared) {
+      await pool.query(
+        `INSERT INTO print_jobs
+           (id, shop_id, batch_id, file_url, file_name, pages, copies, color_mode, color_pages, sides,
+            student_phone, status, token_number, amount_due, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uploaded', NULL, $12, NOW(), NOW())`,
+        [
+          doc.jobId, shopId, batchId, doc.fileUrl, doc.fileName, doc.pages, doc.copies,
+          doc.colorMode, doc.colorPagesValue, doc.sidesValue, studentPhone, doc.amountDue,
+        ]
+      );
+    }
+
+    return res.status(201).json({
+      batchId,
+      amountDue: totalAmountDue,
+      status: 'uploaded',
+      documents: prepared.map((d) => ({ jobId: d.jobId, fileName: d.fileName, amountDue: d.amountDue })),
+    });
   } catch (err) {
     next(err);
   }
@@ -234,7 +363,8 @@ router.get('/:shopId/jobs', requireShopAuth, requireOwnShop, async (req, res, ne
     const baseSelect = `
       SELECT id AS "jobId", token_number AS "tokenNumber", pages, copies,
              color_mode AS "colorMode", color_pages AS "colorPages", sides,
-             file_url AS "fileUrl", student_phone AS "studentPhone", status,
+             file_url AS "fileUrl", file_name AS "fileName", batch_id AS "batchId",
+             student_phone AS "studentPhone", status,
              created_at AS "createdAt"
       FROM print_jobs WHERE shop_id = $1`;
 

@@ -194,6 +194,36 @@ async function migrate() {
   await pool.query(
     `UPDATE shops SET landmark_id = 'lm_anurag_university' WHERE landmark_id IS NULL;`
   );
+
+  // Migration: multi-document batch upload. A batch groups several
+  // print_jobs rows (one per uploaded document) under a single combined
+  // payment and a single token number, so a student uploading 3 files pays
+  // once and picks up once. batches.status/token_number mirror print_jobs'
+  // own status machine (uploaded -> queued -> printing -> ready ->
+  // collected) but track the whole order, not any one document - the
+  // per-document rows still carry their own status too, since a shop owner
+  // may in principle advance them individually.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS batches (
+      id            TEXT PRIMARY KEY,
+      shop_id       TEXT NOT NULL REFERENCES shops(id),
+      student_phone TEXT NOT NULL,
+      status        TEXT NOT NULL CHECK (status IN ('uploaded','queued','printing','ready','collected')),
+      token_number  TEXT,
+      amount_due    INTEGER NOT NULL,
+      created_at    TIMESTAMPTZ NOT NULL,
+      updated_at    TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS batch_id TEXT REFERENCES batches(id);
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS file_name TEXT;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS print_jobs_batch_id_idx ON print_jobs (batch_id);
+  `);
 }
 
 module.exports = { pool, migrate };
