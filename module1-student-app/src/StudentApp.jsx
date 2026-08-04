@@ -1892,6 +1892,7 @@ function QrScanner({ onScan, onClose }) {
   const scannerRef = useRef(null);
   const hasScannedRef = useRef(false);
   const [error, setError] = useState(null);
+  const [startedAt, setStartedAt] = useState(null);
 
   useEffect(() => {
     hasScannedRef.current = false;
@@ -1916,12 +1917,36 @@ function QrScanner({ onScan, onClose }) {
         },
         () => {} // per-frame decode misses are normal while aiming - ignore
       )
-      .catch((err) => setError(err?.message || "Could not access camera"));
+      .then(() => setStartedAt(Date.now()))
+      .catch((err) => {
+        // getUserMedia (and therefore html5-qrcode) silently refuses to even
+        // ask for camera access on a non-HTTPS origin (except localhost) -
+        // that shows up here as a rejected promise, not as a live video feed,
+        // so it's worth naming explicitly rather than a generic message.
+        const insecure = typeof window !== "undefined" && window.location.protocol !== "https:" &&
+          !["localhost", "127.0.0.1"].includes(window.location.hostname);
+        setError(
+          insecure
+            ? "Camera access needs a secure (https://) connection - this page was opened over plain http."
+            : err?.message || "Could not access camera"
+        );
+      });
 
     return () => {
       scannerRef.current?.stop().catch(() => {});
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // If the camera opened successfully but nothing has decoded after a
+  // while, the feed itself is fine - it's aim/lighting/glare, or a QR
+  // encoding it genuinely can't parse. Surface an escape hatch instead of
+  // leaving someone staring at a live camera feed indefinitely.
+  const [stuck, setStuck] = useState(false);
+  useEffect(() => {
+    if (!startedAt) return;
+    const t = setTimeout(() => setStuck(true), 12000);
+    return () => clearTimeout(t);
+  }, [startedAt]);
 
   return (
     <div className="mb-6 rounded-xl border border-stone-300 bg-white p-4">
@@ -1935,10 +1960,19 @@ function QrScanner({ onScan, onClose }) {
       </div>
       {error ? (
         <p className="rounded-lg border border-red-800/25 bg-red-800/5 px-3 py-2 text-xs text-red-900">
-          {error}. Check camera permissions, or use "choose by location" below instead.
+          {error}. Check camera permissions, or use "upload a saved QR image" / "choose by
+          location" below instead.
         </p>
       ) : (
-        <div id={containerId} className="overflow-hidden rounded-lg" />
+        <>
+          <div id={containerId} className="overflow-hidden rounded-lg" />
+          {stuck && (
+            <p className="mt-2 rounded-lg border border-stone-300 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+              Not picking it up? Try moving closer, reducing glare, or use "upload a saved QR
+              image" / "choose by location" below instead.
+            </p>
+          )}
+        </>
       )}
     </div>
   );
@@ -1967,6 +2001,15 @@ function HomeStep({ onShopSelected, onMyOrders }) {
   const [loadingShops, setLoadingShops] = useState(false);
   const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
+
+  const [manualCode, setManualCode] = useState("");
+
+  function handleManualCode(e) {
+    e.preventDefault();
+    const id = extractShopIdFromScan(manualCode.trim());
+    if (!id) return;
+    onShopSelected(id); // no viaQrScan flag - typing a code isn't proof of being at the shop
+  }
 
   function setLandmarkId(id) {
     homeStepCache.landmarkId = id;
@@ -2090,6 +2133,22 @@ function HomeStep({ onShopSelected, onMyOrders }) {
             {decodingFile ? "Reading QR code…" : "Upload a saved QR image"}
           </button>
           <div id="qr-file-reader" className="hidden" />
+
+          <form onSubmit={handleManualCode} className="mb-6 flex gap-2">
+            <input
+              type="text"
+              value={manualCode}
+              onChange={(e) => setManualCode(e.target.value)}
+              placeholder="Or type the shop's code"
+              className="flex-1 rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm focus:border-stone-500 focus:outline-none"
+            />
+            <button type="submit"
+              disabled={!manualCode.trim()}
+              className="shrink-0 rounded-lg border border-stone-300 bg-white px-4 py-2.5 text-sm font-medium text-stone-700 shadow-sm active:bg-stone-50 disabled:opacity-50"
+            >
+              Go
+            </button>
+          </form>
         </>
       )}
 
@@ -2172,10 +2231,28 @@ export default function App() {
   const [shopName, setShopName] = useState(null);
   const [order, setOrder] = useState(null);
   // Proof the student is physically at this shop right now, for gating the
-  // cash-at-counter payment option (see ReviewPaymentStep) - only a live QR
-  // camera scan counts, and only for a short window after scanning, so it
-  // can't be reused later or from a saved/forwarded photo of the code.
-  const [qrScanInfo, setQrScanInfo] = useState(null); // { shopId, scannedAt } | null
+  // cash-at-counter payment option (see ReviewPaymentStep).
+  //
+  // In practice almost nobody opens the PrintNow site first and then uses
+  // our in-app camera scanner - they point their phone's regular camera (or
+  // WhatsApp/Google Lens/any QR app) at the shop's printed sticker, which
+  // opens this page directly at "?shopId=X". That's why the very first
+  // render below counts too, not just handleScan()'s in-app path: a page
+  // load carrying a bare shopId param (no jobId/batchId - i.e. not someone
+  // resuming an existing order via a link) is exactly what scanning the
+  // physical sticker produces, from any scanner.
+  //
+  // Known accepted gap: someone COULD bookmark or forward that same
+  // "?shopId=X" link and reopen it later, away from the shop, which would
+  // also read as "just scanned". This is the same trust tradeoff as the
+  // in-app scanner already had (nothing stops re-scanning a screenshot of
+  // the code either) - the real backstop stays the shop owner, who only
+  // taps "confirm" once cash is actually in hand.
+  const [qrScanInfo, setQrScanInfo] = useState(
+    shopIdParam && !initialJobId && !initialBatchId
+      ? { shopId: shopIdParam, scannedAt: Date.now() }
+      : null
+  ); // { shopId, scannedAt } | null
   // The live upload form's own state, lifted up here (rather than kept
   // inside UploadStep) specifically so "← Back to edit order" from the
   // Review step doesn't lose what the student already filled in - the
