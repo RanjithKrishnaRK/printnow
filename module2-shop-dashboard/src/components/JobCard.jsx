@@ -2,8 +2,10 @@
 // the physical colored paper stubs shops already use, so status is readable
 // at a glance from across the counter.
 import PrintDetails from "./PrintDetails";
+import PaymentReview from "./PaymentReview";
 
 const STATUS_EDGE = {
+  payment_pending: "border-l-amber-500",
   queued: "border-l-queued",
   printing: "border-l-printing",
   ready: "border-l-ready",
@@ -11,6 +13,7 @@ const STATUS_EDGE = {
 };
 
 const STATUS_LABEL = {
+  payment_pending: "Payment pending review",
   queued: "Queued",
   printing: "Printing",
   ready: "Ready for pickup",
@@ -38,7 +41,7 @@ function timeAgo(iso) {
   return `${hrs}h ago`;
 }
 
-export default function JobCard({ job, onAdvance, busy }) {
+export default function JobCard({ job, onAdvance, onConfirmPayment, onRejectPayment, busy }) {
   const action = NEXT_ACTION[job.status];
 
   return (
@@ -47,7 +50,7 @@ export default function JobCard({ job, onAdvance, busy }) {
     >
       <div className="flex items-center gap-4 min-w-0">
         <div className="font-mono font-bold text-2xl text-ink tracking-tight w-20 shrink-0">
-          {job.tokenNumber}
+          {job.tokenNumber || "—"}
         </div>
 
         <div className="min-w-0">
@@ -80,14 +83,25 @@ export default function JobCard({ job, onAdvance, busy }) {
         </div>
       </div>
 
-      {action && (
-        <button
-          onClick={() => onAdvance(job, action.nextStatus)}
-          disabled={busy}
-          className={`w-full sm:w-auto shrink-0 text-white text-sm font-medium rounded-lg px-4 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed transition-colors ${ACTION_BUTTON_COLOR[job.status]}`}
-        >
-          {busy ? "Updating…" : action.label}
-        </button>
+      {job.status === "payment_pending" ? (
+        <PaymentReview
+          paymentMethod={job.paymentMethod}
+          paymentScreenshotUrl={job.paymentScreenshotUrl}
+          amountDue={job.amountDue}
+          onConfirm={onConfirmPayment}
+          onReject={onRejectPayment}
+          busy={busy}
+        />
+      ) : (
+        action && (
+          <button
+            onClick={() => onAdvance(job, action.nextStatus)}
+            disabled={busy}
+            className={`w-full sm:w-auto shrink-0 text-white text-sm font-medium rounded-lg px-4 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed transition-colors ${ACTION_BUTTON_COLOR[job.status]}`}
+          >
+            {busy ? "Updating…" : action.label}
+          </button>
+        )
       )}
     </div>
   );

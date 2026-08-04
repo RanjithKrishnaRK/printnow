@@ -6,8 +6,10 @@
 // Dashboard.jsx) - there's no per-doc advance button, matching how they were
 // paid for and queued together in the first place.
 import PrintDetails from "./PrintDetails";
+import PaymentReview from "./PaymentReview";
 
 const STATUS_EDGE = {
+  payment_pending: "border-l-amber-500",
   queued: "border-l-queued",
   printing: "border-l-printing",
   ready: "border-l-ready",
@@ -15,6 +17,7 @@ const STATUS_EDGE = {
 };
 
 const STATUS_LABEL = {
+  payment_pending: "Payment pending review",
   queued: "Queued",
   printing: "Printing",
   ready: "Ready for pickup",
@@ -42,7 +45,7 @@ function timeAgo(iso) {
 
 // jobs: all print_jobs rows sharing one batchId, already filtered to the
 // currently visible status tab (so job.status is the same across the array).
-export default function BatchCard({ jobs, onAdvanceAll, busy }) {
+export default function BatchCard({ jobs, onAdvanceAll, onConfirmPayment, onRejectPayment, busy }) {
   const status = jobs[0].status;
   const tokenNumber = jobs[0].tokenNumber;
   const oldestCreatedAt = jobs.reduce(
@@ -50,6 +53,7 @@ export default function BatchCard({ jobs, onAdvanceAll, busy }) {
     jobs[0].createdAt
   );
   const action = NEXT_ACTION[status];
+  const totalAmountDue = jobs.reduce((sum, j) => sum + (j.amountDue || 0), 0);
 
   return (
     <div
@@ -58,7 +62,7 @@ export default function BatchCard({ jobs, onAdvanceAll, busy }) {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-center gap-4 min-w-0">
           <div className="font-mono font-bold text-2xl text-ink tracking-tight w-20 shrink-0">
-            {tokenNumber}
+            {tokenNumber || "—"}
           </div>
           <div className="min-w-0">
             <div className="text-sm font-medium text-ink">
@@ -79,14 +83,25 @@ export default function BatchCard({ jobs, onAdvanceAll, busy }) {
           </div>
         </div>
 
-        {action && (
-          <button
-            onClick={() => onAdvanceAll(jobs, action.nextStatus)}
-            disabled={busy}
-            className={`w-full sm:w-auto shrink-0 text-white text-sm font-medium rounded-lg px-4 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed transition-colors ${ACTION_BUTTON_COLOR[status]}`}
-          >
-            {busy ? "Updating…" : `${action.label} (all ${jobs.length})`}
-          </button>
+        {status === "payment_pending" ? (
+          <PaymentReview
+            paymentMethod={jobs[0].paymentMethod}
+            paymentScreenshotUrl={jobs[0].paymentScreenshotUrl}
+            amountDue={totalAmountDue}
+            onConfirm={onConfirmPayment}
+            onReject={onRejectPayment}
+            busy={busy}
+          />
+        ) : (
+          action && (
+            <button
+              onClick={() => onAdvanceAll(jobs, action.nextStatus)}
+              disabled={busy}
+              className={`w-full sm:w-auto shrink-0 text-white text-sm font-medium rounded-lg px-4 py-2.5 disabled:opacity-60 disabled:cursor-not-allowed transition-colors ${ACTION_BUTTON_COLOR[status]}`}
+            >
+              {busy ? "Updating…" : `${action.label} (all ${jobs.length})`}
+            </button>
+          )
         )}
       </div>
 

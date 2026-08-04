@@ -16,12 +16,14 @@ export default function Settings({ shopId, token, firstTime = false, onDone }) {
   const [priceColor, setPriceColor] = useState("");
   const [hourlyLimitEnabled, setHourlyLimitEnabled] = useState(false);
   const [maxPagesPerHour, setMaxPagesPerHour] = useState("");
+  const [upiId, setUpiId] = useState("");
 
   useEffect(() => {
     getSettings(shopId, token)
       .then((s) => {
         setPriceBw(String(s.priceBw ?? ""));
         setPriceColor(String(s.priceColor ?? ""));
+        setUpiId(s.upiId ?? "");
         if (s.maxPagesPerHour) {
           setHourlyLimitEnabled(true);
           setMaxPagesPerHour(String(s.maxPagesPerHour));
@@ -50,6 +52,10 @@ export default function Settings({ shopId, token, firstTime = false, onDone }) {
         return setError("Max pages per hour must be a whole number of at least 1, or turn the limit off.");
       }
     }
+    const trimmedUpi = upiId.trim();
+    if (trimmedUpi && !/^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z][a-zA-Z0-9]{1,64}$/.test(trimmedUpi)) {
+      return setError('UPI ID should look like "shopname@okhdfcbank" - check it against your PhonePe/Paytm/GPay app.');
+    }
 
     setSaving(true);
     try {
@@ -57,6 +63,7 @@ export default function Settings({ shopId, token, firstTime = false, onDone }) {
         priceBw: bw,
         priceColor: color,
         maxPagesPerHour: cap,
+        upiId: trimmedUpi || null,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
@@ -111,6 +118,28 @@ export default function Settings({ shopId, token, firstTime = false, onDone }) {
             className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
           />
         </div>
+      </div>
+
+      <div className="mb-2 border-t border-black/5 pt-4">
+        <p className="mb-1 text-xs font-medium uppercase tracking-wide text-collected">
+          UPI ID for student payments
+        </p>
+        <p className="mb-3 text-xs text-collected">
+          The same UPI ID already linked to your PhonePe/Paytm/GPay soundbox or QR code.
+          Students get redirected here to pay directly — no new setup on your end, and no
+          transaction fees. Leave blank to only accept cash at the counter.
+        </p>
+        <label htmlFor="upiId" className="block text-sm font-medium text-ink mb-1">
+          UPI ID
+        </label>
+        <input
+          id="upiId"
+          type="text"
+          value={upiId}
+          onChange={(e) => setUpiId(e.target.value)}
+          placeholder="e.g. shopname@okhdfcbank"
+          className="w-full max-w-xs rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+        />
       </div>
 
       <div className="mb-2 border-t border-black/5 pt-4">

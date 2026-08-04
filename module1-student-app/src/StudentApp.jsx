@@ -138,7 +138,20 @@ const RATE_PER_PAGE = { bw: 2, color: 8 }; // INR — client-side ESTIMATE only.
 // The authoritative amountDue always comes back from POST /jobs and is what
 // we actually charge at the review step.
 
-const STATUS_STEPS = ["uploaded", "paid", "queued", "printing", "ready", "collected"];
+const STATUS_STEPS = ["uploaded", "payment_pending", "queued", "printing", "ready", "collected"];
+const STATUS_STEP_LABELS = {
+  uploaded: "Uploaded",
+  payment_pending: "Payment pending",
+  queued: "Queued",
+  printing: "Printing",
+  ready: "Ready",
+  collected: "Collected",
+};
+// How long a live QR scan counts as proof the student is physically at the
+// shop, for gating the cash-at-counter payment option in ReviewPaymentStep -
+// long enough to walk through upload/settings, short enough that the same
+// scan can't be reused across a later, remote order.
+const QR_SCAN_FRESHNESS_MS = 20 * 60 * 1000;
 const FLOW_STEPS = ["Order details", "Review & pay", "Track order"];
 
 // ---------------------------------------------------------------------------
@@ -202,6 +215,7 @@ const MOCK_SHOP_PUBLIC_INFO = {
     priceBw: 2,
     priceColor: 10,
     maxPagesPerHour: 500,
+    upiId: "sharmaxerox@okhdfcbank",
   },
   "demo-shop-2": {
     shopId: "demo-shop-2",
@@ -209,6 +223,7 @@ const MOCK_SHOP_PUBLIC_INFO = {
     priceBw: 3,
     priceColor: 12,
     maxPagesPerHour: null,
+    upiId: null,
   },
 };
 
@@ -253,7 +268,8 @@ const mockApi = {
     const job = {
       jobId,
       shopId,
-      shopName: "Sharma Xerox & Print Center",
+      shopName: MOCK_SHOP_PUBLIC_INFO[shopId]?.name || "Sharma Xerox & Print Center",
+      shopUpiId: MOCK_SHOP_PUBLIC_INFO[shopId]?.upiId ?? null,
       status: "uploaded",
       amountDue: body.amountDueEstimate,
       tokenNumber: null,
@@ -263,33 +279,61 @@ const mockApi = {
     mockDb.set(jobId, job);
     return { jobId, amountDue: job.amountDue, status: "uploaded" };
   },
-  async payJob(jobId) {
-    await delay(700);
-    const job = mockDb.get(jobId);
-    if (!job) throw new Error("Job not found");
-    job.status = "paid";
-    job.tokenNumber = String(Math.floor(100 + Math.random() * 800));
-    job.paidAt = Date.now();
-    mockDb.set(jobId, job);
-    return { jobId, status: "paid", tokenNumber: job.tokenNumber };
+  // Real payment flow: student submits proof (UPI screenshot, or picks
+  // cash-at-counter), status goes to "payment_pending" - no token minted
+  // here. Mock mode has no separate shop-dashboard process to actually
+  // press "confirm", so it simulates that confirmation happening ~5s later
+  // (see getJob/getBatch below) - matches the old auto-progression timing
+  // this replaced, just with an extra "payment_pending" stage up front.
+  async submitPayment(kind, id, { method, screenshotUrl }) {
+    await delay(600);
+    const obj = mockDb.get(id);
+    if (!obj) throw new Error("Order not found");
+    obj.status = "payment_pending";
+    obj.paymentMethod = method;
+    obj.paymentScreenshotUrl = method === "upi" ? screenshotUrl : null;
+    obj.paymentRejectionReason = null;
+    obj.submittedAt = Date.now();
+    if (obj.isBatch) {
+      for (const jobId of obj.documentJobIds) {
+        const job = mockDb.get(jobId);
+        if (job) {
+          job.status = "payment_pending";
+          job.paymentMethod = method;
+          job.paymentScreenshotUrl = obj.paymentScreenshotUrl;
+        }
+      }
+    }
+    return { [kind === "batch" ? "batchId" : "jobId"]: id, status: "payment_pending" };
+  },
+  async uploadPaymentScreenshot(file) {
+    await delay(500);
+    // No real storage in mock mode - a local blob URL is enough to preview
+    // the exact image the student picked, right there in the same tab.
+    return { screenshotUrl: URL.createObjectURL(file) };
   },
   async getJob(jobId) {
     await delay(350);
     const job = mockDb.get(jobId);
     if (!job) throw new Error("Job not found");
-    if (job.paidAt) {
-      const s = (Date.now() - job.paidAt) / 1000;
-      if (s > 24) job.status = "ready";
-      else if (s > 14) job.status = "printing";
-      else if (s > 5) job.status = "queued";
+    if (job.submittedAt) {
+      const s = (Date.now() - job.submittedAt) / 1000;
+      if (s > 5) {
+        if (!job.tokenNumber) job.tokenNumber = String(Math.floor(100 + Math.random() * 800));
+        job.status = s > 24 ? "ready" : s > 14 ? "printing" : "queued";
+      }
     }
     return {
       jobId: job.jobId,
       status: job.status,
       tokenNumber: job.tokenNumber,
       shopName: job.shopName,
+      shopUpiId: job.shopUpiId,
       amountDue: job.amountDue,
       createdAt: job.createdAt,
+      paymentMethod: job.paymentMethod,
+      paymentScreenshotUrl: job.paymentScreenshotUrl,
+      paymentRejectionReason: job.paymentRejectionReason,
     };
   },
   // Item #3 — order history by phone, no OTP. Mock version just filters
@@ -315,19 +359,22 @@ const mockApi = {
       }));
   },
   // Multi-document upload: one combined payment/token for several documents,
-  // each keeping its own pages/copies/color/sides. Mirrors createJob/payJob/
+  // each keeping its own pages/copies/color/sides. Mirrors createJob/submitPayment/
   // getJob's shape but for a batch - see the real backend's
   // routes/batches.js for the authoritative version this stands in for.
   async createBatch(shopId, body) {
     await delay(700);
     const batchId = `batch_${mockJobCounter++}`;
+    const shopUpiId = MOCK_SHOP_PUBLIC_INFO[shopId]?.upiId ?? null;
+    const shopName = MOCK_SHOP_PUBLIC_INFO[shopId]?.name || "Sharma Xerox & Print Center";
     const documents = body.documents.map((doc) => {
       const jobId = `job_${mockJobCounter++}`;
       const job = {
         jobId,
         shopId,
         batchId,
-        shopName: "Sharma Xerox & Print Center",
+        shopName,
+        shopUpiId,
         status: "uploaded",
         amountDue: doc.amountDueEstimate,
         tokenNumber: null,
@@ -343,7 +390,8 @@ const mockApi = {
       batchId,
       isBatch: true,
       shopId,
-      shopName: "Sharma Xerox & Print Center",
+      shopName,
+      shopUpiId,
       status: "uploaded",
       amountDue,
       tokenNumber: null,
@@ -353,35 +401,22 @@ const mockApi = {
     });
     return { batchId, amountDue, status: "uploaded", documents };
   },
-  async payBatch(batchId) {
-    await delay(700);
-    const batch = mockDb.get(batchId);
-    if (!batch || !batch.isBatch) throw new Error("Batch not found");
-    batch.status = "paid";
-    batch.tokenNumber = String(Math.floor(100 + Math.random() * 800));
-    batch.paidAt = Date.now();
-    for (const jobId of batch.documentJobIds) {
-      const job = mockDb.get(jobId);
-      if (job) {
-        job.status = "paid";
-        job.tokenNumber = batch.tokenNumber;
-      }
-    }
-    mockDb.set(batchId, batch);
-    return { batchId, status: "paid", tokenNumber: batch.tokenNumber };
-  },
   async getBatch(batchId) {
     await delay(350);
     const batch = mockDb.get(batchId);
     if (!batch || !batch.isBatch) throw new Error("Batch not found");
-    if (batch.paidAt) {
-      const s = (Date.now() - batch.paidAt) / 1000;
-      if (s > 24) batch.status = "ready";
-      else if (s > 14) batch.status = "printing";
-      else if (s > 5) batch.status = "queued";
-      for (const jobId of batch.documentJobIds) {
-        const job = mockDb.get(jobId);
-        if (job) job.status = batch.status;
+    if (batch.submittedAt) {
+      const s = (Date.now() - batch.submittedAt) / 1000;
+      if (s > 5) {
+        if (!batch.tokenNumber) batch.tokenNumber = String(Math.floor(100 + Math.random() * 800));
+        batch.status = s > 24 ? "ready" : s > 14 ? "printing" : "queued";
+        for (const jobId of batch.documentJobIds) {
+          const job = mockDb.get(jobId);
+          if (job) {
+            job.status = batch.status;
+            job.tokenNumber = batch.tokenNumber;
+          }
+        }
       }
     }
     const documents = batch.documentJobIds
@@ -407,8 +442,12 @@ const mockApi = {
       status: batch.status,
       tokenNumber: batch.tokenNumber,
       shopName: batch.shopName,
+      shopUpiId: batch.shopUpiId,
       amountDue: batch.amountDue,
       createdAt: batch.createdAt,
+      paymentMethod: batch.paymentMethod,
+      paymentScreenshotUrl: batch.paymentScreenshotUrl,
+      paymentRejectionReason: batch.paymentRejectionReason,
       documents,
     };
   },
@@ -473,14 +512,35 @@ const realApi = {
     if (!res.ok) throw new Error("Could not create job");
     return res.json();
   },
-  async payJob(jobId, paymentRef) {
-    const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}/payment`, {
+  // kind: "job" | "batch". Records the student's payment claim (UPI
+  // screenshot, or cash-at-counter) - status moves to "payment_pending" but
+  // no token is minted here. See routes/jobs.js and routes/batches.js'
+  // submit-payment/confirm-payment/reject-payment for the full flow.
+  async submitPayment(kind, id, { method, screenshotUrl }) {
+    const path = kind === "batch" ? `/api/batches/${id}/submit-payment` : `/api/jobs/${id}/submit-payment`;
+    const res = await fetch(`${API_BASE_URL}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paymentRef }),
+      body: JSON.stringify({ method, screenshotUrl }),
     });
-    if (!res.ok) throw new Error("Payment failed");
-    return res.json();
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not submit payment");
+    }
+    return res.json(); // { jobId/batchId, status: "payment_pending" }
+  },
+  async uploadPaymentScreenshot(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+    const res = await fetch(`${API_BASE_URL}/api/uploads/payment-screenshot`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not upload that screenshot");
+    }
+    return res.json(); // { screenshotUrl }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -509,19 +569,10 @@ const realApi = {
     }
     return res.json(); // { batchId, amountDue, status, documents }
   },
-  async payBatch(batchId, paymentRef) {
-    const res = await fetch(`${API_BASE_URL}/api/batches/${batchId}/payment`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paymentRef }),
-    });
-    if (!res.ok) throw new Error("Payment failed");
-    return res.json(); // { batchId, status, tokenNumber }
-  },
   async getBatch(batchId) {
     const res = await fetch(`${API_BASE_URL}/api/batches/${batchId}`);
     if (!res.ok) throw new Error("Could not fetch order");
-    return res.json(); // { batchId, status, tokenNumber, shopName, amountDue, createdAt, documents }
+    return res.json(); // { batchId, status, tokenNumber, shopName, shopUpiId, amountDue, createdAt, paymentMethod, paymentScreenshotUrl, paymentRejectionReason, documents }
   },
 };
 
@@ -1159,14 +1210,43 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
 // ---------------------------------------------------------------------------
 // Step 2 — Order review (receipt preview) + payment
 // ---------------------------------------------------------------------------
-// kind: "job" | "batch". orderId is the jobId or batchId respectively - one
-// combined payment either way, mirrored by api.payJob/api.payBatch. order
+// kind: "job" | "batch". orderId is the jobId or batchId respectively. order
 // always carries a `documents` array now (length 1 for the plain single-file
 // flow), so this renders a summary per document plus one combined total.
-function ReviewPaymentStep({ kind, orderId, amountDue, order, onPaid, onBack }) {
-  const [paying, setPaying] = useState(false);
+//
+// Payment itself: a student pays the shop's own UPI ID directly (the same
+// soundbox/QR the shop already uses for every other customer) - there's no
+// gateway webhook to confirm it automatically, so instead the student
+// uploads a screenshot as proof and the shop owner reviews + confirms it on
+// their dashboard (see PaymentReview.jsx in module2). Cash is the other
+// option, but only shown when isNearShop is true (a live QR scan just
+// happened) - otherwise a remote student could select "pay cash" and never
+// show up, leaving the shop owner with a phantom job.
+function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop, onSubmitted, onBack }) {
+  const [shopInfo, setShopInfo] = useState(undefined); // undefined = still loading, null = failed to load
+  const [method, setMethod] = useState(null); // null | "upi" | "cash"
+  const [screenshotFile, setScreenshotFile] = useState(null);
+  const [screenshotPreviewUrl, setScreenshotPreviewUrl] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const documents = order?.documents || [];
+  const shopUpiId = shopInfo?.upiId ?? null;
+
+  useEffect(() => {
+    if (!shopId) return;
+    let cancelled = false;
+    api
+      .getShopPublicInfo(shopId)
+      .then((info) => {
+        if (!cancelled) setShopInfo(info || null);
+      })
+      .catch(() => {
+        if (!cancelled) setShopInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [shopId]);
 
   function describeColor(doc) {
     return doc.colorMode === "mixed"
@@ -1176,79 +1256,244 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, onPaid, onBack }) 
       : "Black & white";
   }
 
-  async function handlePay() {
+  function buildUpiLink() {
+    const params = new URLSearchParams({
+      pa: shopUpiId,
+      pn: shopInfo?.name || "PrintNow shop",
+      am: String(amountDue),
+      cu: "INR",
+      tn: `PrintNow order ${orderId}`,
+    });
+    return `upi://pay?${params.toString()}`;
+  }
+
+  function handleScreenshotChosen(file) {
+    if (!file) return;
     setError(null);
-    setPaying(true);
+    setScreenshotFile(file);
+    setScreenshotPreviewUrl(URL.createObjectURL(file));
+  }
+
+  async function handleSubmitUpi() {
+    if (!screenshotFile) return;
+    setError(null);
+    setSubmitting(true);
     try {
-      const paymentRef = `simulated_${Date.now()}`;
-      const result = kind === "batch" ? await api.payBatch(orderId, paymentRef) : await api.payJob(orderId, paymentRef);
-      onPaid(result.tokenNumber);
+      const { screenshotUrl } = await api.uploadPaymentScreenshot(screenshotFile);
+      await api.submitPayment(kind, orderId, { method: "upi", screenshotUrl });
+      onSubmitted();
     } catch (e) {
-      setError(e.message || "Payment failed. Please try again.");
+      setError(e.message || "Could not submit your payment. Please try again.");
     } finally {
-      setPaying(false);
+      setSubmitting(false);
     }
   }
 
-  return (
-    <div className="space-y-5">
-      {onBack && (
-        <button type="button"
-          onClick={onBack}
-          disabled={paying}
-          className="-mt-1 mb-1 flex items-center gap-1 text-xs font-medium text-stone-500 hover:text-stone-700 disabled:opacity-50"
-        >
-          ← Back to edit order
-        </button>
-      )}
+  async function handleSubmitCash() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await api.submitPayment(kind, orderId, { method: "cash" });
+      onSubmitted();
+    } catch (e) {
+      setError(e.message || "Could not submit your order. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
-      <div className="rounded-xl border border-stone-300 bg-white px-4 py-4 shadow-sm shadow-stone-900/[0.03]">
-        <p className="mb-3 text-xs font-medium uppercase tracking-wide text-stone-500">
-          Order summary{documents.length > 1 ? ` — ${documents.length} documents` : ""}
-        </p>
-
-        <div className="space-y-3">
-          {documents.map((doc, i) => (
-            <div key={i} className={i > 0 ? "border-t border-dashed border-stone-200 pt-3" : ""}>
-              <p className="truncate text-sm font-medium text-stone-800">{doc.fileName}</p>
-              <dl className="mt-1.5 space-y-1">
-                {[
-                  ["Pages", doc.pages],
-                  ["Copies", doc.copies],
-                  ["Sides", doc.sides === "double" ? "Double-sided" : "One-sided"],
-                  ["Color", describeColor(doc)],
-                ].map(([label, value]) => (
-                  <div key={label} className="flex items-center justify-between text-xs">
-                    <dt className="text-stone-500">{label}</dt>
-                    <dd className="max-w-[60%] truncate text-right font-medium text-stone-700">{value}</dd>
-                  </div>
-                ))}
-              </dl>
-            </div>
-          ))}
-        </div>
-
-        <div className="my-3 border-t border-dashed border-stone-300" />
-        <div className="flex items-center justify-between">
-          <span className="text-sm font-medium text-stone-700">Amount due</span>
-          <span className="font-mono text-2xl font-bold text-stone-900">₹{amountDue}</span>
-        </div>
-      </div>
-
-      <p className="text-center text-xs text-stone-500">
-        UPI payment integration is coming soon — this button simulates a successful payment for
-        now.
+  const orderSummaryCard = (
+    <div className="rounded-xl border border-stone-300 bg-white px-4 py-4 shadow-sm shadow-stone-900/[0.03]">
+      <p className="mb-3 text-xs font-medium uppercase tracking-wide text-stone-500">
+        Order summary{documents.length > 1 ? ` — ${documents.length} documents` : ""}
       </p>
 
-      {error && <ErrorBanner message={error} onRetry={handlePay} />}
+      <div className="space-y-3">
+        {documents.map((doc, i) => (
+          <div key={i} className={i > 0 ? "border-t border-dashed border-stone-200 pt-3" : ""}>
+            <p className="truncate text-sm font-medium text-stone-800">{doc.fileName}</p>
+            <dl className="mt-1.5 space-y-1">
+              {[
+                ["Pages", doc.pages],
+                ["Copies", doc.copies],
+                ["Sides", doc.sides === "double" ? "Double-sided" : "One-sided"],
+                ["Color", describeColor(doc)],
+              ].map(([label, value]) => (
+                <div key={label} className="flex items-center justify-between text-xs">
+                  <dt className="text-stone-500">{label}</dt>
+                  <dd className="max-w-[60%] truncate text-right font-medium text-stone-700">{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        ))}
+      </div>
 
-      <button type="button"
-        onClick={handlePay}
-        disabled={paying}
-        className="w-full rounded-lg bg-[#2F6E68] py-3.5 text-sm font-semibold text-white shadow-sm shadow-[#2F6E68]/20 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-      >
-        {paying ? "Confirming payment\u2026" : "Pay now"}
-      </button>
+      <div className="my-3 border-t border-dashed border-stone-300" />
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-medium text-stone-700">Amount due</span>
+        <span className="font-mono text-2xl font-bold text-stone-900">₹{amountDue}</span>
+      </div>
+    </div>
+  );
+
+  const backButton = onBack && (
+    <button type="button"
+      onClick={method ? () => setMethod(null) : onBack}
+      disabled={submitting}
+      className="-mt-1 mb-1 flex items-center gap-1 text-xs font-medium text-stone-500 hover:text-stone-700 disabled:opacity-50"
+    >
+      ← {method ? "Choose a different way to pay" : "Back to edit order"}
+    </button>
+  );
+
+  // Still finding out whether this shop has a UPI ID on file.
+  if (shopInfo === undefined) {
+    return (
+      <div className="space-y-5">
+        {backButton}
+        {orderSummaryCard}
+        <Spinner label="Loading payment options\u2026" />
+      </div>
+    );
+  }
+
+  // Method chosen: UPI - pay the shop's own UPI ID directly, then prove it.
+  if (method === "upi") {
+    return (
+      <div className="space-y-5">
+        {backButton}
+        {orderSummaryCard}
+
+        <div className="rounded-xl border border-[#2F6E68]/30 bg-[#2F6E68]/5 px-4 py-4">
+          <p className="mb-3 text-sm font-medium text-stone-800">
+            Step 1 — Pay ₹{amountDue} to this shop's UPI ID
+          </p>
+          <a
+            href={buildUpiLink()}
+            className="mb-2 flex w-full items-center justify-center gap-2 rounded-lg bg-[#2F6E68] py-3 text-sm font-semibold text-white shadow-sm active:scale-[0.99]"
+          >
+            Open UPI app to pay ₹{amountDue}
+          </a>
+          <p className="text-center text-xs text-stone-500">
+            Opens PhonePe, GPay, Paytm, or whichever UPI app you have — paying to {shopUpiId}
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-stone-300 bg-white px-4 py-4">
+          <p className="mb-2 text-sm font-medium text-stone-800">Step 2 — Upload your payment screenshot</p>
+          <p className="mb-3 text-xs text-stone-500">
+            After paying, take a screenshot of the "payment successful" screen so the shop can verify it.
+          </p>
+
+          {screenshotPreviewUrl ? (
+            <div className="mb-3 flex items-center gap-3">
+              <img
+                src={screenshotPreviewUrl}
+                alt="Payment screenshot preview"
+                className="h-20 w-20 rounded-lg border border-stone-300 object-cover"
+              />
+              <label className="cursor-pointer text-xs font-medium text-[#2F6E68] underline">
+                Choose a different photo
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png"
+                  className="hidden"
+                  onChange={(e) => handleScreenshotChosen(e.target.files?.[0] || null)}
+                />
+              </label>
+            </div>
+          ) : (
+            <label className="mb-3 flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-3 text-sm font-medium text-stone-700 shadow-sm active:bg-stone-50">
+              Choose screenshot
+              <input
+                type="file"
+                accept="image/jpeg,image/png"
+                className="hidden"
+                onChange={(e) => handleScreenshotChosen(e.target.files?.[0] || null)}
+              />
+            </label>
+          )}
+
+          {error && <ErrorBanner message={error} onRetry={handleSubmitUpi} />}
+
+          <button type="button"
+            onClick={handleSubmitUpi}
+            disabled={!screenshotFile || submitting}
+            className="w-full rounded-lg bg-[#A63A2C] py-3.5 text-sm font-semibold text-white shadow-sm shadow-[#A63A2C]/20 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+          >
+            {submitting ? "Submitting\u2026" : "Submit payment proof"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Method chosen: cash - just a confirmation, no screenshot needed.
+  if (method === "cash") {
+    return (
+      <div className="space-y-5">
+        {backButton}
+        {orderSummaryCard}
+
+        <div className="rounded-xl border border-stone-300 bg-white px-4 py-4 text-center">
+          <p className="mb-1 text-sm font-medium text-stone-800">Pay ₹{amountDue} in cash</p>
+          <p className="mb-4 text-xs text-stone-500">
+            Hand over ₹{amountDue} in cash to the shop when you collect your prints.
+          </p>
+
+          {error && <ErrorBanner message={error} onRetry={handleSubmitCash} />}
+
+          <button type="button"
+            onClick={handleSubmitCash}
+            disabled={submitting}
+            className="w-full rounded-lg bg-[#A63A2C] py-3.5 text-sm font-semibold text-white shadow-sm shadow-[#A63A2C]/20 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+          >
+            {submitting ? "Confirming\u2026" : "Confirm — I'll pay cash"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // No method chosen yet - the two options (UPI always if the shop has an
+  // ID, cash only when isNearShop).
+  return (
+    <div className="space-y-5">
+      {backButton}
+      {orderSummaryCard}
+
+      <div className="space-y-2.5">
+        {shopUpiId && (
+          <button type="button"
+            onClick={() => setMethod("upi")}
+            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50"
+          >
+            <span className="text-sm font-medium text-stone-800">Pay via UPI</span>
+            <span className="text-stone-400">→</span>
+          </button>
+        )}
+
+        {isNearShop ? (
+          <button type="button"
+            onClick={() => setMethod("cash")}
+            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50"
+          >
+            <span className="text-sm font-medium text-stone-800">Pay cash at counter</span>
+            <span className="text-stone-400">→</span>
+          </button>
+        ) : (
+          <div className="rounded-lg border border-dashed border-stone-300 px-4 py-3 text-center text-xs text-stone-400">
+            Cash payment is available when you scan the shop's QR code in person.
+          </div>
+        )}
+
+        {!shopUpiId && !isNearShop && (
+          <p className="px-1 text-center text-xs text-stone-500">
+            This shop hasn't set up UPI payments yet — please visit in person to pay and print.
+          </p>
+        )}
+      </div>
     </div>
   );
 }
@@ -1256,7 +1501,7 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, onPaid, onBack }) 
 // ---------------------------------------------------------------------------
 // Step 3 — Token + status page (polls GET /jobs/:jobId)
 // ---------------------------------------------------------------------------
-function StatusStep({ kind, orderId, onBack }) {
+function StatusStep({ kind, orderId, onBack, onRetryPayment }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -1351,6 +1596,21 @@ function StatusStep({ kind, orderId, onBack }) {
         </>
       )}
 
+      {job.status === "uploaded" && job.paymentRejectionReason && (
+        <div className="mb-6 rounded-lg border border-red-800/25 bg-red-800/5 px-4 py-3 text-sm text-red-900">
+          <p className="font-medium">The shop couldn't verify your payment</p>
+          <p className="mt-0.5 text-xs">{job.paymentRejectionReason}</p>
+          {onRetryPayment && (
+            <button type="button"
+              onClick={onRetryPayment}
+              className="mt-2 rounded-lg bg-red-800 px-3 py-1.5 text-xs font-semibold text-white"
+            >
+              Try payment again
+            </button>
+          )}
+        </div>
+      )}
+
       {isCancelled ? (
         <div className="rounded-lg border border-red-800/25 bg-red-800/5 px-4 py-3 text-center text-sm text-red-900">
           This order was cancelled.
@@ -1378,7 +1638,7 @@ function StatusStep({ kind, orderId, onBack }) {
                     active ? "font-semibold text-stone-900" : done ? "text-stone-600" : "text-stone-400"
                   }`}
                 >
-                  {step}
+                  {STATUS_STEP_LABELS[step] || step}
                 </span>
               </li>
             );
@@ -1387,7 +1647,9 @@ function StatusStep({ kind, orderId, onBack }) {
       )}
 
       <div className="mt-6 flex items-center justify-between text-xs text-stone-500">
-        <span>Amount paid: ₹{job.amountDue}</span>
+        <span>
+          {["uploaded", "payment_pending"].includes(job.status) ? "Amount due" : "Amount paid"}: ₹{job.amountDue}
+        </span>
         <div className="flex items-center gap-3">
           <button type="button" onClick={handleShare} className="font-medium text-stone-700 underline">
             {copied ? "Link copied" : "Share status"}
@@ -1754,7 +2016,7 @@ function HomeStep({ onShopSelected, onMyOrders }) {
         setError("Scanned code didn't contain a shop ID. Try again or use \"choose by location\" below.");
         return;
       }
-      onShopSelected(id);
+      onShopSelected(id, true); // true: this came from a live QR scan, proof of being at the shop right now
     } catch (err) {
       // Whatever went wrong here was previously invisible - the screen just
       // stayed put with no clue why. Surface it so we can actually see the
@@ -1909,6 +2171,11 @@ export default function App() {
   const [amountDue, setAmountDue] = useState(null);
   const [shopName, setShopName] = useState(null);
   const [order, setOrder] = useState(null);
+  // Proof the student is physically at this shop right now, for gating the
+  // cash-at-counter payment option (see ReviewPaymentStep) - only a live QR
+  // camera scan counts, and only for a short window after scanning, so it
+  // can't be reused later or from a saved/forwarded photo of the code.
+  const [qrScanInfo, setQrScanInfo] = useState(null); // { shopId, scannedAt } | null
   // The live upload form's own state, lifted up here (rather than kept
   // inside UploadStep) specifically so "← Back to edit order" from the
   // Review step doesn't lose what the student already filled in - the
@@ -1972,8 +2239,9 @@ export default function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  function handleShopSelected(id) {
+  function handleShopSelected(id, viaQrScan = false) {
     setShopId(id);
+    setQrScanInfo(viaQrScan ? { shopId: id, scannedAt: Date.now() } : null);
     setPhase("upload");
     pushPhase("upload", { shopId: id });
   }
@@ -1992,6 +2260,7 @@ export default function App() {
   // status/token via the batch payment), so this always opens as kind "job".
   function handleOpenHistoryJob(id, historyShopId) {
     setShopId(historyShopId || null);
+    setQrScanInfo(null); // opening a past order isn't proof of being at the shop right now
     setOrderKind("job");
     setOrderId(id);
     setPhase("status");
@@ -2002,6 +2271,7 @@ export default function App() {
   function handleChangeShop() {
     setShopId(null);
     setShopName(null);
+    setQrScanInfo(null);
     setOrderForm(makeDefaultOrderForm()); // starting over with a different shop - clear the form too
     setPhase("home");
     pushPhase("home", {});
@@ -2047,14 +2317,30 @@ export default function App() {
     pushPhase("upload", { shopId });
   }
 
-  function handlePaid() {
+  // Payment is now a two-step handoff, not a single confirm: this fires
+  // once the student has submitted their proof (UPI screenshot or cash
+  // choice) - the order sits in "payment_pending" until the shop owner
+  // actually reviews and confirms it, which is what mints the token. So
+  // this moves to the status screen same as before, just without a token
+  // in hand yet - StatusStep polls and shows it once the shop confirms.
+  function handleSubmitted() {
     setPhase("status");
     pushPhase("status", orderKind === "batch" ? { shopId, batchId: orderId } : { shopId, jobId: orderId });
+  }
+
+  // If the shop owner rejects what was submitted (bad screenshot, cash
+  // never handed over), StatusStep offers a way back here to try again -
+  // order/amountDue are still the same values from the original submission,
+  // nothing needs re-fetching.
+  function handleRetryPayment() {
+    setPhase("review");
+    pushPhase("review", orderKind === "batch" ? { shopId, batchId: orderId } : { shopId, jobId: orderId });
   }
 
   function handleOpenRecent(id, kind = "job") {
     setOrderKind(kind);
     setOrderId(id);
+    setQrScanInfo(null); // reopening a saved order isn't proof of being at the shop right now
     setPhase("status");
     pushPhase("status", kind === "batch" ? { shopId, batchId: id } : { shopId, jobId: id });
   }
@@ -2064,6 +2350,7 @@ export default function App() {
   function handleBackToHome() {
     setShopId(null);
     setShopName(null);
+    setQrScanInfo(null);
     setOrderId(null);
     setOrderKind("job");
     setOrder(null);
@@ -2105,12 +2392,14 @@ export default function App() {
           orderId={orderId}
           amountDue={amountDue}
           order={order}
-          onPaid={handlePaid}
+          shopId={shopId}
+          isNearShop={qrScanInfo?.shopId === shopId && Date.now() - qrScanInfo?.scannedAt < QR_SCAN_FRESHNESS_MS}
+          onSubmitted={handleSubmitted}
           onBack={handleBackFromReview}
         />
       )}
       {phase === "status" && orderId && (
-        <StatusStep kind={orderKind} orderId={orderId} onBack={handleBackToHome} />
+        <StatusStep kind={orderKind} orderId={orderId} onBack={handleBackToHome} onRetryPayment={handleRetryPayment} />
       )}
       <p className="mt-8 text-center text-[11px] text-stone-400">
         {MOCK_MODE ? "Running in mock mode — no real backend connected yet." : ""}

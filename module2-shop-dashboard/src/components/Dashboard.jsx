@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getJobs, updateJobStatus, getSettings, setAutoPrint, getEarnings } from "../api";
+import { getJobs, updateJobStatus, getSettings, setAutoPrint, getEarnings, confirmPayment, rejectPayment } from "../api";
 import { clearSession } from "../auth";
 import { triggerBuzzer, isMuted, setMuted } from "../buzzer";
 import { openFileAndPrint } from "../printHelper";
@@ -219,7 +219,51 @@ export default function Dashboard({
     }
   }
 
+  // entry: a groupByBatch() entry - { batchId, jobs }. kind/id derived from
+  // whether it's a grouped batch or a lone job, so one pair of handlers
+  // covers both PrintDetails-style cards.
+  async function handleConfirmPayment(entry) {
+    const kind = entry.batchId ? "batch" : "job";
+    const id = entry.batchId || entry.jobs[0].jobId;
+    setUpdatingJobId(id);
+    try {
+      const result = await confirmPayment(kind, id, token);
+      setJobs((prev) =>
+        prev.map((j) =>
+          (kind === "batch" ? j.batchId === id : j.jobId === id)
+            ? { ...j, status: "queued", tokenNumber: result.tokenNumber }
+            : j
+        )
+      );
+    } catch (err) {
+      setError(err.message || "Could not confirm payment.");
+    } finally {
+      setUpdatingJobId(null);
+    }
+  }
+
+  async function handleRejectPayment(entry, reason) {
+    const kind = entry.batchId ? "batch" : "job";
+    const id = entry.batchId || entry.jobs[0].jobId;
+    setUpdatingJobId(id);
+    try {
+      await rejectPayment(kind, id, token, reason);
+      setJobs((prev) =>
+        prev.map((j) =>
+          (kind === "batch" ? j.batchId === id : j.jobId === id)
+            ? { ...j, status: "uploaded", paymentMethod: null, paymentScreenshotUrl: null, paymentRejectionReason: reason }
+            : j
+        )
+      );
+    } catch (err) {
+      setError(err.message || "Could not reject payment.");
+    } finally {
+      setUpdatingJobId(null);
+    }
+  }
+
   const counts = {
+    payment_pending: jobs.filter((j) => j.status === "payment_pending").length,
     queued: jobs.filter((j) => j.status === "queued").length,
     printing: jobs.filter((j) => j.status === "printing").length,
     ready: jobs.filter((j) => j.status === "ready").length,
@@ -337,6 +381,8 @@ export default function Dashboard({
           <div className="text-center text-collected py-16 border border-dashed border-black/10 rounded-xl">
             {activeTab === "history"
               ? "No collected jobs yet today."
+              : activeTab === "payment_pending"
+              ? "No payments waiting on review right now."
               : `No jobs ${activeTab === "queued" ? "in the queue" : `in "${activeTab}"`} right now.`}
           </div>
         ) : (
@@ -347,6 +393,8 @@ export default function Dashboard({
                   key={entry.batchId}
                   jobs={entry.jobs}
                   onAdvanceAll={handleAdvanceAll}
+                  onConfirmPayment={() => handleConfirmPayment(entry)}
+                  onRejectPayment={(reason) => handleRejectPayment(entry, reason)}
                   busy={updatingJobId === entry.batchId}
                 />
               ) : (
@@ -354,6 +402,8 @@ export default function Dashboard({
                   key={entry.jobs[0].jobId}
                   job={entry.jobs[0]}
                   onAdvance={handleAdvance}
+                  onConfirmPayment={() => handleConfirmPayment(entry)}
+                  onRejectPayment={(reason) => handleRejectPayment(entry, reason)}
                   busy={updatingJobId === entry.jobs[0].jobId}
                 />
               )

@@ -1,4 +1,5 @@
 const TABS = [
+  { key: "payment_pending", label: "Payment pending", dot: "bg-amber-500" },
   { key: "queued", label: "Queued", dot: "bg-queued" },
   { key: "printing", label: "Printing", dot: "bg-printing" },
   { key: "ready", label: "Ready", dot: "bg-ready" },

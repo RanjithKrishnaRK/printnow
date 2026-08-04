@@ -51,4 +51,44 @@ router.post('/', (req, res) => {
   });
 });
 
+// Separate multer instance for payment screenshots - photos of a UPI app's
+// "payment successful" screen, so this accepts images (not PDFs) and caps
+// size much lower since it's a phone screenshot, not a scanned document.
+const screenshotStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `${randomUUID()}${ext}`);
+  },
+});
+const uploadScreenshot = multer({
+  storage: screenshotStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB - plenty for a phone screenshot
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype !== 'image/jpeg' && file.mimetype !== 'image/png') {
+      return cb(new Error('Only JPEG or PNG screenshots are accepted'));
+    }
+    cb(null, true);
+  },
+});
+
+// POST /api/uploads/payment-screenshot
+// multipart/form-data, field name: "file"
+// -> { screenshotUrl: string }
+// Used by POST /api/jobs/:jobId/submit-payment and
+// POST /api/batches/:batchId/submit-payment's { method: "upi", screenshotUrl }.
+router.post('/payment-screenshot', (req, res) => {
+  uploadScreenshot.single('file')(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded (expected field name "file")' });
+    }
+
+    const screenshotUrl = `/uploads/${req.file.filename}`;
+    return res.status(201).json({ screenshotUrl });
+  });
+});
+
 module.exports = router;

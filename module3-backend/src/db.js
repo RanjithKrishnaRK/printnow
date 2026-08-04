@@ -224,6 +224,58 @@ async function migrate() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS print_jobs_batch_id_idx ON print_jobs (batch_id);
   `);
+
+  // Migration: shop's own UPI ID (e.g. "shopowner@okhdfcbank") + the
+  // pay-then-prove-it flow. A student is redirected to pay this UPI ID
+  // directly (same soundbox/QR the shop already uses for every other
+  // customer) rather than through a payment gateway - there's no webhook to
+  // tell us payment succeeded, so instead:
+  //   uploaded -> payment_pending (student submitted a screenshot, or chose
+  //               cash-at-counter) -> queued (SHOP OWNER reviewed the
+  //               evidence and tapped confirm) -> ...
+  // payment_method distinguishes the two paths; payment_screenshot_url is
+  // only ever set for 'upi'. If the shop owner rejects what they see (bad
+  // screenshot, no cash handed over), the row goes back to 'uploaded' with
+  // payment_rejection_reason set, and the student can resubmit.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS upi_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS payment_method TEXT CHECK (payment_method IN ('upi','cash'));
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS payment_screenshot_url TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS payment_rejection_reason TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS payment_method TEXT CHECK (payment_method IN ('upi','cash'));
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS payment_screenshot_url TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS payment_rejection_reason TEXT;
+  `);
+  // Widen both status CHECK constraints to admit 'payment_pending', sitting
+  // between 'uploaded' and 'queued'. Postgres names an inline column CHECK
+  // constraint "<table>_<column>_check" by default, so that's what's
+  // dropped before re-adding it with the new allowed list.
+  await pool.query(`
+    ALTER TABLE print_jobs DROP CONSTRAINT IF EXISTS print_jobs_status_check;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD CONSTRAINT print_jobs_status_check
+      CHECK (status IN ('uploaded','payment_pending','queued','printing','ready','collected'));
+  `);
+  await pool.query(`
+    ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_status_check;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD CONSTRAINT batches_status_check
+      CHECK (status IN ('uploaded','payment_pending','queued','printing','ready','collected'));
+  `);
 }
 
 module.exports = { pool, migrate };

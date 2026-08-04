@@ -365,6 +365,8 @@ router.get('/:shopId/jobs', requireShopAuth, requireOwnShop, async (req, res, ne
              color_mode AS "colorMode", color_pages AS "colorPages", sides,
              file_url AS "fileUrl", file_name AS "fileName", batch_id AS "batchId",
              student_phone AS "studentPhone", status,
+             payment_method AS "paymentMethod", payment_screenshot_url AS "paymentScreenshotUrl",
+             payment_rejection_reason AS "paymentRejectionReason",
              created_at AS "createdAt"
       FROM print_jobs WHERE shop_id = $1`;
 
@@ -392,7 +394,7 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
     const { rows } = await pool.query(
       `SELECT auto_print_enabled AS "autoPrintEnabled",
               price_bw AS "priceBw", price_color AS "priceColor",
-              max_pages_per_hour AS "maxPagesPerHour"
+              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"
        FROM shops WHERE id = $1`,
       [shopId]
     );
@@ -407,17 +409,21 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
 
 // PATCH /api/shops/:shopId/settings
 // Shop-owner-only (JWT required, must match :shopId).
-// body: any subset of { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour }
+// body: any subset of { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId }
 // -> the full updated settings object. Partial updates: only fields present
 // in the body get validated and changed, so the Settings page can save
 // pricing and the hourly cap independently of the auto-print toggle.
 // maxPagesPerHour: send null (or omit and pass explicitly as null) to clear
 // the cap entirely ("no limit") - 0 or a negative number is rejected rather
 // than silently treated as "no limit", since that's an easy typo to make.
+// upiId: the shop's own UPI ID (e.g. "shopowner@okhdfcbank") - whatever's
+// already registered to their existing soundbox/QR. Send null to clear it
+// (students then only see the cash-at-counter option, gated separately by
+// a fresh QR scan - see routes/jobs.js submit-payment).
 router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour } = req.body || {};
+    const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId } = req.body || {};
 
     const sets = [];
     const values = [];
@@ -457,9 +463,22 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       values.push(maxPagesPerHour);
     }
 
+    if (upiId !== undefined) {
+      if (upiId !== null) {
+        if (typeof upiId !== 'string' || !/^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z][a-zA-Z0-9]{1,64}$/.test(upiId.trim())) {
+          return res.status(400).json({ error: 'upiId must look like "name@bank" (e.g. shop123@okhdfcbank), or null to clear it' });
+        }
+        sets.push(`upi_id = $${paramIndex++}`);
+        values.push(upiId.trim());
+      } else {
+        sets.push(`upi_id = $${paramIndex++}`);
+        values.push(null);
+      }
+    }
+
     if (sets.length === 0) {
       return res.status(400).json({
-        error: 'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour',
+        error: 'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId',
       });
     }
 
@@ -468,7 +487,7 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       `UPDATE shops SET ${sets.join(', ')} WHERE id = $${paramIndex}
        RETURNING auto_print_enabled AS "autoPrintEnabled",
                  price_bw AS "priceBw", price_color AS "priceColor",
-                 max_pages_per_hour AS "maxPagesPerHour"`,
+                 max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"`,
       values
     );
     if (rows.length === 0) {
@@ -482,16 +501,19 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
 
 // GET /api/shops/:shopId/public
 // Public - no auth. Powers Module 1: once a student has picked a shop, this
-// is what shows them that shop's per-page pricing and hourly print
-// capacity before they commit to uploading. Deliberately excludes anything
-// account-related (email, autoPrintEnabled, etc).
+// is what shows them that shop's per-page pricing, hourly print capacity,
+// and UPI ID (to build the "pay at this shop's usual UPI ID" deep link)
+// before they commit to uploading. Deliberately excludes anything
+// account-related (email, autoPrintEnabled, etc). upiId may be null if the
+// shop hasn't set one yet - the student app falls back to cash-only in that
+// case.
 router.get('/:shopId/public', async (req, res, next) => {
   try {
     const { shopId } = req.params;
     const { rows } = await pool.query(
       `SELECT id AS "shopId", name,
               price_bw AS "priceBw", price_color AS "priceColor",
-              max_pages_per_hour AS "maxPagesPerHour"
+              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"
        FROM shops WHERE id = $1`,
       [shopId]
     );

@@ -23,6 +23,7 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
 export const JOB_STATUSES = [
   "uploaded",
   "paid",
+  "payment_pending",
   "queued",
   "printing",
   "ready",
@@ -85,7 +86,11 @@ async function realGetJobs(shopId, token, status) {
   });
   if (!res.ok) throw new Error("Could not load jobs.");
   const jobs = await res.json();
-  return jobs.map((j) => ({ ...j, fileUrl: absoluteFileUrl(j.fileUrl) }));
+  return jobs.map((j) => ({
+    ...j,
+    fileUrl: absoluteFileUrl(j.fileUrl),
+    paymentScreenshotUrl: absoluteFileUrl(j.paymentScreenshotUrl),
+  }));
 }
 
 async function realUpdateJobStatus(jobId, token, status) {
@@ -99,6 +104,38 @@ async function realUpdateJobStatus(jobId, token, status) {
   });
   if (!res.ok) throw new Error("Could not update job status.");
   return res.json(); // { jobId, status }
+}
+
+// kind: "job" | "batch" - a batch's confirm/reject advances every document
+// in it together (see routes/batches.js), a job's advances just itself.
+async function realConfirmPayment(kind, id, token) {
+  const path = kind === "batch" ? `/api/batches/${id}/confirm-payment` : `/api/jobs/${id}/confirm-payment`;
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not confirm payment.");
+  }
+  return res.json(); // { jobId/batchId, status: "queued", tokenNumber }
+}
+
+async function realRejectPayment(kind, id, token, reason) {
+  const path = kind === "batch" ? `/api/batches/${id}/reject-payment` : `/api/jobs/${id}/reject-payment`;
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not reject payment.");
+  }
+  return res.json(); // { jobId/batchId, status: "uploaded" }
 }
 
 async function realGetSettings(shopId, token) {
@@ -151,6 +188,20 @@ const MOCK_SHOP = {
 };
 
 let mockJobs = [
+  {
+    jobId: "job_1000",
+    tokenNumber: null,
+    pages: 8,
+    copies: 1,
+    colorMode: "bw",
+    fileUrl: "https://example.com/files/job_1000.pdf",
+    status: "payment_pending",
+    paymentMethod: "upi",
+    paymentScreenshotUrl: "https://placehold.co/300x600?text=UPI+Paid+%E2%82%B916",
+    paymentRejectionReason: null,
+    amountDue: 16,
+    createdAt: new Date(Date.now() - 1000 * 60 * 3).toISOString(),
+  },
   {
     jobId: "job_1001",
     tokenNumber: "A101",
@@ -213,7 +264,7 @@ const mockSignedUpShops = []; // { name, email, password, shopId, token }
 // Mirrors the shape returned by GET/PATCH /api/shops/:shopId/settings.
 // priceBw/priceColor default to the same starter rates the real backend
 // backfills new shops with; maxPagesPerHour null = no cap (default).
-let mockSettings = { autoPrintEnabled: false, priceBw: 2, priceColor: 10, maxPagesPerHour: null };
+let mockSettings = { autoPrintEnabled: false, priceBw: 2, priceColor: 10, maxPagesPerHour: null, upiId: null };
 
 async function mockLogin(email, password) {
   await wait(MOCK_LATENCY_MS);
@@ -273,6 +324,32 @@ async function mockUpdateJobStatus(jobId, token, status) {
   return { jobId: job.jobId, status: job.status };
 }
 
+// Mock has no separate batches list - kind is accepted for signature parity
+// with the real API but always operates on mockJobs by id.
+async function mockConfirmPayment(kind, id, token) {
+  await wait(MOCK_LATENCY_MS);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  const job = mockJobs.find((j) => j.jobId === id);
+  if (!job) throw new Error("Job not found.");
+  if (job.status !== "payment_pending") throw new Error(`Cannot confirm payment for a job in status "${job.status}"`);
+  job.status = "queued";
+  job.tokenNumber = job.tokenNumber || `A${100 + Math.floor(Math.random() * 900)}`;
+  return { jobId: job.jobId, status: "queued", tokenNumber: job.tokenNumber };
+}
+
+async function mockRejectPayment(kind, id, token, reason) {
+  await wait(MOCK_LATENCY_MS);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  const job = mockJobs.find((j) => j.jobId === id);
+  if (!job) throw new Error("Job not found.");
+  if (job.status !== "payment_pending") throw new Error(`Cannot reject payment for a job in status "${job.status}"`);
+  job.status = "uploaded";
+  job.paymentMethod = null;
+  job.paymentScreenshotUrl = null;
+  job.paymentRejectionReason = reason || "Payment could not be verified";
+  return { jobId: job.jobId, status: "uploaded" };
+}
+
 async function mockGetSettings(token) {
   await wait(150);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
@@ -304,7 +381,7 @@ async function mockGetEarnings(token) {
 async function mockUpdateSettings(token, patch) {
   await wait(150);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
-  const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour } = patch || {};
+  const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId } = patch || {};
 
   if (autoPrintEnabled !== undefined) {
     if (typeof autoPrintEnabled !== "boolean") throw new Error("autoPrintEnabled must be true or false");
@@ -324,6 +401,9 @@ async function mockUpdateSettings(token, patch) {
       throw new Error("maxPagesPerHour must be a positive integer, or null for no limit");
     }
     mockSettings.maxPagesPerHour = maxPagesPerHour;
+  }
+  if (upiId !== undefined) {
+    mockSettings.upiId = upiId;
   }
   return { ...mockSettings };
 }
@@ -354,6 +434,15 @@ export function updateJobStatus(jobId, token, status) {
   return USE_MOCK
     ? mockUpdateJobStatus(jobId, token, status)
     : realUpdateJobStatus(jobId, token, status);
+}
+
+// kind: "job" | "batch"
+export function confirmPayment(kind, id, token) {
+  return USE_MOCK ? mockConfirmPayment(kind, id, token) : realConfirmPayment(kind, id, token);
+}
+
+export function rejectPayment(kind, id, token, reason) {
+  return USE_MOCK ? mockRejectPayment(kind, id, token, reason) : realRejectPayment(kind, id, token, reason);
 }
 
 export function getSettings(shopId, token) {
