@@ -69,7 +69,8 @@ export default function JobCard({ job, onAdvance, onConfirmPayment, onRejectPaym
               className="text-xs text-ink hover:underline inline-block mt-0.5"
               title="Tap to call the student"
             >
-              📞 {job.studentPhone}
+              📞 {job.studentName ? `${job.studentName} · ` : ""}
+              {job.studentPhone}
             </a>
           )}
           <a

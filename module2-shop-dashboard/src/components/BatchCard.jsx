@@ -66,7 +66,8 @@ export default function BatchCard({ jobs, onAdvanceAll, onConfirmPayment, onReje
           </div>
           <div className="min-w-0">
             <div className="text-sm font-medium text-ink">
-              {jobs.length} documents · one order
+              {jobs.length} documents · one order ·{" "}
+              <span className="font-mono font-semibold text-ready">₹{totalAmountDue}</span>
             </div>
             <div className="text-xs text-collected mt-0.5">
               {STATUS_LABEL[status]} · {timeAgo(oldestCreatedAt)}
@@ -77,7 +78,8 @@ export default function BatchCard({ jobs, onAdvanceAll, onConfirmPayment, onReje
                 className="text-xs text-ink hover:underline inline-block mt-0.5"
                 title="Tap to call the student"
               >
-                📞 {jobs[0].studentPhone}
+                📞 {jobs[0].studentName ? `${jobs[0].studentName} · ` : ""}
+                {jobs[0].studentPhone}
               </a>
             )}
           </div>

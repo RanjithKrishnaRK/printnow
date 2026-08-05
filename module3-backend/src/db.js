@@ -276,6 +276,28 @@ async function migrate() {
     ALTER TABLE batches ADD CONSTRAINT batches_status_check
       CHECK (status IN ('uploaded','payment_pending','queued','printing','ready','collected'));
   `);
+
+  // Migration: a student's name, captured once per phone number. The first
+  // time a phone number places an order anywhere, the student app requires
+  // a name and this table remembers it - every order after that (at any
+  // shop) recognizes the phone number and skips asking again. student_name
+  // is denormalized onto print_jobs/batches at creation time (rather than
+  // joined from here on every read) so the shop dashboard's job list stays
+  // a single query, and so a job's displayed name doesn't retroactively
+  // change if the name were ever edited later.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS students (
+      phone      TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS student_name TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS student_name TEXT;
+  `);
 }
 
 module.exports = { pool, migrate };

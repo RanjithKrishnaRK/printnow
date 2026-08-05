@@ -11,6 +11,7 @@ const {
 } = require('../auth');
 const { calculateAmountDue, parseColorPages } = require('../pricing');
 const { PRICING } = require('../config');
+const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 
 const router = express.Router();
 
@@ -123,7 +124,7 @@ router.post('/signup', async (req, res, next) => {
 router.post('/:shopId/jobs', async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { fileUrl, pages, copies, colorMode, studentPhone, sides, colorPages, fileName } = req.body || {};
+    const { fileUrl, pages, copies, colorMode, studentPhone, sides, colorPages, fileName, studentName } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
       'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
@@ -173,15 +174,26 @@ router.post('/:shopId/jobs', async (req, res, next) => {
       colorPages: colorPagesValue,
       rates: { bw: shop.priceBw, color: shop.priceColor },
     });
+
+    let resolvedName;
+    try {
+      resolvedName = await resolveStudentName(studentPhone, studentName);
+    } catch (err) {
+      if (err instanceof StudentNameRequiredError) {
+        return res.status(400).json({ error: err.message, code: err.code });
+      }
+      throw err;
+    }
+
     const jobId = randomUUID();
     const fileNameValue = typeof fileName === 'string' && fileName.trim() ? fileName.trim() : null;
 
     await pool.query(
       `INSERT INTO print_jobs
          (id, shop_id, file_url, file_name, pages, copies, color_mode, color_pages, sides,
-          student_phone, status, token_number, amount_due, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploaded', NULL, $11, NOW(), NOW())`,
-      [jobId, shopId, fileUrl, fileNameValue, pages, copies, colorMode, colorPagesValue, sidesValue, studentPhone, amountDue]
+          student_phone, student_name, status, token_number, amount_due, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uploaded', NULL, $12, NOW(), NOW())`,
+      [jobId, shopId, fileUrl, fileNameValue, pages, copies, colorMode, colorPagesValue, sidesValue, studentPhone, resolvedName, amountDue]
     );
 
     return res.status(201).json({ jobId, amountDue, status: 'uploaded' });
@@ -205,7 +217,7 @@ router.post('/:shopId/jobs', async (req, res, next) => {
 router.post('/:shopId/batches', async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { studentPhone, documents } = req.body || {};
+    const { studentPhone, studentName, documents } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
       'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
@@ -288,21 +300,31 @@ router.post('/:shopId/batches', async (req, res, next) => {
     const batchId = randomUUID();
     const totalAmountDue = prepared.reduce((sum, d) => sum + d.amountDue, 0);
 
+    let resolvedName;
+    try {
+      resolvedName = await resolveStudentName(studentPhone, studentName);
+    } catch (err) {
+      if (err instanceof StudentNameRequiredError) {
+        return res.status(400).json({ error: err.message, code: err.code });
+      }
+      throw err;
+    }
+
     await pool.query(
-      `INSERT INTO batches (id, shop_id, student_phone, status, token_number, amount_due, created_at, updated_at)
-       VALUES ($1, $2, $3, 'uploaded', NULL, $4, NOW(), NOW())`,
-      [batchId, shopId, studentPhone, totalAmountDue]
+      `INSERT INTO batches (id, shop_id, student_phone, student_name, status, token_number, amount_due, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'uploaded', NULL, $5, NOW(), NOW())`,
+      [batchId, shopId, studentPhone, resolvedName, totalAmountDue]
     );
 
     for (const doc of prepared) {
       await pool.query(
         `INSERT INTO print_jobs
            (id, shop_id, batch_id, file_url, file_name, pages, copies, color_mode, color_pages, sides,
-            student_phone, status, token_number, amount_due, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'uploaded', NULL, $12, NOW(), NOW())`,
+            student_phone, student_name, status, token_number, amount_due, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'uploaded', NULL, $13, NOW(), NOW())`,
         [
           doc.jobId, shopId, batchId, doc.fileUrl, doc.fileName, doc.pages, doc.copies,
-          doc.colorMode, doc.colorPagesValue, doc.sidesValue, studentPhone, doc.amountDue,
+          doc.colorMode, doc.colorPagesValue, doc.sidesValue, studentPhone, resolvedName, doc.amountDue,
         ]
       );
     }
@@ -364,7 +386,8 @@ router.get('/:shopId/jobs', requireShopAuth, requireOwnShop, async (req, res, ne
       SELECT id AS "jobId", token_number AS "tokenNumber", pages, copies,
              color_mode AS "colorMode", color_pages AS "colorPages", sides,
              file_url AS "fileUrl", file_name AS "fileName", batch_id AS "batchId",
-             student_phone AS "studentPhone", status,
+             student_phone AS "studentPhone", student_name AS "studentName",
+             status, amount_due AS "amountDue",
              payment_method AS "paymentMethod", payment_screenshot_url AS "paymentScreenshotUrl",
              payment_rejection_reason AS "paymentRejectionReason",
              created_at AS "createdAt"

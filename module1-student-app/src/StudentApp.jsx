@@ -199,7 +199,23 @@ function computeEstimate({ pages, copies, colorMode, colorPageCount, rates }) {
 // ---------------------------------------------------------------------------
 const mockDb = new Map();
 let mockJobCounter = 1000;
+const mockStudents = new Map(); // phone -> name, mirrors the backend's `students` table
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+
+// Mirrors module3-backend/src/studentName.js: first order for a phone
+// number requires a name and remembers it; every order after that reuses
+// the name on file regardless of what's passed in.
+function resolveMockStudentName(phone, providedName) {
+  if (mockStudents.has(phone)) return mockStudents.get(phone);
+  const trimmed = typeof providedName === "string" ? providedName.trim() : "";
+  if (!trimmed) {
+    const err = new Error("This is your first order — please provide your name");
+    err.code = "STUDENT_NAME_REQUIRED";
+    throw err;
+  }
+  mockStudents.set(phone, trimmed);
+  return trimmed;
+}
 
 const MOCK_LANDMARKS = [{ id: "lm_anurag_university", name: "Anurag University" }];
 const MOCK_SHOPS_BY_LANDMARK = {
@@ -262,8 +278,13 @@ const mockApi = {
       type: "application/pdf",
     });
   },
+  async checkStudent(phone) {
+    await delay(200);
+    return mockStudents.has(phone) ? { phone, name: mockStudents.get(phone) } : null;
+  },
   async createJob(shopId, body) {
     await delay(600);
+    const studentName = resolveMockStudentName(body.studentPhone, body.studentName);
     const jobId = `job_${mockJobCounter++}`;
     const job = {
       jobId,
@@ -275,6 +296,7 @@ const mockApi = {
       tokenNumber: null,
       createdAt: new Date().toISOString(),
       ...body,
+      studentName,
     };
     mockDb.set(jobId, job);
     return { jobId, amountDue: job.amountDue, status: "uploaded" };
@@ -364,6 +386,7 @@ const mockApi = {
   // routes/batches.js for the authoritative version this stands in for.
   async createBatch(shopId, body) {
     await delay(700);
+    const studentName = resolveMockStudentName(body.studentPhone, body.studentName);
     const batchId = `batch_${mockJobCounter++}`;
     const shopUpiId = MOCK_SHOP_PUBLIC_INFO[shopId]?.upiId ?? null;
     const shopName = MOCK_SHOP_PUBLIC_INFO[shopId]?.name || "Sharma Xerox & Print Center";
@@ -380,6 +403,7 @@ const mockApi = {
         tokenNumber: null,
         createdAt: new Date().toISOString(),
         studentPhone: body.studentPhone,
+        studentName,
         ...doc,
       };
       mockDb.set(jobId, job);
@@ -546,6 +570,17 @@ const realApi = {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
     if (!res.ok) throw new Error("Could not fetch job");
     return res.json();
+  },
+  // Whether this phone number has ordered before anywhere - determines if
+  // UploadStep needs to ask for a name (see src/routes/students.js).
+  // Returns null for a brand-new number rather than throwing, since "not
+  // found" is an expected, normal outcome here (most first-time phone
+  // numbers), not an error condition.
+  async checkStudent(phone) {
+    const res = await fetch(`${API_BASE_URL}/api/students/${encodeURIComponent(phone)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error("Could not check phone number");
+    return res.json(); // { phone, name }
   },
   // Item #3 — order history by phone, no OTP (see src/routes/students.js).
   async getOrderHistory(phone) {
@@ -958,13 +993,59 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
 // Step 1 — Upload + print settings + estimate
 // ---------------------------------------------------------------------------
 function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onBack }) {
-  const { documents, phone } = order;
+  const { documents, phone, name } = order;
   const [addingFile, setAddingFile] = useState(false);
   const [addError, setAddError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState(null);
   const [shopInfo, setShopInfo] = useState(null);
   const fileInputRef = useRef(null);
+  // Name capture: once the phone number is a valid 10 digits, check whether
+  // it's ordered before anywhere (see api.checkStudent / GET
+  // /api/students/:phone) - a known number shows a friendly "welcome back"
+  // note and skips asking for a name entirely; a new number requires one
+  // before it can submit. checkedPhone tracks which phone number the result
+  // below actually belongs to, so a fast typist can't slip past the check
+  // with a stale result from a previous number still cached in state.
+  const [checkingPhone, setCheckingPhone] = useState(false);
+  const [checkedPhone, setCheckedPhone] = useState(null);
+  const [knownName, setKnownName] = useState(null); // string | null - null means "checked, and it's new"
+
+  useEffect(() => {
+    const trimmed = phone.trim();
+    if (!/^[6-9]\d{9}$/.test(trimmed)) {
+      setCheckedPhone(null);
+      setKnownName(null);
+      return;
+    }
+    let cancelled = false;
+    setCheckingPhone(true);
+    const t = setTimeout(() => {
+      api
+        .checkStudent(trimmed)
+        .then((result) => {
+          if (cancelled) return;
+          setKnownName(result?.name || null);
+          setCheckedPhone(trimmed);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            // Couldn't check - fail safe by treating as "new", so the name
+            // field appears rather than silently letting a nameless order
+            // through.
+            setKnownName(null);
+            setCheckedPhone(trimmed);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setCheckingPhone(false);
+        });
+    }, 400); // debounce - avoid a request per keystroke while typing the number
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [phone]);
 
   // Every shop sets its own per-page pricing and (optionally) an hourly
   // print cap from its Settings page - fetch it once the student's landed
@@ -1035,8 +1116,19 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
       return d.file && pagesNum > 0 && d.copies > 0 && (d.colorMode !== "mixed" || (d.colorPages.trim() && !rangeError));
     });
 
+  const phoneValid = /^[6-9]\d{9}$/.test(phone.trim());
+  const phoneChecked = phoneValid && checkedPhone === phone.trim();
+  const isNewNumber = phoneChecked && !knownName;
+  const resolvedName = knownName || name.trim();
+
   const canSubmit =
-    allDocsValid && /^[6-9]\d{9}$/.test(phone.trim()) && !submitting && !addingFile;
+    allDocsValid &&
+    phoneValid &&
+    phoneChecked &&
+    !checkingPhone &&
+    (!isNewNumber || name.trim()) &&
+    !submitting &&
+    !addingFile;
 
   async function handleSubmit() {
     setSubmitError(null);
@@ -1072,10 +1164,18 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
 
       if (uploaded.length === 1) {
         const single = uploaded[0];
-        const job = await api.createJob(shopId, { ...single, studentPhone: phone.trim() });
+        const job = await api.createJob(shopId, {
+          ...single,
+          studentPhone: phone.trim(),
+          studentName: resolvedName,
+        });
         onOrderCreated("job", job.jobId, { documents: summaryDocs, phone: phone.trim() });
       } else {
-        const result = await api.createBatch(shopId, { studentPhone: phone.trim(), documents: uploaded });
+        const result = await api.createBatch(shopId, {
+          studentPhone: phone.trim(),
+          studentName: resolvedName,
+          documents: uploaded,
+        });
         onOrderCreated("batch", result.batchId, { documents: summaryDocs, phone: phone.trim() });
       }
     } catch (e) {
@@ -1183,6 +1283,30 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
           className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
         />
         <p className="mt-1 text-xs text-stone-500">We'll text you when it's ready to collect.</p>
+
+        {phoneValid && checkingPhone && (
+          <p className="mt-2 text-xs text-stone-500">Checking…</p>
+        )}
+        {phoneValid && phoneChecked && knownName && (
+          <p className="mt-2 text-xs text-[#2F6E68]">Welcome back, {knownName}!</p>
+        )}
+        {isNewNumber && (
+          <div className="mt-3">
+            <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+              Your name
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setOrder((prev) => ({ ...prev, name: e.target.value }))}
+              placeholder="So the shop knows who to look out for"
+              className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
+            />
+            <p className="mt-1 text-xs text-stone-500">
+              First time ordering with this number — we'll remember it next time.
+            </p>
+          </div>
+        )}
       </div>
 
       {documents.length > 0 && totalEstimate > 0 && (
@@ -1908,12 +2032,23 @@ function QrScanner({ onScan, onClose }) {
           // camera actually stops. Without this guard that second callback
           // re-triggers onScan and races the screen transition, which is
           // what made live scanning look like it "did nothing" - hand off
-          // on the first hit only, and don't block the transition on stop()
-          // resolving.
+          // on the first hit only.
           if (hasScannedRef.current) return;
           hasScannedRef.current = true;
-          onScan(decodedText);
-          scanner.stop().catch(() => {});
+          // Stop the camera FIRST and wait for it to finish tearing down its
+          // video element, THEN call onScan. Calling onScan immediately (old
+          // order) let the parent's state update unmount this component -
+          // removing the #qr-reader container from the DOM - while
+          // html5-qrcode's own stop() was still mid-flight trying to
+          // manipulate that same, now-detached video element. That race is
+          // what produced a blank page after a successful in-app scan (the
+          // library throwing synchronously into React's render cycle, with
+          // no error boundary to catch it) - third-party scanners never hit
+          // this because they never run this library or this teardown at all.
+          scanner
+            .stop()
+            .catch(() => {})
+            .finally(() => onScan(decodedText));
         },
         () => {} // per-frame decode misses are normal while aiming - ignore
       )
@@ -2212,6 +2347,7 @@ function makeDefaultOrderForm() {
   return {
     documents: [],
     phone: "",
+    name: "",
   };
 }
 

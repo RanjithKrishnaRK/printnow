@@ -1,6 +1,7 @@
 // Shared "highlighted" print-details badges: pages×copies, color/b&w/mixed,
-// 2-sided. Pulled out of JobCard so BatchCard's per-document rows can show
-// the exact same at-a-glance treatment without duplicating the markup.
+// 2-sided, and the amount due/collected - visible at every status (queued,
+// printing, ready, and History too), not just while reviewing payment, so a
+// shop owner can always see what a job is worth at a glance.
 export default function PrintDetails({ job }) {
   return (
     <div className="flex items-center gap-2 text-sm text-ink font-medium flex-wrap">
@@ -23,6 +24,11 @@ export default function PrintDetails({ job }) {
       {job.sides === "double" && (
         <span className="text-xs px-1.5 py-0.5 rounded font-medium bg-ink/10 text-ink">
           2-sided
+        </span>
+      )}
+      {typeof job.amountDue === "number" && (
+        <span className="text-xs px-1.5 py-0.5 rounded font-mono font-semibold bg-ready/10 text-ready">
+          ₹{job.amountDue}
         </span>
       )}
     </div>
