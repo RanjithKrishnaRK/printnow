@@ -82,7 +82,9 @@ router.post('/change-password', requireAdminAuth, async (req, res, next) => {
 
 // GET /api/admin/shops
 // Auth required. All shops platform-wide, with landmark name and a job
-// count, for the admin's shop list view.
+// count, for the admin's shop list view. Revenue only counts jobs the shop
+// owner has actually confirmed payment for (past 'payment_pending') - see
+// routes/shops.js' earnings route for the same rule and rationale.
 router.get('/shops', requireAdminAuth, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`
@@ -93,7 +95,7 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
         s.created_at AS "createdAt",
         l.name AS "landmarkName",
         COUNT(pj.id)::int AS "totalJobs",
-        COALESCE(SUM(CASE WHEN pj.status != 'uploaded' THEN pj.amount_due ELSE 0 END), 0)::int AS "totalRevenue"
+        COALESCE(SUM(CASE WHEN pj.status NOT IN ('uploaded', 'payment_pending') THEN pj.amount_due ELSE 0 END), 0)::int AS "totalRevenue"
       FROM shops s
       LEFT JOIN landmarks l ON l.id = s.landmark_id
       LEFT JOIN print_jobs pj ON pj.shop_id = s.id
@@ -158,6 +160,77 @@ router.delete('/shops/:shopId', requireAdminAuth, async (req, res, next) => {
   }
 });
 
+// GET /api/admin/shops/:shopId/stats
+// Auth required. Per-shop financial detail: total/today earnings, and both
+// split by payment method (cash vs UPI) - the shop owner's own earnings
+// route (GET /api/shops/:shopId/earnings) shows totals but not this
+// breakdown, since a shop owner doesn't need to see it split that way, but
+// the platform admin does, to understand cash-vs-digital mix across shops.
+// Same "confirmed payment only" revenue rule as everywhere else: a job still
+// sitting at 'uploaded' or 'payment_pending' isn't counted.
+router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+
+    const { rows: shopRows } = await pool.query('SELECT id, name FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+
+    const CONFIRMED = `status NOT IN ('uploaded', 'payment_pending')`;
+    const [totalRes, todayRes, byMethodRes, todayByMethodRes] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings", COUNT(*)::int AS "totalJobs"
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED}`,
+        [shopId]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(amount_due), 0)::int AS "todayEarnings", COUNT(*)::int AS "todayJobs"
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED} AND created_at::date = CURRENT_DATE`,
+        [shopId]
+      ),
+      pool.query(
+        `SELECT COALESCE(payment_method, 'unknown') AS method,
+                COALESCE(SUM(amount_due), 0)::int AS total, COUNT(*)::int AS count
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED}
+         GROUP BY payment_method`,
+        [shopId]
+      ),
+      pool.query(
+        `SELECT COALESCE(payment_method, 'unknown') AS method,
+                COALESCE(SUM(amount_due), 0)::int AS total, COUNT(*)::int AS count
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED} AND created_at::date = CURRENT_DATE
+         GROUP BY payment_method`,
+        [shopId]
+      ),
+    ]);
+
+    // Reshape the group-by rows into a flat { cash: N, upi: N } - easier for
+    // the admin UI to render than iterating an array, and guarantees both
+    // keys exist (0) even if a shop has never had one payment method at all.
+    function toMethodTotals(rows) {
+      const totals = { cash: 0, upi: 0 };
+      for (const row of rows) {
+        if (row.method === 'cash' || row.method === 'upi') totals[row.method] = row.total;
+      }
+      return totals;
+    }
+
+    return res.status(200).json({
+      shopId,
+      shopName: shopRows[0].name,
+      totalEarnings: totalRes.rows[0].totalEarnings,
+      totalJobs: totalRes.rows[0].totalJobs,
+      todayEarnings: todayRes.rows[0].todayEarnings,
+      todayJobs: todayRes.rows[0].todayJobs,
+      totalByMethod: toMethodTotals(byMethodRes.rows),
+      todayByMethod: toMethodTotals(todayByMethodRes.rows),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/admin/landmarks
 // Auth required. Same landmarks as the public endpoint, plus a shop count -
 // the public /api/landmarks endpoint stays lean for Module 1/2's dropdowns.
@@ -217,6 +290,35 @@ router.post('/landmarks', requireAdminAuth, async (req, res, next) => {
   }
 });
 
+// DELETE /api/admin/landmarks/:landmarkId
+// Auth required. -> { ok: true, shopsUnassigned }
+// Any shop currently registered under this landmark gets its landmark_id
+// cleared (not deleted along with it - a shop losing its physical location
+// tag is very different from a shop being removed entirely, which is what
+// DELETE /shops/:shopId is for). Those shops simply stop appearing in that
+// landmark's browse list until reassigned to a different one from their own
+// Settings page.
+router.delete('/landmarks/:landmarkId', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { landmarkId } = req.params;
+
+    const { rows } = await pool.query('SELECT id FROM landmarks WHERE id = $1', [landmarkId]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Landmark not found' });
+    }
+
+    const { rowCount: shopsUnassigned } = await pool.query(
+      'UPDATE shops SET landmark_id = NULL WHERE landmark_id = $1',
+      [landmarkId]
+    );
+    await pool.query('DELETE FROM landmarks WHERE id = $1', [landmarkId]);
+
+    return res.status(200).json({ ok: true, shopsUnassigned });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/admin/stats
 // Auth required. Platform-wide analytics for the admin dashboard's charts.
 router.get('/stats', requireAdminAuth, async (req, res, next) => {
@@ -240,12 +342,12 @@ router.get('/stats', requireAdminAuth, async (req, res, next) => {
         SELECT status, COUNT(*)::int AS count
         FROM print_jobs GROUP BY status
       `),
-      // Revenue only counts jobs that actually got paid for (paid or later
-      // in the lifecycle) - an "uploaded" job that was never paid isn't
-      // real revenue yet.
+      // Revenue only counts jobs that actually got paid for and confirmed
+      // by the shop owner (past 'payment_pending') - an "uploaded" job was
+      // never paid, and "payment_pending" is only a claim not yet reviewed.
       pool.query(`
         SELECT COALESCE(SUM(amount_due), 0)::int AS "totalRevenue"
-        FROM print_jobs WHERE status != 'uploaded'
+        FROM print_jobs WHERE status NOT IN ('uploaded', 'payment_pending')
       `),
       pool.query(`
         SELECT color_mode AS "colorMode", COUNT(*)::int AS count
@@ -288,6 +390,113 @@ router.get('/stats', requireAdminAuth, async (req, res, next) => {
       dailyVolume: dailyVolume.rows,
       topShops: topShops.rows,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/shops/:shopId/reviews
+// Auth required. Every review for a shop - real and fake, visible and
+// hidden - for moderation. (The public GET /api/shops/:shopId/reviews only
+// ever returns visible ones; this is the admin-only superset.)
+router.get('/shops/:shopId/reviews', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { rows } = await pool.query(
+      `SELECT id, rating, comment, author_name AS "authorName", source, visible,
+              created_at AS "createdAt"
+       FROM reviews WHERE shop_id = $1 ORDER BY created_at DESC`,
+      [shopId]
+    );
+    return res.status(200).json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/shops/:shopId/reviews
+// Auth required. body: { rating, comment?, authorName }
+// Creates an admin-authored review (source: 'fake') - renders identically to
+// a real student review everywhere a student sees it. Meant to seed early
+// social proof before there's enough real order volume for genuine reviews
+// to carry a new shop - not a permanent substitute; the admin should phase
+// these out (hide or delete) as real ones accumulate.
+router.post('/shops/:shopId/reviews', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { rating, comment, authorName } = req.body || {};
+
+    const { rows: shopRows } = await pool.query('SELECT id FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'rating must be a whole number from 1 to 5' });
+    }
+    if (!authorName || typeof authorName !== 'string' || !authorName.trim()) {
+      return res.status(400).json({ error: 'authorName is required' });
+    }
+    const commentValue = typeof comment === 'string' && comment.trim() ? comment.trim().slice(0, 1000) : null;
+
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO reviews (id, shop_id, job_id, rating, comment, author_name, source, visible, created_at)
+       VALUES ($1, $2, NULL, $3, $4, $5, 'fake', TRUE, NOW())`,
+      [id, shopId, rating, commentValue, authorName.trim()]
+    );
+
+    return res.status(201).json({
+      id,
+      rating,
+      comment: commentValue,
+      authorName: authorName.trim(),
+      source: 'fake',
+      visible: true,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/reviews/:reviewId
+// Auth required. body: { visible: boolean } -> the updated review
+// Hides or re-shows a review (real or fake) without deleting it - useful
+// for pulling a real review that's abusive/spam without losing the record,
+// or temporarily unpublishing a fake one.
+router.patch('/reviews/:reviewId', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { reviewId } = req.params;
+    const { visible } = req.body || {};
+    if (typeof visible !== 'boolean') {
+      return res.status(400).json({ error: 'visible must be a boolean' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE reviews SET visible = $1 WHERE id = $2
+       RETURNING id, rating, comment, author_name AS "authorName", source, visible, created_at AS "createdAt"`,
+      [visible, reviewId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Review not found' });
+    }
+
+    return res.status(200).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/admin/reviews/:reviewId
+// Auth required. -> { ok: true }
+router.delete('/reviews/:reviewId', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { reviewId } = req.params;
+    const { rowCount } = await pool.query('DELETE FROM reviews WHERE id = $1', [reviewId]);
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Review not found' });
+    }
+    return res.status(200).json({ ok: true });
   } catch (err) {
     next(err);
   }

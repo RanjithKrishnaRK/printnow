@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getShops, deleteShop } from "../api";
+import ShopDetail from "./ShopDetail";
 
 const POLL_MS = 15000;
 
@@ -8,6 +9,7 @@ export default function Shops({ token }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState(null);
+  const [detailShop, setDetailShop] = useState(null);
 
   const loadShops = useCallback(async () => {
     try {
@@ -92,7 +94,15 @@ export default function Shops({ token }) {
               ) : (
                 shops.map((s) => (
                   <tr key={s.shopId}>
-                    <td className="px-4 py-3 text-ink font-medium">{s.name}</td>
+                    <td className="px-4 py-3 text-ink font-medium">
+                      <button
+                        onClick={() => setDetailShop(s)}
+                        className="hover:underline text-left"
+                        title="View earnings, payment breakdown, and reviews"
+                      >
+                        {s.name}
+                      </button>
+                    </td>
                     <td className="px-4 py-3 text-collected">{s.email}</td>
                     <td className="px-4 py-3 text-collected">{s.landmarkName || "—"}</td>
                     <td className="px-4 py-3 text-right text-ink">{s.totalJobs}</td>
@@ -118,6 +128,10 @@ export default function Shops({ token }) {
           </table>
         </div>
       </div>
+
+      {detailShop && (
+        <ShopDetail token={token} shop={detailShop} onClose={() => setDetailShop(null)} />
+      )}
     </div>
   );
 }

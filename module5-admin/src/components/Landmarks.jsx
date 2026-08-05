@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getLandmarks, createLandmark } from "../api";
+import { getLandmarks, createLandmark, deleteLandmark } from "../api";
 
 export default function Landmarks({ token }) {
   const [landmarks, setLandmarks] = useState([]);
@@ -8,6 +8,7 @@ export default function Landmarks({ token }) {
   const [name, setName] = useState("");
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState("");
+  const [deletingId, setDeletingId] = useState(null);
 
   function load() {
     setLoading(true);
@@ -32,6 +33,27 @@ export default function Landmarks({ token }) {
       setAddError(err.message || "Could not add landmark.");
     } finally {
       setAdding(false);
+    }
+  }
+
+  async function handleDelete(landmark) {
+    const confirmed = window.confirm(
+      landmark.shopCount > 0
+        ? `Delete "${landmark.name}"? ${landmark.shopCount} shop(s) are currently under it - they won't be deleted, but will need to be reassigned to a different landmark from their own Settings page before students can find them again.`
+        : `Delete "${landmark.name}"?`
+    );
+    if (!confirmed) return;
+
+    setDeletingId(landmark.id);
+    const prev = landmarks;
+    setLandmarks((p) => p.filter((l) => l.id !== landmark.id));
+    try {
+      await deleteLandmark(token, landmark.id);
+    } catch (err) {
+      setError(err.message || "Could not delete landmark.");
+      setLandmarks(prev);
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -79,6 +101,7 @@ export default function Landmarks({ token }) {
                 <th className="text-left px-4 py-3 font-medium">Name</th>
                 <th className="text-right px-4 py-3 font-medium">Shops</th>
                 <th className="text-left px-4 py-3 font-medium">Created</th>
+                <th className="text-right px-4 py-3 font-medium">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-black/5">
@@ -88,6 +111,15 @@ export default function Landmarks({ token }) {
                   <td className="px-4 py-3 text-right text-ink">{l.shopCount}</td>
                   <td className="px-4 py-3 text-collected">
                     {new Date(l.createdAt).toLocaleDateString()}
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    <button
+                      onClick={() => handleDelete(l)}
+                      disabled={deletingId === l.id}
+                      className="text-xs text-red-600 hover:text-red-700 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {deletingId === l.id ? "Deleting…" : "Delete"}
+                    </button>
                   </td>
                 </tr>
               ))}

@@ -30,8 +30,14 @@ router.get('/', async (req, res, next) => {
     }
 
     const { rows } = await pool.query(
-      `SELECT id AS "shopId", name, landmark_id AS "landmarkId"
-       FROM shops WHERE landmark_id = $1 ORDER BY name ASC`,
+      `SELECT s.id AS "shopId", s.name, s.landmark_id AS "landmarkId",
+              COALESCE(ROUND(AVG(r.rating)::numeric, 1), 0)::float AS "avgRating",
+              COUNT(r.id)::int AS "reviewCount"
+       FROM shops s
+       LEFT JOIN reviews r ON r.shop_id = s.id AND r.visible = TRUE
+       WHERE s.landmark_id = $1
+       GROUP BY s.id
+       ORDER BY s.name ASC`,
       [landmarkId]
     );
 
@@ -551,10 +557,11 @@ router.get('/:shopId/public', async (req, res, next) => {
 
 // GET /api/shops/:shopId/earnings
 // Shop-owner-only (JWT required, must match :shopId). Powers the earnings
-// summary in the dashboard header. Revenue only counts jobs that actually
-// got paid for (status != 'uploaded') - same rule the admin panel's
-// platform-wide revenue stat already uses, so the two numbers stay
-// consistent with each other.
+// summary in the dashboard header. Revenue only counts jobs the shop owner
+// has actually confirmed payment for (status past 'payment_pending') - an
+// 'uploaded' job was never paid at all, and a 'payment_pending' one is just
+// a claim (screenshot/cash promise) not yet reviewed, so neither is real
+// revenue yet. Same rule the admin panel's stats use, so the numbers agree.
 router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId } = req.params;
@@ -563,14 +570,14 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings",
                 COUNT(*)::int AS "totalJobs"
-         FROM print_jobs WHERE shop_id = $1 AND status != 'uploaded'`,
+         FROM print_jobs WHERE shop_id = $1 AND status NOT IN ('uploaded', 'payment_pending')`,
         [shopId]
       ),
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "todayEarnings",
                 COUNT(*)::int AS "todayJobs"
          FROM print_jobs
-         WHERE shop_id = $1 AND status != 'uploaded' AND created_at::date = CURRENT_DATE`,
+         WHERE shop_id = $1 AND status NOT IN ('uploaded', 'payment_pending') AND created_at::date = CURRENT_DATE`,
         [shopId]
       ),
       pool.query(
@@ -586,6 +593,99 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
       todayJobs: todayRes.rows[0].todayJobs,
       jobsByStatus: statusRes.rows,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/:shopId/reviews
+// Public. body: { jobId, rating, comment? } -> { id, rating, comment, authorName, createdAt }
+// jobId can be either a print_jobs row's own id, or - for a batch order - any
+// one of its documents' job ids (a batch has no single "job" of its own to
+// point at, and one review per order reads more naturally than one per
+// document anyway, so the first doc found for that batch_id is used).
+// Requires the job to have actually moved past payment review (queued or
+// later) - a review on a job still sitting at 'uploaded'/'payment_pending'
+// would mean nothing was ever confirmed, let alone experienced. authorName
+// comes from the job's own student_name, never re-typed.
+router.post('/:shopId/reviews', async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { jobId, rating, comment } = req.body || {};
+
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ error: 'jobId is required' });
+    }
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'rating must be a whole number from 1 to 5' });
+    }
+    const commentValue = typeof comment === 'string' && comment.trim() ? comment.trim().slice(0, 1000) : null;
+
+    const { rows } = await pool.query(
+      `SELECT id, shop_id, student_name, status FROM print_jobs WHERE id = $1`,
+      [jobId]
+    );
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (job.shop_id !== shopId) {
+      return res.status(403).json({ error: 'This job does not belong to this shop' });
+    }
+    if (job.status === 'uploaded' || job.status === 'payment_pending') {
+      return res.status(409).json({ error: 'This order needs to be paid and confirmed before it can be reviewed' });
+    }
+
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM reviews WHERE job_id = $1 AND source = 'real'`,
+      [jobId]
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'This order has already been reviewed' });
+    }
+
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO reviews (id, shop_id, job_id, rating, comment, author_name, source, visible, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'real', TRUE, NOW())`,
+      [id, shopId, jobId, rating, commentValue, job.student_name || 'A student']
+    );
+
+    return res.status(201).json({
+      id,
+      rating,
+      comment: commentValue,
+      authorName: job.student_name || 'A student',
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/shops/:shopId/reviews
+// Public. -> { averageRating, count, reviews: [{ id, rating, comment, authorName, createdAt }] }
+// Only visible reviews - real and admin-added "fake" ones render identically
+// here, which is deliberate (see db.js migration comment on the reviews
+// table) - a hidden real review and a never-approved one are indistinguishable
+// to a student either way.
+router.get('/:shopId/reviews', async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+
+    const { rows: summaryRows } = await pool.query(
+      `SELECT COALESCE(ROUND(AVG(rating)::numeric, 1), 0)::float AS "averageRating", COUNT(*)::int AS count
+       FROM reviews WHERE shop_id = $1 AND visible = TRUE`,
+      [shopId]
+    );
+    const { rows: reviewRows } = await pool.query(
+      `SELECT id, rating, comment, author_name AS "authorName", created_at AS "createdAt"
+       FROM reviews WHERE shop_id = $1 AND visible = TRUE
+       ORDER BY created_at DESC LIMIT 50`,
+      [shopId]
+    );
+
+    return res.status(200).json({ ...summaryRows[0], reviews: reviewRows });
   } catch (err) {
     next(err);
   }

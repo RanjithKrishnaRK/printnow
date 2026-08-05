@@ -73,3 +73,57 @@ export async function createLandmark(token, name) {
   });
   return handle(res);
 }
+
+export async function deleteLandmark(token, landmarkId) {
+  const res = await fetch(`${BASE_URL}/api/admin/landmarks/${landmarkId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { ok: true, shopsUnassigned }
+}
+
+export async function getShopStats(token, shopId) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/stats`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { totalEarnings, todayEarnings, totalByMethod: {cash, upi}, todayByMethod: {cash, upi}, ... }
+}
+
+export async function getShopReviews(token, shopId) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/reviews`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // [{ id, rating, comment, authorName, source, visible, createdAt }]
+}
+
+export async function createFakeReview(token, shopId, { rating, comment, authorName }) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/reviews`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ rating, comment, authorName }),
+  });
+  return handle(res);
+}
+
+export async function setReviewVisibility(token, reviewId, visible) {
+  const res = await fetch(`${BASE_URL}/api/admin/reviews/${reviewId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ visible }),
+  });
+  return handle(res);
+}
+
+export async function deleteReview(token, reviewId) {
+  const res = await fetch(`${BASE_URL}/api/admin/reviews/${reviewId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { ok: true }
+}

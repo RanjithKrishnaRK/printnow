@@ -220,8 +220,8 @@ function resolveMockStudentName(phone, providedName) {
 const MOCK_LANDMARKS = [{ id: "lm_anurag_university", name: "Anurag University" }];
 const MOCK_SHOPS_BY_LANDMARK = {
   lm_anurag_university: [
-    { shopId: "demo-shop", name: "Sharma Xerox & Print Center" },
-    { shopId: "demo-shop-2", name: "Campus Copy Point" },
+    { shopId: "demo-shop", name: "Sharma Xerox & Print Center", avgRating: 4.6, reviewCount: 28 },
+    { shopId: "demo-shop-2", name: "Campus Copy Point", avgRating: 0, reviewCount: 0 },
   ],
 };
 const MOCK_SHOP_PUBLIC_INFO = {
@@ -281,6 +281,21 @@ const mockApi = {
   async checkStudent(phone) {
     await delay(200);
     return mockStudents.has(phone) ? { phone, name: mockStudents.get(phone) } : null;
+  },
+  async submitReview(shopId, { jobId, rating, comment }) {
+    await delay(500);
+    const job = mockDb.get(jobId);
+    if (!job) throw new Error("Job not found");
+    if (job.status === "uploaded" || job.status === "payment_pending") {
+      throw new Error("This order needs to be paid and confirmed before it can be reviewed");
+    }
+    return {
+      id: `review_${Date.now()}`,
+      rating,
+      comment: comment || null,
+      authorName: job.studentName || "A student",
+      createdAt: new Date().toISOString(),
+    };
   },
   async createJob(shopId, body) {
     await delay(600);
@@ -480,17 +495,26 @@ const mockApi = {
 const realApi = {
   async getLandmarks() {
     const res = await fetch(`${API_BASE_URL}/api/landmarks`);
-    if (!res.ok) throw new Error("Could not load landmarks");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load landmarks");
+    }
     return res.json();
   },
   async getShopsByLandmark(landmarkId) {
     const res = await fetch(`${API_BASE_URL}/api/shops?landmarkId=${encodeURIComponent(landmarkId)}`);
-    if (!res.ok) throw new Error("Could not load shops");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load shops");
+    }
     return res.json();
   },
   async getShopPublicInfo(shopId) {
     const res = await fetch(`${API_BASE_URL}/api/shops/${shopId}/public`);
-    if (!res.ok) throw new Error("Could not load this shop's pricing");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load this shop's pricing");
+    }
     return res.json(); // { shopId, name, priceBw, priceColor, maxPagesPerHour }
   },
   // Module 3 (src/routes/uploads.js) expects multipart/form-data with a
@@ -533,7 +557,10 @@ const realApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error("Could not create job");
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || "Could not create job");
+    }
     return res.json();
   },
   // kind: "job" | "batch". Records the student's payment claim (UPI
@@ -568,7 +595,10 @@ const realApi = {
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
-    if (!res.ok) throw new Error("Could not fetch job");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not fetch job");
+    }
     return res.json();
   },
   // Whether this phone number has ordered before anywhere - determines if
@@ -579,8 +609,26 @@ const realApi = {
   async checkStudent(phone) {
     const res = await fetch(`${API_BASE_URL}/api/students/${encodeURIComponent(phone)}`);
     if (res.status === 404) return null;
-    if (!res.ok) throw new Error("Could not check phone number");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not check phone number");
+    }
     return res.json(); // { phone, name }
+  },
+  // Optional review after an order is confirmed - see routes/shops.js
+  // POST /:shopId/reviews. jobId can be any one document's job id even for
+  // a batch order (see that route's comment).
+  async submitReview(shopId, { jobId, rating, comment }) {
+    const res = await fetch(`${API_BASE_URL}/api/shops/${shopId}/reviews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, rating, comment }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not submit your review");
+    }
+    return res.json();
   },
   // Item #3 — order history by phone, no OTP (see src/routes/students.js).
   async getOrderHistory(phone) {
@@ -606,7 +654,10 @@ const realApi = {
   },
   async getBatch(batchId) {
     const res = await fetch(`${API_BASE_URL}/api/batches/${batchId}`);
-    if (!res.ok) throw new Error("Could not fetch order");
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not fetch order");
+    }
     return res.json(); // { batchId, status, tokenNumber, shopName, shopUpiId, amountDue, createdAt, paymentMethod, paymentScreenshotUrl, paymentRejectionReason, documents }
   },
 };
@@ -661,6 +712,31 @@ function getRecentJobs() {
     }));
   } catch (e) {
     return [];
+  }
+}
+// There's no backend "has this order already been reviewed" check exposed
+// to the student app (the backend does still enforce one-review-per-job
+// itself, so this is just about not showing the prompt again locally, not
+// the actual duplicate guard) - a small localStorage set of order ids is
+// enough for that.
+function hasReviewedLocally(orderId) {
+  try {
+    const raw = window.localStorage.getItem("printq_reviewed");
+    const ids = raw ? JSON.parse(raw) : [];
+    return ids.includes(orderId);
+  } catch (e) {
+    return false;
+  }
+}
+function markReviewedLocally(orderId) {
+  try {
+    const raw = window.localStorage.getItem("printq_reviewed");
+    const ids = raw ? JSON.parse(raw) : [];
+    if (!ids.includes(orderId)) {
+      window.localStorage.setItem("printq_reviewed", JSON.stringify([...ids, orderId].slice(-50)));
+    }
+  } catch (e) {
+    // non-fatal
   }
 }
 // "Login" is just remembering the phone number the student last looked up
@@ -788,7 +864,7 @@ function RecentOrders({ onOpen }) {
         {jobs.map((j) => (
           <button type="button"
             key={j.id}
-            onClick={() => onOpen(j.id, j.kind)}
+            onClick={() => onOpen(j.id, j.kind, j.shopId)}
             className="rounded-full border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-600 active:bg-stone-50"
           >
             {j.label || j.id}
@@ -1625,12 +1701,43 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
 // ---------------------------------------------------------------------------
 // Step 3 — Token + status page (polls GET /jobs/:jobId)
 // ---------------------------------------------------------------------------
-function StatusStep({ kind, orderId, onBack, onRetryPayment }) {
+function StatusStep({ kind, orderId, shopId, onBack, onRetryPayment }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const isBatch = kind === "batch";
+
+  // Optional review, offered once the order is past payment review (queued
+  // or later - see routes/shops.js POST /:shopId/reviews for why). For a
+  // batch there's no single "job" of its own to attach it to, so the first
+  // document's job id stands in for the whole order - one review per order
+  // reads more naturally than one per document anyway.
+  const [reviewSubmitted, setReviewSubmitted] = useState(() => hasReviewedLocally(orderId));
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewComment, setReviewComment] = useState("");
+  const [submittingReview, setSubmittingReview] = useState(false);
+  const [reviewError, setReviewError] = useState(null);
+
+  async function handleSubmitReview() {
+    if (!reviewRating) return;
+    setReviewError(null);
+    setSubmittingReview(true);
+    try {
+      const targetJobId = isBatch ? job.documents?.[0]?.jobId : orderId;
+      await api.submitReview(shopId, {
+        jobId: targetJobId,
+        rating: reviewRating,
+        comment: reviewComment.trim() || undefined,
+      });
+      markReviewedLocally(orderId);
+      setReviewSubmitted(true);
+    } catch (e) {
+      setReviewError(e.message || "Could not submit your review. Please try again.");
+    } finally {
+      setSubmittingReview(false);
+    }
+  }
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -1783,6 +1890,54 @@ function StatusStep({ kind, orderId, onBack, onRetryPayment }) {
           </button>
         </div>
       </div>
+
+      {!isCancelled && !["uploaded", "payment_pending"].includes(job.status) && (
+        <div className="mt-6 border-t border-dashed border-stone-300 pt-5">
+          {reviewSubmitted ? (
+            <p className="text-center text-sm text-[#2F6E68]">Thanks for the review!</p>
+          ) : (
+            <div>
+              <p className="mb-2 text-center text-xs font-medium uppercase tracking-wide text-stone-500">
+                How was it? (optional)
+              </p>
+              <div className="flex justify-center gap-1.5">
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <button type="button"
+                    key={n}
+                    onClick={() => setReviewRating(n)}
+                    className={`text-2xl leading-none transition ${
+                      n <= reviewRating ? "text-amber-500" : "text-stone-300"
+                    }`}
+                    aria-label={`${n} star${n > 1 ? "s" : ""}`}
+                  >
+                    ★
+                  </button>
+                ))}
+              </div>
+
+              {reviewRating > 0 && (
+                <div className="mt-3">
+                  <input
+                    type="text"
+                    value={reviewComment}
+                    onChange={(e) => setReviewComment(e.target.value)}
+                    placeholder="Anything you'd like to add? (optional)"
+                    className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm focus:border-stone-500 focus:outline-none"
+                  />
+                  {reviewError && <p className="mt-1.5 text-xs text-red-700">{reviewError}</p>}
+                  <button type="button"
+                    onClick={handleSubmitReview}
+                    disabled={submittingReview}
+                    className="mt-2 w-full rounded-lg bg-[#2F6E68] py-2.5 text-sm font-semibold text-white shadow-sm transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300"
+                  >
+                    {submittingReview ? "Submitting\u2026" : "Submit review"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       </div>
     </div>
   );
@@ -2324,7 +2479,14 @@ function HomeStep({ onShopSelected, onMyOrders }) {
             onClick={() => onShopSelected(s.shopId)}
             className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 text-left text-sm shadow-sm active:bg-stone-50"
           >
-            <span className="font-medium text-stone-800">{s.name}</span>
+            <span>
+              <span className="font-medium text-stone-800">{s.name}</span>
+              {s.reviewCount > 0 && (
+                <span className="ml-2 text-xs text-amber-600">
+                  ★ {s.avgRating} <span className="text-stone-400">({s.reviewCount})</span>
+                </span>
+              )}
+            </span>
             <span className="text-stone-400">→</span>
           </button>
         ))}
@@ -2550,12 +2712,13 @@ export default function App() {
     pushPhase("review", orderKind === "batch" ? { shopId, batchId: orderId } : { shopId, jobId: orderId });
   }
 
-  function handleOpenRecent(id, kind = "job") {
+  function handleOpenRecent(id, kind = "job", entryShopId) {
     setOrderKind(kind);
     setOrderId(id);
+    if (entryShopId) setShopId(entryShopId);
     setQrScanInfo(null); // reopening a saved order isn't proof of being at the shop right now
     setPhase("status");
-    pushPhase("status", kind === "batch" ? { shopId, batchId: id } : { shopId, jobId: id });
+    pushPhase("status", kind === "batch" ? { shopId: entryShopId || shopId, batchId: id } : { shopId: entryShopId || shopId, jobId: id });
   }
 
   // New: the status page previously had no way back at all except leaving
@@ -2612,7 +2775,13 @@ export default function App() {
         />
       )}
       {phase === "status" && orderId && (
-        <StatusStep kind={orderKind} orderId={orderId} onBack={handleBackToHome} onRetryPayment={handleRetryPayment} />
+        <StatusStep
+          kind={orderKind}
+          orderId={orderId}
+          shopId={shopId}
+          onBack={handleBackToHome}
+          onRetryPayment={handleRetryPayment}
+        />
       )}
       <p className="mt-8 text-center text-[11px] text-stone-400">
         {MOCK_MODE ? "Running in mock mode — no real backend connected yet." : ""}

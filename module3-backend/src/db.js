@@ -298,6 +298,39 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE batches ADD COLUMN IF NOT EXISTS student_name TEXT;
   `);
+
+  // Migration: shop reviews, shown to students browsing shops (average
+  // rating + count on the shop list, full list on a shop's page) and
+  // optional to leave after an order is confirmed paid. source
+  // distinguishes a real student's review (job_id set, tied to their
+  // actual order) from one an admin typed in directly ('fake') - both
+  // render identically to students, which is the whole point while the
+  // platform is still building up a real review base, but admins can tell
+  // them apart and moderate either kind (hide instead of only delete, so a
+  // bad real review can be pulled without losing the record of it existing).
+  // One real review per job/batch: the partial unique index only applies to
+  // source='real' rows, so admin-added fake reviews (job_id always NULL)
+  // are untouched by it.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reviews (
+      id           TEXT PRIMARY KEY,
+      shop_id      TEXT NOT NULL REFERENCES shops(id),
+      job_id       TEXT REFERENCES print_jobs(id),
+      rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment      TEXT,
+      author_name  TEXT NOT NULL,
+      source       TEXT NOT NULL CHECK (source IN ('real','fake')),
+      visible      BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS reviews_one_per_real_job
+      ON reviews (job_id) WHERE source = 'real';
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS reviews_shop_id_idx ON reviews (shop_id);
+  `);
 }
 
 module.exports = { pool, migrate };
