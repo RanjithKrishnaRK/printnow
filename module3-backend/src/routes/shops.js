@@ -681,7 +681,7 @@ router.get('/:shopId/reviews', async (req, res, next) => {
     const { rows: reviewRows } = await pool.query(
       `SELECT id, rating, comment, author_name AS "authorName", created_at AS "createdAt"
        FROM reviews WHERE shop_id = $1 AND visible = TRUE
-       ORDER BY created_at DESC LIMIT 50`,
+       ORDER BY sort_order DESC, created_at DESC LIMIT 50`,
       [shopId]
     );
 

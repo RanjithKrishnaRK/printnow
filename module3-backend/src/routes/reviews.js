@@ -24,7 +24,7 @@ router.get('/', async (req, res, next) => {
        FROM reviews r
        JOIN shops s ON s.id = r.shop_id
        WHERE r.visible = TRUE
-       ORDER BY r.created_at DESC
+       ORDER BY r.sort_order DESC, r.created_at DESC
        LIMIT 30`
     );
     return res.status(200).json({ reviews: rows });

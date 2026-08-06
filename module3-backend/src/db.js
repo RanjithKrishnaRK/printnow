@@ -331,6 +331,18 @@ async function migrate() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS reviews_shop_id_idx ON reviews (shop_id);
   `);
+
+  // Migration: admin-controlled top-to-bottom ordering for reviews. Default
+  // display order is newest-first (created_at DESC); sort_order lets an
+  // admin override that by hand from the Reviews tab, moving a chosen
+  // review up or down. Higher sort_order sorts first - everywhere reviews
+  // are listed for display uses "ORDER BY sort_order DESC, created_at DESC",
+  // so reviews that have never been manually reordered (all sort_order = 0,
+  // the default) fall back to the original newest-first order among
+  // themselves, and only get displaced by ones an admin has actually moved.
+  await pool.query(`
+    ALTER TABLE reviews ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
+  `);
 }
 
 module.exports = { pool, migrate };

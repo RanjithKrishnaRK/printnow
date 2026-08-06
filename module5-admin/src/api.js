@@ -127,6 +127,18 @@ export async function createFakeReview(token, shopId, { rating, comment, authorN
   return handle(res);
 }
 
+export async function moveReview(token, reviewId, direction) {
+  const res = await fetch(`${BASE_URL}/api/admin/reviews/${reviewId}/move`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ direction }),
+  });
+  return handle(res); // { ok: true, moved: boolean }
+}
+
 export async function setReviewVisibility(token, reviewId, visible) {
   const res = await fetch(`${BASE_URL}/api/admin/reviews/${reviewId}`, {
     method: "PATCH",

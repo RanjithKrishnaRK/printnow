@@ -406,10 +406,10 @@ router.get('/reviews', requireAdminAuth, async (req, res, next) => {
     const { rows } = await pool.query(
       `SELECT r.id, r.shop_id AS "shopId", s.name AS "shopName",
               r.rating, r.comment, r.author_name AS "authorName", r.source, r.visible,
-              r.created_at AS "createdAt"
+              r.sort_order AS "sortOrder", r.created_at AS "createdAt"
        FROM reviews r
        JOIN shops s ON s.id = r.shop_id
-       ORDER BY r.created_at DESC`
+       ORDER BY r.sort_order DESC, r.created_at DESC`
     );
     return res.status(200).json(rows);
   } catch (err) {
@@ -474,7 +474,7 @@ router.get('/shops/:shopId/reviews', requireAdminAuth, async (req, res, next) =>
     const { rows } = await pool.query(
       `SELECT id, rating, comment, author_name AS "authorName", source, visible,
               created_at AS "createdAt"
-       FROM reviews WHERE shop_id = $1 ORDER BY created_at DESC`,
+       FROM reviews WHERE shop_id = $1 ORDER BY sort_order DESC, created_at DESC`,
       [shopId]
     );
     return res.status(200).json(rows);
@@ -551,6 +551,57 @@ router.patch('/reviews/:reviewId', requireAdminAuth, async (req, res, next) => {
     }
 
     return res.status(200).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/reviews/:reviewId/move
+// Auth required. body: { direction: "up" | "down" } -> the full reordered list
+// Swaps a review's position with its immediate neighbor in the current
+// display order (sort_order DESC, created_at DESC) - "up" moves it toward
+// the top of the platform-wide front-page feed and every shop's own list,
+// "down" toward the bottom. Before swapping, every review's sort_order is
+// renumbered to match its current visual position (dense, strictly
+// descending integers) - most reviews start at the same default (0), so a
+// raw value-swap between two equal sort_orders would do nothing; this
+// guarantees the two being swapped always end up with genuinely different
+// values, and that every future move keeps behaving predictably.
+router.post('/reviews/:reviewId/move', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { reviewId } = req.params;
+    const { direction } = req.body || {};
+    if (direction !== 'up' && direction !== 'down') {
+      return res.status(400).json({ error: 'direction must be "up" or "down"' });
+    }
+
+    const { rows: ordered } = await pool.query(
+      `SELECT id FROM reviews ORDER BY sort_order DESC, created_at DESC`
+    );
+    const index = ordered.findIndex((r) => r.id === reviewId);
+    if (index === -1) {
+      return res.status(404).json({ error: 'Review not found' });
+    }
+
+    const swapIndex = direction === 'up' ? index - 1 : index + 1;
+    if (swapIndex < 0 || swapIndex >= ordered.length) {
+      // Already at the top/bottom - nothing to do, not an error.
+      return res.status(200).json({ ok: true, moved: false });
+    }
+
+    // Renumber everything to its current position (highest number = top),
+    // then swap the two positions being moved.
+    const n = ordered.length;
+    const newOrders = ordered.map((r, i) => ({ id: r.id, sortOrder: n - i }));
+    const a = newOrders[index];
+    const b = newOrders[swapIndex];
+    [a.sortOrder, b.sortOrder] = [b.sortOrder, a.sortOrder];
+
+    for (const row of newOrders) {
+      await pool.query('UPDATE reviews SET sort_order = $1 WHERE id = $2', [row.sortOrder, row.id]);
+    }
+
+    return res.status(200).json({ ok: true, moved: true });
   } catch (err) {
     next(err);
   }

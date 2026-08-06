@@ -5,6 +5,7 @@ import {
   createReviewForShop,
   setReviewVisibility,
   deleteReview,
+  moveReview,
 } from "../api";
 
 const STAR = "★";
@@ -113,6 +114,25 @@ export default function Reviews({ token }) {
     }
   }
 
+  // Moves operate on the true platform-wide order (sort_order DESC,
+  // created_at DESC across every shop), which is what actually determines
+  // the front-page feed - only enabled with no shop filter active, since
+  // "move up" while filtered to one shop would be ambiguous about whether
+  // it means "up within this shop" or "up overall" (it's always the
+  // latter). After a move, reload so the list reflects the real new order
+  // rather than trying to reorder local state by hand.
+  async function handleMove(review, direction) {
+    setBusyId(review.id);
+    try {
+      await moveReview(token, review.id, direction);
+      await loadReviews();
+    } catch (err) {
+      setError(err.message || "Could not reorder review.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   const visibleList = filterShopId ? reviews.filter((r) => r.shopId === filterShopId) : reviews;
 
   if (loading) return <div className="text-collected py-12 text-center text-sm">Loading…</div>;
@@ -195,6 +215,12 @@ export default function Reviews({ token }) {
           ))}
         </select>
       </div>
+      {filterShopId && (
+        <p className="text-xs text-collected">
+          Clear the shop filter to reorder — position controls apply to the true platform-wide
+          order, which is what the front-page feed actually uses.
+        </p>
+      )}
 
       {error && <p className="text-sm text-red-600">{error}</p>}
 
@@ -202,7 +228,7 @@ export default function Reviews({ token }) {
         <p className="text-sm text-collected py-8 text-center">No reviews yet.</p>
       ) : (
         <div className="space-y-2">
-          {visibleList.map((r) => (
+          {visibleList.map((r, i) => (
             <div
               key={r.id}
               className={`rounded-lg border px-4 py-3 text-sm ${
@@ -228,6 +254,26 @@ export default function Reviews({ token }) {
                   )}
                 </div>
                 <div className="flex items-center gap-3 text-xs">
+                  {!filterShopId && (
+                    <span className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleMove(r, "up")}
+                        disabled={busyId === r.id || i === 0}
+                        title="Move up (toward the top of the front-page feed)"
+                        className="text-collected hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        onClick={() => handleMove(r, "down")}
+                        disabled={busyId === r.id || i === visibleList.length - 1}
+                        title="Move down"
+                        className="text-collected hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
+                      >
+                        ▼
+                      </button>
+                    </span>
+                  )}
                   <button
                     onClick={() => handleToggleVisible(r)}
                     disabled={busyId === r.id}
