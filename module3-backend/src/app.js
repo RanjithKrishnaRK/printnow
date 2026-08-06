@@ -12,6 +12,7 @@ const adminRouter = require('./routes/admin');
 const studentsRouter = require('./routes/students');
 const convertRouter = require('./routes/convert');
 const batchesRouter = require('./routes/batches');
+const reviewsRouter = require('./routes/reviews');
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/students', studentsRouter);
 app.use('/api/convert', convertRouter);
 app.use('/api/batches', batchesRouter);
+app.use('/api/reviews', reviewsRouter);
 
 // 404 fallback
 app.use((req, res) => {

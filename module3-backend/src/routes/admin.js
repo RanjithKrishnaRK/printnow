@@ -395,6 +395,75 @@ router.get('/stats', requireAdminAuth, async (req, res, next) => {
   }
 });
 
+// GET /api/admin/reviews
+// Auth required. Every review across every shop - real and fake, visible
+// and hidden - with the shop name attached, so admin can moderate the
+// platform-wide front-page feed (see routes/reviews.js) without having to
+// open each shop individually. GET /shops/:shopId/reviews below still
+// exists for the per-shop view inside a shop's own detail page.
+router.get('/reviews', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT r.id, r.shop_id AS "shopId", s.name AS "shopName",
+              r.rating, r.comment, r.author_name AS "authorName", r.source, r.visible,
+              r.created_at AS "createdAt"
+       FROM reviews r
+       JOIN shops s ON s.id = r.shop_id
+       ORDER BY r.created_at DESC`
+    );
+    return res.status(200).json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/reviews
+// Auth required. body: { shopId, rating, comment?, authorName }
+// Same as POST /shops/:shopId/reviews below, but for the global Reviews tab
+// where the shop is picked from a dropdown rather than already being on
+// that shop's own page.
+router.post('/reviews', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId, rating, comment, authorName } = req.body || {};
+
+    if (!shopId || typeof shopId !== 'string') {
+      return res.status(400).json({ error: 'shopId is required' });
+    }
+    const { rows: shopRows } = await pool.query('SELECT id, name FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'rating must be a whole number from 1 to 5' });
+    }
+    if (!authorName || typeof authorName !== 'string' || !authorName.trim()) {
+      return res.status(400).json({ error: 'authorName is required' });
+    }
+    const commentValue = typeof comment === 'string' && comment.trim() ? comment.trim().slice(0, 1000) : null;
+
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO reviews (id, shop_id, job_id, rating, comment, author_name, source, visible, created_at)
+       VALUES ($1, $2, NULL, $3, $4, $5, 'fake', TRUE, NOW())`,
+      [id, shopId, rating, commentValue, authorName.trim()]
+    );
+
+    return res.status(201).json({
+      id,
+      shopId,
+      shopName: shopRows[0].name,
+      rating,
+      comment: commentValue,
+      authorName: authorName.trim(),
+      source: 'fake',
+      visible: true,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/admin/shops/:shopId/reviews
 // Auth required. Every review for a shop - real and fake, visible and
 // hidden - for moderation. (The public GET /api/shops/:shopId/reviews only

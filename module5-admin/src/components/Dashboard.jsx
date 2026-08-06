@@ -3,12 +3,14 @@ import { clearSession } from "../auth";
 import Overview from "./Overview";
 import Shops from "./Shops";
 import Landmarks from "./Landmarks";
+import Reviews from "./Reviews";
 import ChangePassword from "./ChangePassword";
 
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "shops", label: "Shops" },
   { id: "landmarks", label: "Landmarks" },
+  { id: "reviews", label: "Reviews" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -62,6 +64,7 @@ export default function Dashboard({ token, email, onLogout }) {
         {activeTab === "overview" && <Overview token={token} />}
         {activeTab === "shops" && <Shops token={token} />}
         {activeTab === "landmarks" && <Landmarks token={token} />}
+        {activeTab === "reviews" && <Reviews token={token} />}
         {activeTab === "settings" && <ChangePassword token={token} />}
       </main>
     </div>

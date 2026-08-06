@@ -282,6 +282,16 @@ const mockApi = {
     await delay(200);
     return mockStudents.has(phone) ? { phone, name: mockStudents.get(phone) } : null;
   },
+  async getPlatformReviews() {
+    await delay(300);
+    return {
+      reviews: [
+        { id: "r1", rating: 5, comment: "Super fast, no queue at all.", authorName: "Priya S.", shopName: "Sharma Xerox & Print Center", createdAt: new Date(Date.now() - 86400000).toISOString() },
+        { id: "r2", rating: 4, comment: "Good pricing for color prints.", authorName: "Arjun K.", shopName: "Sharma Xerox & Print Center", createdAt: new Date(Date.now() - 3 * 86400000).toISOString() },
+        { id: "r3", rating: 5, comment: null, authorName: "Meena R.", shopName: "Campus Copy Point", createdAt: new Date(Date.now() - 5 * 86400000).toISOString() },
+      ],
+    };
+  },
   async submitReview(shopId, { jobId, rating, comment }) {
     await delay(500);
     const job = mockDb.get(jobId);
@@ -638,6 +648,14 @@ const realApi = {
       throw new Error(body.error || "Could not load order history");
     }
     return res.json();
+  },
+  // Platform-wide review feed for the front page ("What students are
+  // saying") - see routes/reviews.js. Distinct from a single shop's own
+  // reviews, which power its star rating in the browse list.
+  async getPlatformReviews() {
+    const res = await fetch(`${API_BASE_URL}/api/reviews`);
+    if (!res.ok) throw new Error("Could not load reviews");
+    return res.json(); // { reviews: [...] }
   },
   // Multi-document upload — see module3-backend/src/routes/batches.js.
   async createBatch(shopId, body) {
@@ -2280,6 +2298,7 @@ const homeStepCache = {
   landmarkId: "",
   shops: null,
   shopsForLandmarkId: null,
+  platformReviews: null,
 };
 
 function HomeStep({ onShopSelected, onMyOrders }) {
@@ -2290,6 +2309,7 @@ function HomeStep({ onShopSelected, onMyOrders }) {
   const [shops, setShops] = useState(homeStepCache.shops || []);
   const [loadingShops, setLoadingShops] = useState(false);
   const [error, setError] = useState(null);
+  const [platformReviews, setPlatformReviews] = useState(homeStepCache.platformReviews || []);
   const fileInputRef = useRef(null);
 
   const [manualCode, setManualCode] = useState("");
@@ -2315,6 +2335,20 @@ function HomeStep({ onShopSelected, onMyOrders }) {
         setLandmarks(data);
       })
       .catch(() => setError("Could not load landmarks."));
+  }, []);
+
+  useEffect(() => {
+    if (homeStepCache.platformReviews) return; // already fetched earlier this session
+    api
+      .getPlatformReviews()
+      .then((data) => {
+        homeStepCache.platformReviews = data.reviews;
+        setPlatformReviews(data.reviews);
+      })
+      .catch(() => {
+        // Non-fatal - the section just doesn't render if this fails (see
+        // below), same "fail quiet" treatment as other optional content.
+      });
   }, []);
 
   useEffect(() => {
@@ -2498,6 +2532,29 @@ function HomeStep({ onShopSelected, onMyOrders }) {
       >
         📋 My Orders
       </button>
+
+      {platformReviews.length > 0 && (
+        <div className="mt-10 border-t border-dashed border-stone-300 pt-6">
+          <p className="mb-3 text-center text-xs font-medium uppercase tracking-wide text-stone-500">
+            What students are saying
+          </p>
+          <div className="space-y-2.5">
+            {platformReviews.map((r) => (
+              <div key={r.id} className="rounded-lg border border-stone-200 bg-white px-3.5 py-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-amber-500 text-sm tracking-tight">
+                    {"★".repeat(r.rating)}
+                    <span className="text-stone-200">{"★".repeat(5 - r.rating)}</span>
+                  </span>
+                  <span className="text-xs text-stone-400">{r.shopName}</span>
+                </div>
+                {r.comment && <p className="mt-1.5 text-sm text-stone-700">{r.comment}</p>}
+                <p className="mt-1 text-xs text-stone-400">— {r.authorName}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

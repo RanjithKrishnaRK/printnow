@@ -82,6 +82,25 @@ export async function deleteLandmark(token, landmarkId) {
   return handle(res); // { ok: true, shopsUnassigned }
 }
 
+export async function getAllReviews(token) {
+  const res = await fetch(`${BASE_URL}/api/admin/reviews`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // [{ id, shopId, shopName, rating, comment, authorName, source, visible, createdAt }]
+}
+
+export async function createReviewForShop(token, { shopId, rating, comment, authorName }) {
+  const res = await fetch(`${BASE_URL}/api/admin/reviews`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ shopId, rating, comment, authorName }),
+  });
+  return handle(res);
+}
+
 export async function getShopStats(token, shopId) {
   const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/stats`, {
     headers: { Authorization: `Bearer ${token}` },
