@@ -2188,11 +2188,13 @@ function QrScanner({ onScan, onClose }) {
   const containerId = "qr-reader";
   const scannerRef = useRef(null);
   const hasScannedRef = useRef(false);
+  const stoppingRef = useRef(false); // true once stop() has been initiated, from either the decode handler or unmount
   const [error, setError] = useState(null);
   const [startedAt, setStartedAt] = useState(null);
 
   useEffect(() => {
     hasScannedRef.current = false;
+    stoppingRef.current = false;
     const scanner = new Html5Qrcode(containerId);
     scannerRef.current = scanner;
     scanner
@@ -2209,19 +2211,28 @@ function QrScanner({ onScan, onClose }) {
           if (hasScannedRef.current) return;
           hasScannedRef.current = true;
           // Stop the camera FIRST and wait for it to finish tearing down its
-          // video element, THEN call onScan. Calling onScan immediately (old
-          // order) let the parent's state update unmount this component -
-          // removing the #qr-reader container from the DOM - while
-          // html5-qrcode's own stop() was still mid-flight trying to
-          // manipulate that same, now-detached video element. That race is
-          // what produced a blank page after a successful in-app scan (the
-          // library throwing synchronously into React's render cycle, with
-          // no error boundary to catch it) - third-party scanners never hit
-          // this because they never run this library or this teardown at all.
-          scanner
-            .stop()
-            .catch(() => {})
-            .finally(() => onScan(decodedText));
+          // video element, THEN call onScan. Calling onScan immediately let
+          // the parent's state update unmount this component - removing the
+          // #qr-reader container and triggering the cleanup below - while
+          // html5-qrcode's own stop() here was still mid-flight tearing down
+          // that same video element. stoppingRef stops the cleanup effect
+          // from calling stop() a second time on top of that; html5-qrcode
+          // can throw SYNCHRONOUSLY (not just reject) when stop() runs twice
+          // or the container's already gone, which a bare .catch() doesn't
+          // protect against and was crashing straight into React's unmount
+          // lifecycle - this is what actually produced the blank page /
+          // error-boundary trip after a successful in-app scan. Third-party
+          // scanners never run this library or this teardown at all, which
+          // is why only our own scanner ever hit it.
+          stoppingRef.current = true;
+          try {
+            scanner
+              .stop()
+              .catch(() => {})
+              .finally(() => onScan(decodedText));
+          } catch {
+            onScan(decodedText); // stop() itself threw synchronously - still hand off the scan result
+          }
         },
         () => {} // per-frame decode misses are normal while aiming - ignore
       )
@@ -2241,7 +2252,13 @@ function QrScanner({ onScan, onClose }) {
       });
 
     return () => {
-      scannerRef.current?.stop().catch(() => {});
+      if (stoppingRef.current) return; // already stopped (or being stopped) by the decode handler above
+      stoppingRef.current = true;
+      try {
+        scannerRef.current?.stop().catch(() => {});
+      } catch {
+        // Unmounting anyway - nothing useful to do with a synchronous throw here.
+      }
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2310,6 +2327,8 @@ function HomeStep({ onShopSelected, onMyOrders }) {
   const [loadingShops, setLoadingShops] = useState(false);
   const [error, setError] = useState(null);
   const [platformReviews, setPlatformReviews] = useState(homeStepCache.platformReviews || []);
+  const [showAllReviews, setShowAllReviews] = useState(false);
+  const REVIEWS_COLLAPSED_COUNT = 3;
   const fileInputRef = useRef(null);
 
   const [manualCode, setManualCode] = useState("");
@@ -2539,7 +2558,7 @@ function HomeStep({ onShopSelected, onMyOrders }) {
             What students are saying
           </p>
           <div className="space-y-2.5">
-            {platformReviews.map((r) => (
+            {(showAllReviews ? platformReviews : platformReviews.slice(0, REVIEWS_COLLAPSED_COUNT)).map((r) => (
               <div key={r.id} className="rounded-lg border border-stone-200 bg-white px-3.5 py-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-amber-500 text-sm tracking-tight">
@@ -2553,6 +2572,15 @@ function HomeStep({ onShopSelected, onMyOrders }) {
               </div>
             ))}
           </div>
+          {!showAllReviews && platformReviews.length > REVIEWS_COLLAPSED_COUNT && (
+            <button type="button"
+              onClick={() => setShowAllReviews(true)}
+              className="mt-3 flex w-full items-center justify-center text-xs font-medium text-stone-500 underline decoration-stone-300 underline-offset-2"
+            >
+              Show {platformReviews.length - REVIEWS_COLLAPSED_COUNT} more review
+              {platformReviews.length - REVIEWS_COLLAPSED_COUNT > 1 ? "s" : ""}
+            </button>
+          )}
         </div>
       )}
     </div>
