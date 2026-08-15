@@ -33,6 +33,25 @@ export async function changePassword(token, currentPassword, newPassword) {
   return handle(res); // { ok: true }
 }
 
+export async function getPaymentFees(token) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/payment-fees`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { serviceFee, gatewayFeePercent }
+}
+
+export async function updatePaymentFees(token, { serviceFee, gatewayFeePercent }) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/payment-fees`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ serviceFee, gatewayFeePercent }),
+  });
+  return handle(res); // { serviceFee, gatewayFeePercent }
+}
+
 export async function getStats(token) {
   const res = await fetch(`${BASE_URL}/api/admin/stats`, {
     headers: { Authorization: `Bearer ${token}` },

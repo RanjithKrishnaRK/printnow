@@ -11,6 +11,7 @@ const { randomUUID } = require('crypto');
 const { pool } = require('../db');
 const { hashPassword, comparePassword, signAdminToken, requireAdminAuth } = require('../auth');
 const { UPLOAD_DIR } = require('../config');
+const { getPaymentFees, updatePaymentFees } = require('../settings');
 
 const router = express.Router();
 
@@ -75,6 +76,47 @@ router.post('/change-password', requireAdminAuth, async (req, res, next) => {
     ]);
 
     return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/settings/payment-fees
+// Auth required. -> { serviceFee, gatewayFeePercent }
+router.get('/settings/payment-fees', requireAdminAuth, async (req, res, next) => {
+  try {
+    const fees = await getPaymentFees();
+    return res.status(200).json(fees);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/settings/payment-fees
+// Auth required. body: { serviceFee, gatewayFeePercent } -> the updated values
+// serviceFee is a flat INR amount added to every online payment;
+// gatewayFeePercent is a percentage of the print cost, rounded to the
+// nearest rupee when actually applied (see routes/jobs.js and
+// routes/batches.js razorpay/create-order). Both must be >= 0 - a negative
+// fee would mean paying a student to check out, which is never intended
+// even as a promo (do that by editing PRICING/amount_due directly instead).
+router.patch('/settings/payment-fees', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { serviceFee, gatewayFeePercent } = req.body || {};
+    if (typeof serviceFee !== 'number' || !Number.isFinite(serviceFee) || serviceFee < 0) {
+      return res.status(400).json({ error: 'serviceFee must be a non-negative number' });
+    }
+    if (
+      typeof gatewayFeePercent !== 'number' ||
+      !Number.isFinite(gatewayFeePercent) ||
+      gatewayFeePercent < 0 ||
+      gatewayFeePercent > 100
+    ) {
+      return res.status(400).json({ error: 'gatewayFeePercent must be a number between 0 and 100' });
+    }
+
+    const updated = await updatePaymentFees({ serviceFee, gatewayFeePercent });
+    return res.status(200).json(updated);
   } catch (err) {
     next(err);
   }

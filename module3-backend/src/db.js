@@ -312,6 +312,52 @@ async function migrate() {
       CHECK (payment_method IN ('upi','cash','razorpay'));
   `);
 
+  // Migration: generic admin-editable settings (key/value), starting with
+  // the two online-payment surcharges. Kept as a flexible table rather than
+  // dedicated columns since "what settings the admin can tune" will likely
+  // grow past just these two. serviceFee is a flat INR amount added to
+  // every online payment; gatewayFeePercent is a percentage of the print
+  // cost (rounded to the nearest rupee when applied - see routes/jobs.js
+  // and routes/batches.js razorpay/create-order). Both default to 0 - "no
+  // fee for the first few weeks" per the launch plan - and are only
+  // inserted if missing, so re-running this migration never resets a value
+  // an admin has already changed.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES ('service_fee', '0', NOW())
+    ON CONFLICT (key) DO NOTHING;
+  `);
+  await pool.query(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES ('gateway_fee_percent', '0', NOW())
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
+  // Migration: record what was actually charged for an online payment
+  // (print cost is amount_due; these two are the surcharges layered on top
+  // at the moment the Razorpay order was created), so the fee breakdown a
+  // student saw is auditable later even if the admin changes the fee
+  // settings afterward.
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS service_fee INTEGER NOT NULL DEFAULT 0;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS gateway_fee INTEGER NOT NULL DEFAULT 0;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS service_fee INTEGER NOT NULL DEFAULT 0;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS gateway_fee INTEGER NOT NULL DEFAULT 0;
+  `);
+
   // Migration: a student's name, captured once per phone number. The first
   // time a phone number places an order anywhere, the student app requires
   // a name and this table remembers it - every order after that (at any

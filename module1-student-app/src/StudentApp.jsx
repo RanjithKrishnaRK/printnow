@@ -416,6 +416,12 @@ const mockApi = {
     }
     return { [kind === "batch" ? "batchId" : "jobId"]: id, status: "queued", tokenNumber: obj.tokenNumber };
   },
+  // Mock mode has no admin panel writing real settings - always "no fee",
+  // matching the platform's actual default.
+  async getPaymentFees() {
+    await delay(150);
+    return { serviceFee: 0, gatewayFeePercent: 0 };
+  },
   async getJob(jobId) {
     await delay(350);
     const job = mockDb.get(jobId);
@@ -686,6 +692,17 @@ const realApi = {
       throw new Error(body.error || "Payment could not be verified");
     }
     return res.json(); // { jobId/batchId, status: "queued", tokenNumber }
+  },
+  // Public, no auth - admin-editable fee settings (see admin panel's
+  // Settings tab). Read before opening checkout so the "Pay online" button
+  // can show the real total, rather than surprising the student mid-payment.
+  async getPaymentFees() {
+    const res = await fetch(`${API_BASE_URL}/api/settings/payment-fees`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load payment fee settings");
+    }
+    return res.json(); // { serviceFee, gatewayFeePercent }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -1518,37 +1535,42 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
 //
 // Payment itself: a student pays the shop's own UPI ID directly (the same
 // soundbox/QR the shop already uses for every other customer) - there's no
-// gateway webhook to confirm it automatically, so instead the student
-// uploads a screenshot as proof and the shop owner reviews + confirms it on
-// their dashboard (see PaymentReview.jsx in module2). Cash is the other
-// option, but only shown when isNearShop is true (a live QR scan just
-// happened) - otherwise a remote student could select "pay cash" and never
-// show up, leaving the shop owner with a phantom job.
+// gateway signature IS the confirmation, no shop owner review needed - see
+// verifyRazorpayPayment). Cash is the other option, but only shown when
+// isNearShop is true (a live QR scan just happened) - otherwise a remote
+// student could select "pay cash" and never show up, leaving the shop
+// owner with a phantom job. Manual UPI-screenshot payment has been removed
+// from this screen entirely: it required the shop owner to manually review
+// and confirm every payment, which was the slowest path for everyone - a
+// remote student (came in via the website, not a QR scan) now only sees
+// "Pay online", since cash isn't an option for them either.
 function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop, onSubmitted, onBack }) {
-  const [shopInfo, setShopInfo] = useState(undefined); // undefined = still loading, null = failed to load
-  const [method, setMethod] = useState(null); // null | "upi" | "cash"
-  const [screenshotFile, setScreenshotFile] = useState(null);
-  const [screenshotPreviewUrl, setScreenshotPreviewUrl] = useState(null);
+  const [method, setMethod] = useState(null); // null | "cash"
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [fees, setFees] = useState({ serviceFee: 0, gatewayFeePercent: 0 });
   const documents = order?.documents || [];
-  const shopUpiId = shopInfo?.upiId ?? null;
 
+  // Fee settings are public/admin-editable (see admin panel's Settings tab)
+  // and apply only to the online path - fetched once so the "Pay online"
+  // button can show the real total up front instead of surprising the
+  // student inside the Razorpay popup. Silently falls back to "no fee" on
+  // error rather than blocking checkout over a settings-read failure.
   useEffect(() => {
-    if (!shopId) return;
     let cancelled = false;
     api
-      .getShopPublicInfo(shopId)
-      .then((info) => {
-        if (!cancelled) setShopInfo(info || null);
+      .getPaymentFees()
+      .then((f) => {
+        if (!cancelled) setFees(f);
       })
-      .catch(() => {
-        if (!cancelled) setShopInfo(null);
-      });
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [shopId]);
+  }, []);
+
+  const gatewayFee = Math.round((amountDue * fees.gatewayFeePercent) / 100);
+  const onlineTotal = amountDue + fees.serviceFee + gatewayFee;
 
   function describeColor(doc) {
     return doc.colorMode === "mixed"
@@ -1556,39 +1578,6 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
       : doc.colorMode === "color"
       ? "Full color"
       : "Black & white";
-  }
-
-  function buildUpiLink() {
-    const params = new URLSearchParams({
-      pa: shopUpiId,
-      pn: shopInfo?.name || "PrintNow shop",
-      am: String(amountDue),
-      cu: "INR",
-      tn: `PrintNow order ${orderId}`,
-    });
-    return `upi://pay?${params.toString()}`;
-  }
-
-  function handleScreenshotChosen(file) {
-    if (!file) return;
-    setError(null);
-    setScreenshotFile(file);
-    setScreenshotPreviewUrl(URL.createObjectURL(file));
-  }
-
-  async function handleSubmitUpi() {
-    if (!screenshotFile) return;
-    setError(null);
-    setSubmitting(true);
-    try {
-      const { screenshotUrl } = await api.uploadPaymentScreenshot(screenshotFile);
-      await api.submitPayment(kind, orderId, { method: "upi", screenshotUrl });
-      onSubmitted();
-    } catch (e) {
-      setError(e.message || "Could not submit your payment. Please try again.");
-    } finally {
-      setSubmitting(false);
-    }
   }
 
   async function handleSubmitCash() {
@@ -1703,88 +1692,6 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     </button>
   );
 
-  // Still finding out whether this shop has a UPI ID on file.
-  if (shopInfo === undefined) {
-    return (
-      <div className="space-y-5">
-        {backButton}
-        {orderSummaryCard}
-        <Spinner label="Loading payment options\u2026" />
-      </div>
-    );
-  }
-
-  // Method chosen: UPI - pay the shop's own UPI ID directly, then prove it.
-  if (method === "upi") {
-    return (
-      <div className="space-y-5">
-        {backButton}
-        {orderSummaryCard}
-
-        <div className="rounded-xl border border-[#2F6E68]/30 bg-[#2F6E68]/5 px-4 py-4">
-          <p className="mb-3 text-sm font-medium text-stone-800">
-            Step 1 — Pay ₹{amountDue} to this shop's UPI ID
-          </p>
-          <a
-            href={buildUpiLink()}
-            className="mb-2 flex w-full items-center justify-center gap-2 rounded-lg bg-[#2F6E68] py-3 text-sm font-semibold text-white shadow-sm active:scale-[0.99]"
-          >
-            Open UPI app to pay ₹{amountDue}
-          </a>
-          <p className="text-center text-xs text-stone-500">
-            Opens PhonePe, GPay, Paytm, or whichever UPI app you have — paying to {shopUpiId}
-          </p>
-        </div>
-
-        <div className="rounded-xl border border-stone-300 bg-white px-4 py-4">
-          <p className="mb-2 text-sm font-medium text-stone-800">Step 2 — Upload your payment screenshot</p>
-          <p className="mb-3 text-xs text-stone-500">
-            After paying, take a screenshot of the "payment successful" screen so the shop can verify it.
-          </p>
-
-          {screenshotPreviewUrl ? (
-            <div className="mb-3 flex items-center gap-3">
-              <img
-                src={screenshotPreviewUrl}
-                alt="Payment screenshot preview"
-                className="h-20 w-20 rounded-lg border border-stone-300 object-cover"
-              />
-              <label className="cursor-pointer text-xs font-medium text-[#2F6E68] underline">
-                Choose a different photo
-                <input
-                  type="file"
-                  accept="image/jpeg,image/png"
-                  className="hidden"
-                  onChange={(e) => handleScreenshotChosen(e.target.files?.[0] || null)}
-                />
-              </label>
-            </div>
-          ) : (
-            <label className="mb-3 flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-3 text-sm font-medium text-stone-700 shadow-sm active:bg-stone-50">
-              Choose screenshot
-              <input
-                type="file"
-                accept="image/jpeg,image/png"
-                className="hidden"
-                onChange={(e) => handleScreenshotChosen(e.target.files?.[0] || null)}
-              />
-            </label>
-          )}
-
-          {error && <ErrorBanner message={error} onRetry={handleSubmitUpi} />}
-
-          <button type="button"
-            onClick={handleSubmitUpi}
-            disabled={!screenshotFile || submitting}
-            className="w-full rounded-lg bg-[#A63A2C] py-3.5 text-sm font-semibold text-white shadow-sm shadow-[#A63A2C]/20 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-          >
-            {submitting ? "Submitting\u2026" : "Submit payment proof"}
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   // Method chosen: cash - just a confirmation, no screenshot needed.
   if (method === "cash") {
     return (
@@ -1812,8 +1719,10 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     );
   }
 
-  // No method chosen yet - the two options (UPI always if the shop has an
-  // ID, cash only when isNearShop).
+  // No method chosen yet. Scanned the shop's QR in person (isNearShop):
+  // online + cash. Came in through the website instead: online only - no
+  // cash (they're not standing at the counter to hand it over) and no
+  // manual UPI (removed entirely, see comment above the component).
   return (
     <div className="space-y-5">
       {backButton}
@@ -1827,24 +1736,20 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
           disabled={submitting}
           className="flex w-full items-center justify-between rounded-lg border border-[#2F6E68] bg-[#2F6E68]/5 px-4 py-3.5 text-left shadow-sm active:bg-[#2F6E68]/10 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <span className="text-sm font-medium text-[#2F6E68]">
-            {submitting ? "Opening secure payment\u2026" : "Pay online — Card / UPI / Wallet"}
+          <span>
+            <span className="block text-sm font-medium text-[#2F6E68]">
+              {submitting ? "Opening secure payment\u2026" : "Pay online — Card / UPI / Wallet"}
+            </span>
+            {onlineTotal > amountDue && (
+              <span className="mt-0.5 block text-xs text-[#2F6E68]/70">
+                Total ₹{onlineTotal} (₹{amountDue} print + ₹{onlineTotal - amountDue} payment fee)
+              </span>
+            )}
           </span>
           <span className="text-[#2F6E68]">→</span>
         </button>
 
-        {shopUpiId && (
-          <button type="button"
-            onClick={() => setMethod("upi")}
-            disabled={submitting}
-            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <span className="text-sm font-medium text-stone-800">Pay via UPI (manual, needs shop to confirm)</span>
-            <span className="text-stone-400">→</span>
-          </button>
-        )}
-
-        {isNearShop ? (
+        {isNearShop && (
           <button type="button"
             onClick={() => setMethod("cash")}
             disabled={submitting}
@@ -1853,16 +1758,6 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
             <span className="text-sm font-medium text-stone-800">Pay cash at counter</span>
             <span className="text-stone-400">→</span>
           </button>
-        ) : (
-          <div className="rounded-lg border border-dashed border-stone-300 px-4 py-3 text-center text-xs text-stone-400">
-            Cash payment is available when you scan the shop's QR code in person.
-          </div>
-        )}
-
-        {!shopUpiId && !isNearShop && (
-          <p className="px-1 text-center text-xs text-stone-500">
-            This shop hasn't set up UPI payments yet — please visit in person to pay and print.
-          </p>
         )}
       </div>
     </div>

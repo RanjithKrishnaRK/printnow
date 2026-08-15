@@ -8,6 +8,7 @@ const { generateTokenNumber } = require('../tokenGenerator');
 const { notifyStudent } = require('../notify');
 const { UPLOAD_DIR, RAZORPAY_KEY_ID } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
+const { getPaymentFees } = require('../settings');
 
 const router = express.Router();
 
@@ -33,18 +34,26 @@ router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
       });
     }
 
+    const fees = await getPaymentFees();
+    const baseAmount = job.amount_due;
+    const gatewayFee = Math.round((baseAmount * fees.gatewayFeePercent) / 100);
+    const serviceFee = fees.serviceFee;
+    const totalAmount = baseAmount + serviceFee + gatewayFee;
+
     const razorpay = getClient();
     const order = await razorpay.orders.create({
-      amount: job.amount_due * 100,
+      amount: totalAmount * 100,
       currency: 'INR',
       receipt: `job_${jobId}`,
       notes: { jobId },
     });
 
-    await pool.query('UPDATE print_jobs SET razorpay_order_id = $1, updated_at = NOW() WHERE id = $2', [
-      order.id,
-      jobId,
-    ]);
+    await pool.query(
+      `UPDATE print_jobs
+       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [order.id, serviceFee, gatewayFee, jobId]
+    );
 
     return res.status(200).json({
       orderId: order.id,
@@ -52,6 +61,10 @@ router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
       currency: order.currency,
       keyId: RAZORPAY_KEY_ID,
       jobId,
+      baseAmount,
+      serviceFee,
+      gatewayFee,
+      totalAmount,
     });
   } catch (err) {
     next(err);
@@ -255,7 +268,8 @@ router.get('/:jobId', async (req, res, next) => {
               pj.amount_due AS "amountDue", pj.created_at AS "createdAt",
               pj.payment_method AS "paymentMethod",
               pj.payment_screenshot_url AS "paymentScreenshotUrl",
-              pj.payment_rejection_reason AS "paymentRejectionReason"
+              pj.payment_rejection_reason AS "paymentRejectionReason",
+              pj.service_fee AS "serviceFee", pj.gateway_fee AS "gatewayFee"
        FROM print_jobs pj
        JOIN shops s ON s.id = pj.shop_id
        WHERE pj.id = $1`,

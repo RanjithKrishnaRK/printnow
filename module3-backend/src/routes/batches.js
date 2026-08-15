@@ -5,6 +5,7 @@ const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
 const { RAZORPAY_KEY_ID } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
+const { getPaymentFees } = require('../settings');
 
 const router = express.Router();
 
@@ -26,18 +27,26 @@ router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
       });
     }
 
+    const fees = await getPaymentFees();
+    const baseAmount = batch.amount_due;
+    const gatewayFee = Math.round((baseAmount * fees.gatewayFeePercent) / 100);
+    const serviceFee = fees.serviceFee;
+    const totalAmount = baseAmount + serviceFee + gatewayFee;
+
     const razorpay = getClient();
     const order = await razorpay.orders.create({
-      amount: batch.amount_due * 100,
+      amount: totalAmount * 100,
       currency: 'INR',
       receipt: `batch_${batchId}`,
       notes: { batchId },
     });
 
-    await pool.query('UPDATE batches SET razorpay_order_id = $1, updated_at = NOW() WHERE id = $2', [
-      order.id,
-      batchId,
-    ]);
+    await pool.query(
+      `UPDATE batches
+       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [order.id, serviceFee, gatewayFee, batchId]
+    );
 
     return res.status(200).json({
       orderId: order.id,
@@ -45,6 +54,10 @@ router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
       currency: order.currency,
       keyId: RAZORPAY_KEY_ID,
       batchId,
+      baseAmount,
+      serviceFee,
+      gatewayFee,
+      totalAmount,
     });
   } catch (err) {
     next(err);
@@ -260,7 +273,8 @@ router.get('/:batchId', async (req, res, next) => {
               b.amount_due AS "amountDue", b.created_at AS "createdAt",
               b.payment_method AS "paymentMethod",
               b.payment_screenshot_url AS "paymentScreenshotUrl",
-              b.payment_rejection_reason AS "paymentRejectionReason"
+              b.payment_rejection_reason AS "paymentRejectionReason",
+              b.service_fee AS "serviceFee", b.gateway_fee AS "gatewayFee"
        FROM batches b
        JOIN shops s ON s.id = b.shop_id
        WHERE b.id = $1`,

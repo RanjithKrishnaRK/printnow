@@ -5,6 +5,7 @@ import Shops from "./Shops";
 import Landmarks from "./Landmarks";
 import Reviews from "./Reviews";
 import ChangePassword from "./ChangePassword";
+import PaymentFees from "./PaymentFees";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -65,7 +66,12 @@ export default function Dashboard({ token, email, onLogout }) {
         {activeTab === "shops" && <Shops token={token} />}
         {activeTab === "landmarks" && <Landmarks token={token} />}
         {activeTab === "reviews" && <Reviews token={token} />}
-        {activeTab === "settings" && <ChangePassword token={token} />}
+        {activeTab === "settings" && (
+          <div className="space-y-6">
+            <ChangePassword token={token} />
+            <PaymentFees token={token} />
+          </div>
+        )}
       </main>
     </div>
   );
