@@ -6,11 +6,121 @@ const { pool } = require('../db');
 const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
 const { notifyStudent } = require('../notify');
-const { UPLOAD_DIR } = require('../config');
+const { UPLOAD_DIR, RAZORPAY_KEY_ID } = require('../config');
+const { getClient, verifyPaymentSignature } = require('../razorpay');
 
 const router = express.Router();
 
 const SHOP_SETTABLE_STATUSES = ['printing', 'ready', 'collected'];
+
+// POST /api/jobs/:jobId/razorpay/create-order
+// Public. -> { orderId, amount, currency, keyId, jobId }
+// amount always comes from the job's own amount_due (never a client-
+// supplied number) and is converted to paise, since Razorpay orders are
+// denominated in the smallest currency unit. This mints a gateway order
+// but does NOT change the job's status - only a verified payment does.
+router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (job.status !== 'uploaded') {
+      return res.status(409).json({
+        error: `Cannot start payment for a job in status "${job.status}" (expected "uploaded")`,
+      });
+    }
+
+    const razorpay = getClient();
+    const order = await razorpay.orders.create({
+      amount: job.amount_due * 100,
+      currency: 'INR',
+      receipt: `job_${jobId}`,
+      notes: { jobId },
+    });
+
+    await pool.query('UPDATE print_jobs SET razorpay_order_id = $1, updated_at = NOW() WHERE id = $2', [
+      order.id,
+      jobId,
+    ]);
+
+    return res.status(200).json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: RAZORPAY_KEY_ID,
+      jobId,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:jobId/razorpay/verify
+// Public. body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
+// -> { jobId, status: "queued", tokenNumber }
+// The only place an online payment is trusted - see razorpay.js for why
+// the signature (not the browser's "success" callback) is what's checked.
+// Goes straight to "queued", skipping payment_pending entirely: unlike
+// UPI/cash there's no shop owner confirmation step left to wait on, the
+// gateway already did the verifying server-side-to-server-side.
+router.post('/:jobId/razorpay/verify', async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body || {};
+    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return res.status(400).json({
+        error: 'razorpayOrderId, razorpayPaymentId and razorpaySignature are required',
+      });
+    }
+
+    const valid = verifyPaymentSignature({
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      signature: razorpaySignature,
+    });
+    if (!valid) {
+      return res.status(400).json({ error: 'Payment could not be verified' });
+    }
+
+    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Idempotent: a retried/duplicate verify call for a job already queued
+    // by this exact payment just returns the existing result instead of
+    // erroring, since the frontend may legitimately call this twice (e.g.
+    // a flaky network after the first call actually succeeded).
+    if (job.status !== 'uploaded') {
+      if (job.razorpay_payment_id === razorpayPaymentId) {
+        return res.status(200).json({ jobId, status: job.status, tokenNumber: job.token_number });
+      }
+      return res.status(409).json({
+        error: `Cannot verify payment for a job in status "${job.status}" (expected "uploaded")`,
+      });
+    }
+    if (job.razorpay_order_id && job.razorpay_order_id !== razorpayOrderId) {
+      return res.status(400).json({ error: 'Order does not match this job' });
+    }
+
+    const tokenNumber = await generateTokenNumber(job.shop_id);
+    await pool.query(
+      `UPDATE print_jobs
+       SET status = 'queued', token_number = $1, payment_method = 'razorpay',
+           razorpay_order_id = $2, razorpay_payment_id = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [tokenNumber, razorpayOrderId, razorpayPaymentId, jobId]
+    );
+
+    return res.status(200).json({ jobId, status: 'queued', tokenNumber });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // POST /api/jobs/:jobId/submit-payment
 // Public. body: { method: "upi" | "cash", screenshotUrl? }

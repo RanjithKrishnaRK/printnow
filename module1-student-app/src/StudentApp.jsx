@@ -134,6 +134,28 @@ function makeDocId() {
 const MOCK_MODE = import.meta.env.VITE_USE_MOCK !== "false";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
 
+// Loaded lazily (not a static <script> tag in index.html) since most
+// sessions won't necessarily use online payment - no reason to pull this
+// in on every single page load. Cached as a module-level promise so
+// picking "Pay online" twice in one session doesn't inject the script twice.
+let razorpayScriptPromise = null;
+function loadRazorpayScript() {
+  if (window.Razorpay) return Promise.resolve();
+  if (!razorpayScriptPromise) {
+    razorpayScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.onload = () => resolve();
+      script.onerror = () => {
+        razorpayScriptPromise = null; // allow retry on a later attempt
+        reject(new Error("Could not load the payment gateway. Check your connection and try again."));
+      };
+      document.body.appendChild(script);
+    });
+  }
+  return razorpayScriptPromise;
+}
+
 const RATE_PER_PAGE = { bw: 2, color: 8 }; // INR — client-side ESTIMATE only.
 // The authoritative amountDue always comes back from POST /jobs and is what
 // we actually charge at the review step.
@@ -358,6 +380,41 @@ const mockApi = {
     // No real storage in mock mode - a local blob URL is enough to preview
     // the exact image the student picked, right there in the same tab.
     return { screenshotUrl: URL.createObjectURL(file) };
+  },
+  // Mock mode has no real Razorpay account, so this returns a fake order id
+  // rather than actually calling out - the UI still opens the real
+  // Razorpay Checkout widget in test-friendly fashion since keyId is empty,
+  // but treat this purely as a UI smoke test, not a real payment demo.
+  async createRazorpayOrder(kind, id) {
+    await delay(400);
+    const obj = mockDb.get(id);
+    if (!obj) throw new Error("Order not found");
+    return {
+      orderId: `order_mock_${Date.now()}`,
+      amount: obj.amountDue * 100,
+      currency: "INR",
+      keyId: "",
+      [kind === "batch" ? "batchId" : "jobId"]: id,
+    };
+  },
+  async verifyRazorpayPayment(kind, id) {
+    await delay(500);
+    const obj = mockDb.get(id);
+    if (!obj) throw new Error("Order not found");
+    obj.status = "queued";
+    obj.paymentMethod = "razorpay";
+    obj.tokenNumber = obj.tokenNumber || String(Math.floor(100 + Math.random() * 800));
+    if (obj.isBatch) {
+      for (const jobId of obj.documentJobIds) {
+        const job = mockDb.get(jobId);
+        if (job) {
+          job.status = "queued";
+          job.paymentMethod = "razorpay";
+          job.tokenNumber = obj.tokenNumber;
+        }
+      }
+    }
+    return { [kind === "batch" ? "batchId" : "jobId"]: id, status: "queued", tokenNumber: obj.tokenNumber };
   },
   async getJob(jobId) {
     await delay(350);
@@ -602,6 +659,33 @@ const realApi = {
       throw new Error(body.error || "Could not upload that screenshot");
     }
     return res.json(); // { screenshotUrl }
+  },
+  // kind: "job" | "batch". Opens a Razorpay order for the order's own
+  // amount_due (server decides the amount, never the client). This is the
+  // gateway-payment path: unlike submitPayment above it never touches
+  // "payment_pending" - a verified Razorpay payment goes straight to
+  // "queued" via verifyRazorpayPayment below.
+  async createRazorpayOrder(kind, id) {
+    const path = kind === "batch" ? `/api/batches/${id}/razorpay/create-order` : `/api/jobs/${id}/razorpay/create-order`;
+    const res = await fetch(`${API_BASE_URL}${path}`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not start online payment");
+    }
+    return res.json(); // { orderId, amount, currency, keyId, jobId/batchId }
+  },
+  async verifyRazorpayPayment(kind, id, { razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
+    const path = kind === "batch" ? `/api/batches/${id}/razorpay/verify` : `/api/jobs/${id}/razorpay/verify`;
+    const res = await fetch(`${API_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ razorpayOrderId, razorpayPaymentId, razorpaySignature }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Payment could not be verified");
+    }
+    return res.json(); // { jobId/batchId, status: "queued", tokenNumber }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -1520,6 +1604,60 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     }
   }
 
+  // Online payment via Razorpay Checkout - the one path that skips the
+  // shop owner's manual confirm step entirely, since the gateway's
+  // signature (verified server-side in verifyRazorpayPayment) IS the
+  // confirmation. setSubmitting stays true for the whole modal lifetime so
+  // the rest of this screen can't be interacted with mid-payment; every
+  // exit (success, failure, or the student just closing the popup) clears it.
+  async function handlePayOnline() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await loadRazorpayScript();
+      const order = await api.createRazorpayOrder(kind, orderId);
+
+      const rzp = new window.Razorpay({
+        key: order.keyId,
+        amount: order.amount,
+        currency: order.currency,
+        name: "PrintNow",
+        description: `Order ${orderId}`,
+        order_id: order.orderId,
+        theme: { color: "#2F6E68" },
+        handler: async (response) => {
+          try {
+            await api.verifyRazorpayPayment(kind, orderId, {
+              razorpayOrderId: response.razorpay_order_id,
+              razorpayPaymentId: response.razorpay_payment_id,
+              razorpaySignature: response.razorpay_signature,
+            });
+            onSubmitted();
+          } catch (e) {
+            setError(
+              e.message ||
+                "Payment went through but we couldn't verify it. Please show the shop your payment confirmation."
+            );
+            setSubmitting(false);
+          }
+        },
+        modal: {
+          // Student closed the popup without paying - not an error, just
+          // back to a normal, retryable state.
+          ondismiss: () => setSubmitting(false),
+        },
+      });
+      rzp.on("payment.failed", (resp) => {
+        setError(resp.error?.description || "Payment failed. Please try again.");
+        setSubmitting(false);
+      });
+      rzp.open();
+    } catch (e) {
+      setError(e.message || "Could not start online payment. Please try again.");
+      setSubmitting(false);
+    }
+  }
+
   const orderSummaryCard = (
     <div className="rounded-xl border border-stone-300 bg-white px-4 py-4 shadow-sm shadow-stone-900/[0.03]">
       <p className="mb-3 text-xs font-medium uppercase tracking-wide text-stone-500">
@@ -1681,13 +1819,27 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
       {backButton}
       {orderSummaryCard}
 
+      {error && <ErrorBanner message={error} onRetry={handlePayOnline} />}
+
       <div className="space-y-2.5">
+        <button type="button"
+          onClick={handlePayOnline}
+          disabled={submitting}
+          className="flex w-full items-center justify-between rounded-lg border border-[#2F6E68] bg-[#2F6E68]/5 px-4 py-3.5 text-left shadow-sm active:bg-[#2F6E68]/10 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <span className="text-sm font-medium text-[#2F6E68]">
+            {submitting ? "Opening secure payment\u2026" : "Pay online — Card / UPI / Wallet"}
+          </span>
+          <span className="text-[#2F6E68]">→</span>
+        </button>
+
         {shopUpiId && (
           <button type="button"
             onClick={() => setMethod("upi")}
-            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50"
+            disabled={submitting}
+            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <span className="text-sm font-medium text-stone-800">Pay via UPI</span>
+            <span className="text-sm font-medium text-stone-800">Pay via UPI (manual, needs shop to confirm)</span>
             <span className="text-stone-400">→</span>
           </button>
         )}
@@ -1695,7 +1847,8 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
         {isNearShop ? (
           <button type="button"
             onClick={() => setMethod("cash")}
-            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50"
+            disabled={submitting}
+            className="flex w-full items-center justify-between rounded-lg border border-stone-300 bg-white px-4 py-3.5 text-left shadow-sm active:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <span className="text-sm font-medium text-stone-800">Pay cash at counter</span>
             <span className="text-stone-400">→</span>

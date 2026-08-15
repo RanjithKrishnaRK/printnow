@@ -277,6 +277,41 @@ async function migrate() {
       CHECK (status IN ('uploaded','payment_pending','queued','printing','ready','collected'));
   `);
 
+  // Migration: Razorpay online payments. Unlike UPI/cash, this path never
+  // touches 'payment_pending' - the gateway's signature IS the
+  // confirmation, so uploaded -> queued directly (see routes/jobs.js and
+  // routes/batches.js POST .../razorpay/verify). razorpay_order_id is set
+  // the moment an order is created (before payment); razorpay_payment_id
+  // only after verify succeeds - so a row with an order id but no payment
+  // id means "checkout was opened but never completed", useful for
+  // debugging abandoned payments later.
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs DROP CONSTRAINT IF EXISTS print_jobs_payment_method_check;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD CONSTRAINT print_jobs_payment_method_check
+      CHECK (payment_method IN ('upi','cash','razorpay'));
+  `);
+  await pool.query(`
+    ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_payment_method_check;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD CONSTRAINT batches_payment_method_check
+      CHECK (payment_method IN ('upi','cash','razorpay'));
+  `);
+
   // Migration: a student's name, captured once per phone number. The first
   // time a phone number places an order anywhere, the student app requires
   // a name and this table remembers it - every order after that (at any

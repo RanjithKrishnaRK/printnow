@@ -3,8 +3,117 @@ const express = require('express');
 const { pool } = require('../db');
 const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
+const { RAZORPAY_KEY_ID } = require('../config');
+const { getClient, verifyPaymentSignature } = require('../razorpay');
 
 const router = express.Router();
+
+// POST /api/batches/:batchId/razorpay/create-order
+// Public. -> { orderId, amount, currency, keyId, batchId }
+// Mirrors POST /api/jobs/:jobId/razorpay/create-order - one order for the
+// whole batch's combined amount_due, same as UPI/cash already do.
+router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
+  try {
+    const { batchId } = req.params;
+    const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);
+    const batch = rows[0];
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    if (batch.status !== 'uploaded') {
+      return res.status(409).json({
+        error: `Cannot start payment for a batch in status "${batch.status}" (expected "uploaded")`,
+      });
+    }
+
+    const razorpay = getClient();
+    const order = await razorpay.orders.create({
+      amount: batch.amount_due * 100,
+      currency: 'INR',
+      receipt: `batch_${batchId}`,
+      notes: { batchId },
+    });
+
+    await pool.query('UPDATE batches SET razorpay_order_id = $1, updated_at = NOW() WHERE id = $2', [
+      order.id,
+      batchId,
+    ]);
+
+    return res.status(200).json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: RAZORPAY_KEY_ID,
+      batchId,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/batches/:batchId/razorpay/verify
+// Public. body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
+// -> { batchId, status: "queued", tokenNumber }
+// Same trust boundary as the per-job version - see razorpay.js. On success,
+// mints one token for the whole batch and mirrors it onto every print_jobs
+// row under it, exactly like confirm-payment already does for UPI/cash.
+router.post('/:batchId/razorpay/verify', async (req, res, next) => {
+  try {
+    const { batchId } = req.params;
+    const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body || {};
+    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return res.status(400).json({
+        error: 'razorpayOrderId, razorpayPaymentId and razorpaySignature are required',
+      });
+    }
+
+    const valid = verifyPaymentSignature({
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      signature: razorpaySignature,
+    });
+    if (!valid) {
+      return res.status(400).json({ error: 'Payment could not be verified' });
+    }
+
+    const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);
+    const batch = rows[0];
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    if (batch.status !== 'uploaded') {
+      if (batch.razorpay_payment_id === razorpayPaymentId) {
+        return res.status(200).json({ batchId, status: batch.status, tokenNumber: batch.token_number });
+      }
+      return res.status(409).json({
+        error: `Cannot verify payment for a batch in status "${batch.status}" (expected "uploaded")`,
+      });
+    }
+    if (batch.razorpay_order_id && batch.razorpay_order_id !== razorpayOrderId) {
+      return res.status(400).json({ error: 'Order does not match this batch' });
+    }
+
+    const tokenNumber = await generateTokenNumber(batch.shop_id);
+    await pool.query(
+      `UPDATE batches
+       SET status = 'queued', token_number = $1, payment_method = 'razorpay',
+           razorpay_order_id = $2, razorpay_payment_id = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [tokenNumber, razorpayOrderId, razorpayPaymentId, batchId]
+    );
+    await pool.query(
+      `UPDATE print_jobs
+       SET status = 'queued', token_number = $1, payment_method = 'razorpay', updated_at = NOW()
+       WHERE batch_id = $2`,
+      [tokenNumber, batchId]
+    );
+
+    return res.status(200).json({ batchId, status: 'queued', tokenNumber });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // POST /api/batches/:batchId/submit-payment
 // Public. body: { method: "upi" | "cash", screenshotUrl? }

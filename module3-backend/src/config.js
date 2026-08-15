@@ -33,6 +33,15 @@ module.exports = {
   ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'admin@printnow.in',
   ADMIN_INITIAL_PASSWORD: process.env.ADMIN_INITIAL_PASSWORD || 'change-me-on-first-login',
 
+  // Razorpay keys for online payments. Deliberately NO fallback value for
+  // either - unlike JWT_SECRET above, there's no safe default for these:
+  // a fallback would either be a real secret (never hardcode that) or a
+  // fake one that fails every payment silently. Leave unset in dev; the
+  // razorpay/create-order route below fails loudly if they're missing
+  // rather than pretending to work.
+  RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || null,
+  RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || null,
+
   // Comma-separated list of allowed frontend origins, e.g.
   // "http://localhost:5173,http://localhost:5174"
   // Module 1 (student app) and Module 2 (shop dashboard) will run on
