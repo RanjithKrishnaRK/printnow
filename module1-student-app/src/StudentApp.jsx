@@ -420,7 +420,16 @@ const mockApi = {
   // matching the platform's actual default.
   async getPaymentFees() {
     await delay(150);
-    return { serviceFeePercent: 0, serviceFeeEnabled: false, gatewayFeePercent: 0, gatewayFeeEnabled: false };
+    return {
+      serviceFeePercent: 0,
+      serviceFeeEnabled: false,
+      serviceFeeTier1Flat: 1,
+      serviceFeeTier2Flat: 1.5,
+      gatewayFeePercent: 0,
+      gatewayFeeEnabled: false,
+      gatewayFeeTier1Flat: 1,
+      gatewayFeeTier2Flat: 1.5,
+    };
   },
   async getJob(jobId) {
     await delay(350);
@@ -1551,8 +1560,12 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
   const [fees, setFees] = useState({
     serviceFeePercent: 0,
     serviceFeeEnabled: false,
+    serviceFeeTier1Flat: 1,
+    serviceFeeTier2Flat: 1.5,
     gatewayFeePercent: 0,
     gatewayFeeEnabled: false,
+    gatewayFeeTier1Flat: 1,
+    gatewayFeeTier2Flat: 1.5,
   });
   const documents = order?.documents || [];
 
@@ -1580,12 +1593,33 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     };
   }, []);
 
-  // A disabled fee is always 0, regardless of whatever percentage happens
-  // to be saved for it - mirrors computeFeeBreakdown on the backend
-  // exactly, so this preview can never show a different total than what
-  // create-order actually charges.
-  const serviceFee = fees.serviceFeeEnabled ? Math.round((amountDue * fees.serviceFeePercent) / 100) : 0;
-  const gatewayFee = fees.gatewayFeeEnabled ? Math.round((amountDue * fees.gatewayFeePercent) / 100) : 0;
+  // Mirrors settings.js computeFeeBreakdown exactly, so this preview can
+  // never show a different total than what create-order actually charges.
+  // A percentage of a small order rounds to ₹0, so ₹20-and-under orders use
+  // a flat rupee amount instead (two tiers - ₹0-10 and ₹11-20 - since a
+  // flat ₹1 isn't really the same proportion on both); above ₹20 uses the
+  // percentage. A disabled fee is always 0 regardless of any of its stored
+  // numbers.
+  function feeFor(baseAmount, enabled, percent, tier1Flat, tier2Flat) {
+    if (!enabled) return 0;
+    if (baseAmount <= 10) return tier1Flat;
+    if (baseAmount <= 20) return tier2Flat;
+    return Math.round((baseAmount * percent) / 100);
+  }
+  const serviceFee = feeFor(
+    amountDue,
+    fees.serviceFeeEnabled,
+    fees.serviceFeePercent,
+    fees.serviceFeeTier1Flat,
+    fees.serviceFeeTier2Flat
+  );
+  const gatewayFee = feeFor(
+    amountDue,
+    fees.gatewayFeeEnabled,
+    fees.gatewayFeePercent,
+    fees.gatewayFeeTier1Flat,
+    fees.gatewayFeeTier2Flat
+  );
   const onlineTotal = amountDue + serviceFee + gatewayFee;
 
   function describeColor(doc) {

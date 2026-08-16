@@ -335,8 +335,12 @@ async function migrate() {
     INSERT INTO settings (key, value, updated_at) VALUES
       ('service_fee_percent', '0', NOW()),
       ('service_fee_enabled', 'false', NOW()),
+      ('service_fee_tier1_flat', '1', NOW()),
+      ('service_fee_tier2_flat', '1.5', NOW()),
       ('gateway_fee_percent', '0', NOW()),
-      ('gateway_fee_enabled', 'false', NOW())
+      ('gateway_fee_enabled', 'false', NOW()),
+      ('gateway_fee_tier1_flat', '1', NOW()),
+      ('gateway_fee_tier2_flat', '1.5', NOW())
     ON CONFLICT (key) DO NOTHING;
   `);
   // The old flat-rupee 'service_fee' key from before this table had

@@ -37,19 +37,19 @@ export async function getPaymentFees(token) {
   const res = await fetch(`${BASE_URL}/api/admin/settings/payment-fees`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  return handle(res); // { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
+  return handle(res); // { serviceFeePercent, serviceFeeEnabled, serviceFeeTier1Flat, serviceFeeTier2Flat, gatewayFeePercent, gatewayFeeEnabled, gatewayFeeTier1Flat, gatewayFeeTier2Flat }
 }
 
-export async function updatePaymentFees(token, { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }) {
+export async function updatePaymentFees(token, fees) {
   const res = await fetch(`${BASE_URL}/api/admin/settings/payment-fees`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }),
+    body: JSON.stringify(fees),
   });
-  return handle(res); // { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
+  return handle(res);
 }
 
 export async function getStats(token) {
