@@ -3,12 +3,40 @@
 // real values come from .env (see .env.example). Defaults let the app boot
 // out of the box for local MVP testing.
 
+const crypto = require('crypto');
+
 require('dotenv').config();
+
+// JWT_SECRET used to fall back to a fixed, hardcoded string
+// ('dev-secret-change-me-in-prod') if the env var wasn't set. Since this
+// file lives in a public repo, that string was effectively public - anyone
+// could forge a valid admin token against a deploy that never actually set
+// JWT_SECRET on Render. Now: production refuses to boot without a real
+// secret (fail loudly at deploy time, not silently at attack time); local
+// dev gets a random secret generated fresh each process start, so it's
+// never a fixed/guessable value, at the cost of dev-only sessions not
+// surviving a restart.
+function resolveJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'JWT_SECRET is not set. Refusing to start in production without it - ' +
+        'set it in your hosting provider\'s environment variables before deploying ' +
+        '(see module3-backend/.env.example for how to generate one).'
+    );
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] JWT_SECRET is not set - using a random secret for this process only. ' +
+      'Fine for local dev; set a real JWT_SECRET before deploying.'
+  );
+  return crypto.randomBytes(48).toString('hex');
+}
 
 module.exports = {
   PORT: process.env.PORT || 4000,
 
-  JWT_SECRET: process.env.JWT_SECRET || 'dev-secret-change-me-in-prod',
+  JWT_SECRET: resolveJwtSecret(),
   JWT_EXPIRES_IN: '7d',
 
   // Postgres connection string, e.g.

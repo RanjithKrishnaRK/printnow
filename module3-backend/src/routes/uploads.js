@@ -9,18 +9,29 @@
 
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
 const { randomUUID } = require('crypto');
 const { UPLOAD_DIR } = require('../config');
 
 const router = express.Router();
 
+// Extensions are derived ONLY from the mimetype we've already validated in
+// fileFilter below - never from file.originalname. originalname is
+// attacker-controlled (multer just copies whatever filename the client
+// sends), and mimetype itself is also client-supplied but at least gets
+// checked against a whitelist first. Taking the extension from
+// originalname directly used to mean an attacker could upload a file
+// claiming to be a PDF by mimetype while actually naming it "x.html" -
+// stored and served back with a ".html" name, letting a browser render it
+// as HTML on this domain (stored XSS via file upload, with access to
+// whatever's in this origin's cookies/localStorage). Whitelisting the
+// extension by verified mimetype closes that off entirely: whatever the
+// client calls the file, it's saved as <uuid>.pdf or <uuid>.jpg/.png, full stop.
+const PDF_EXT = '.pdf';
+const IMAGE_EXT_BY_MIMETYPE = { 'image/jpeg': '.jpg', 'image/png': '.png' };
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.pdf';
-    cb(null, `${randomUUID()}${ext}`);
-  },
+  filename: (req, file, cb) => cb(null, `${randomUUID()}${PDF_EXT}`),
 });
 
 const upload = multer({
@@ -56,16 +67,14 @@ router.post('/', (req, res) => {
 // size much lower since it's a phone screenshot, not a scanned document.
 const screenshotStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `${randomUUID()}${ext}`);
-  },
+  filename: (req, file, cb) =>
+    cb(null, `${randomUUID()}${IMAGE_EXT_BY_MIMETYPE[file.mimetype] || '.jpg'}`),
 });
 const uploadScreenshot = multer({
   storage: screenshotStorage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB - plenty for a phone screenshot
   fileFilter: (req, file, cb) => {
-    if (file.mimetype !== 'image/jpeg' && file.mimetype !== 'image/png') {
+    if (!IMAGE_EXT_BY_MIMETYPE[file.mimetype]) {
       return cb(new Error('Only JPEG or PNG screenshots are accepted'));
     }
     cb(null, true);

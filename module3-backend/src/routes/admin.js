@@ -12,12 +12,13 @@ const { pool } = require('../db');
 const { hashPassword, comparePassword, signAdminToken, requireAdminAuth } = require('../auth');
 const { UPLOAD_DIR } = require('../config');
 const { getPaymentFees, updatePaymentFees } = require('../settings');
+const { loginRateLimiter } = require('../rateLimit');
 
 const router = express.Router();
 
 // POST /api/admin/login
 // body: { email, password } -> { token }
-router.post('/login', async (req, res, next) => {
+router.post('/login', loginRateLimiter('email'), async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {

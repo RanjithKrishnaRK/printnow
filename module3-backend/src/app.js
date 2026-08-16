@@ -1,6 +1,7 @@
 // src/app.js
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const path = require('path');
 const { CORS_ORIGINS, UPLOAD_DIR } = require('./config');
 
@@ -16,6 +17,23 @@ const reviewsRouter = require('./routes/reviews');
 const settingsRouter = require('./routes/settings');
 
 const app = express();
+
+// Baseline security headers (X-Content-Type-Options: nosniff, no X-Powered-By,
+// etc.) on every response. Two defaults are deliberately overridden:
+// - contentSecurityPolicy: off - this API serves JSON and uploaded
+//   files, never HTML pages of its own, so a CSP meant for an HTML app
+//   doesn't apply and would only risk breaking the /uploads static file
+//   responses for no benefit.
+// - crossOriginResourcePolicy: 'cross-origin' - uploaded files (job PDFs,
+//   payment screenshots) are legitimately loaded from other origins
+//   (Module 1 student app, Module 2 shop dashboard); helmet's stricter
+//   default would block that.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
 
 app.use(
   cors({

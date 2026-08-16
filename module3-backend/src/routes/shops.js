@@ -12,6 +12,7 @@ const {
 const { calculateAmountDue, parseColorPages } = require('../pricing');
 const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
+const { loginRateLimiter } = require('../rateLimit');
 
 const router = express.Router();
 
@@ -348,7 +349,7 @@ router.post('/:shopId/batches', async (req, res, next) => {
 
 // POST /api/shops/login
 // body: { email, password } -> { shopId, token }
-router.post('/login', async (req, res, next) => {
+router.post('/login', loginRateLimiter('email'), async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
 
