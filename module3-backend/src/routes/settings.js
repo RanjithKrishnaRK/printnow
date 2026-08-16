@@ -8,7 +8,7 @@ const { getPaymentFees } = require('../settings');
 
 const router = express.Router();
 
-// GET /api/settings/payment-fees -> { serviceFee, gatewayFeePercent }
+// GET /api/settings/payment-fees -> { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
 router.get('/payment-fees', async (req, res, next) => {
   try {
     const fees = await getPaymentFees();

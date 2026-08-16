@@ -83,7 +83,7 @@ router.post('/change-password', requireAdminAuth, async (req, res, next) => {
 });
 
 // GET /api/admin/settings/payment-fees
-// Auth required. -> { serviceFee, gatewayFeePercent }
+// Auth required. -> { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
 router.get('/settings/payment-fees', requireAdminAuth, async (req, res, next) => {
   try {
     const fees = await getPaymentFees();
@@ -94,18 +94,23 @@ router.get('/settings/payment-fees', requireAdminAuth, async (req, res, next) =>
 });
 
 // PATCH /api/admin/settings/payment-fees
-// Auth required. body: { serviceFee, gatewayFeePercent } -> the updated values
-// serviceFee is a flat INR amount added to every online payment;
-// gatewayFeePercent is a percentage of the print cost, rounded to the
-// nearest rupee when actually applied (see routes/jobs.js and
-// routes/batches.js razorpay/create-order). Both must be >= 0 - a negative
-// fee would mean paying a student to check out, which is never intended
-// even as a promo (do that by editing PRICING/amount_due directly instead).
+// Auth required. body: { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
+// -> the updated values
+// Both fees are percentages of the print cost, rounded to the nearest
+// rupee when actually applied (see settings.js computeFeeBreakdown). Each
+// has its own enabled toggle - a disabled fee contributes 0 regardless of
+// its stored percentage, so "hide this fee" and "this fee is 0%" are two
+// clearly different, independently-settable things.
 router.patch('/settings/payment-fees', requireAdminAuth, async (req, res, next) => {
   try {
-    const { serviceFee, gatewayFeePercent } = req.body || {};
-    if (typeof serviceFee !== 'number' || !Number.isFinite(serviceFee) || serviceFee < 0) {
-      return res.status(400).json({ error: 'serviceFee must be a non-negative number' });
+    const { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled } = req.body || {};
+    if (
+      typeof serviceFeePercent !== 'number' ||
+      !Number.isFinite(serviceFeePercent) ||
+      serviceFeePercent < 0 ||
+      serviceFeePercent > 100
+    ) {
+      return res.status(400).json({ error: 'serviceFeePercent must be a number between 0 and 100' });
     }
     if (
       typeof gatewayFeePercent !== 'number' ||
@@ -115,8 +120,16 @@ router.patch('/settings/payment-fees', requireAdminAuth, async (req, res, next) 
     ) {
       return res.status(400).json({ error: 'gatewayFeePercent must be a number between 0 and 100' });
     }
+    if (typeof serviceFeeEnabled !== 'boolean' || typeof gatewayFeeEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'serviceFeeEnabled and gatewayFeeEnabled must be booleans' });
+    }
 
-    const updated = await updatePaymentFees({ serviceFee, gatewayFeePercent });
+    const updated = await updatePaymentFees({
+      serviceFeePercent,
+      serviceFeeEnabled,
+      gatewayFeePercent,
+      gatewayFeeEnabled,
+    });
     return res.status(200).json(updated);
   } catch (err) {
     next(err);

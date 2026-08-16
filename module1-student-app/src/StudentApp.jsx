@@ -420,7 +420,7 @@ const mockApi = {
   // matching the platform's actual default.
   async getPaymentFees() {
     await delay(150);
-    return { serviceFee: 0, gatewayFeePercent: 0 };
+    return { serviceFeePercent: 0, serviceFeeEnabled: false, gatewayFeePercent: 0, gatewayFeeEnabled: false };
   },
   async getJob(jobId) {
     await delay(350);
@@ -702,7 +702,7 @@ const realApi = {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || "Could not load payment fee settings");
     }
-    return res.json(); // { serviceFee, gatewayFeePercent }
+    return res.json(); // { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -1548,12 +1548,17 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
   const [method, setMethod] = useState(null); // null | "cash"
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
-  const [fees, setFees] = useState({ serviceFee: 0, gatewayFeePercent: 0 });
+  const [fees, setFees] = useState({
+    serviceFeePercent: 0,
+    serviceFeeEnabled: false,
+    gatewayFeePercent: 0,
+    gatewayFeeEnabled: false,
+  });
   const documents = order?.documents || [];
 
-  // Fee settings are public/admin-editable (see admin panel's Settings tab)
-  // and apply only to the online path - fetched once so the "Pay online"
-  // button can show the real total up front instead of surprising the
+  // Fee settings are public and admin-editable (see admin panel's Settings
+  // tab) and apply only to the online path - fetched once so the order
+  // summary can show the real total up front instead of surprising the
   // student inside the Razorpay popup. Silently falls back to "no fee" on
   // error rather than blocking checkout over a settings-read failure.
   useEffect(() => {
@@ -1569,8 +1574,13 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     };
   }, []);
 
-  const gatewayFee = Math.round((amountDue * fees.gatewayFeePercent) / 100);
-  const onlineTotal = amountDue + fees.serviceFee + gatewayFee;
+  // A disabled fee is always 0, regardless of whatever percentage happens
+  // to be saved for it - mirrors computeFeeBreakdown on the backend
+  // exactly, so this preview can never show a different total than what
+  // create-order actually charges.
+  const serviceFee = fees.serviceFeeEnabled ? Math.round((amountDue * fees.serviceFeePercent) / 100) : 0;
+  const gatewayFee = fees.gatewayFeeEnabled ? Math.round((amountDue * fees.gatewayFeePercent) / 100) : 0;
+  const onlineTotal = amountDue + serviceFee + gatewayFee;
 
   function describeColor(doc) {
     return doc.colorMode === "mixed"
@@ -1676,9 +1686,30 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
 
       <div className="my-3 border-t border-dashed border-stone-300" />
       <div className="flex items-center justify-between">
-        <span className="text-sm font-medium text-stone-700">Amount due</span>
+        <span className="text-sm font-medium text-stone-700">Print cost</span>
         <span className="font-mono text-2xl font-bold text-stone-900">₹{amountDue}</span>
       </div>
+
+      {(serviceFee > 0 || gatewayFee > 0) && (
+        <div className="mt-3 space-y-1 border-t border-dashed border-stone-200 pt-3 text-xs">
+          {serviceFee > 0 && (
+            <div className="flex items-center justify-between text-stone-500">
+              <span>Service fee (online payment only)</span>
+              <span>₹{serviceFee}</span>
+            </div>
+          )}
+          {gatewayFee > 0 && (
+            <div className="flex items-center justify-between text-stone-500">
+              <span>Payment gateway fee (online payment only)</span>
+              <span>₹{gatewayFee}</span>
+            </div>
+          )}
+          <div className="flex items-center justify-between pt-1 font-medium text-stone-700">
+            <span>Total if paying online</span>
+            <span className="font-mono">₹{onlineTotal}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -1741,9 +1772,7 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
               {submitting ? "Opening secure payment\u2026" : "Pay online — Card / UPI / Wallet"}
             </span>
             {onlineTotal > amountDue && (
-              <span className="mt-0.5 block text-xs text-[#2F6E68]/70">
-                Total ₹{onlineTotal} (₹{amountDue} print + ₹{onlineTotal - amountDue} payment fee)
-              </span>
+              <span className="mt-0.5 block text-xs text-[#2F6E68]/70">Total ₹{onlineTotal}, fees included above</span>
             )}
           </span>
           <span className="text-[#2F6E68]">→</span>

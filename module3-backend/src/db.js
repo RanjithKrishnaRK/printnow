@@ -315,13 +315,15 @@ async function migrate() {
   // Migration: generic admin-editable settings (key/value), starting with
   // the two online-payment surcharges. Kept as a flexible table rather than
   // dedicated columns since "what settings the admin can tune" will likely
-  // grow past just these two. serviceFee is a flat INR amount added to
-  // every online payment; gatewayFeePercent is a percentage of the print
-  // cost (rounded to the nearest rupee when applied - see routes/jobs.js
-  // and routes/batches.js razorpay/create-order). Both default to 0 - "no
-  // fee for the first few weeks" per the launch plan - and are only
-  // inserted if missing, so re-running this migration never resets a value
-  // an admin has already changed.
+  // grow past just these two. Both fees are percentages of the print cost
+  // (rounded to the nearest rupee when applied - see settings.js
+  // computeFeeBreakdown, shared by routes/jobs.js and routes/batches.js),
+  // and each has its own *_enabled toggle so the admin can turn a fee off
+  // entirely without having to remember to also zero out its percentage -
+  // "off" always means the fee contributes nothing, full stop. All four
+  // default to 0/false - "no fee for the first few weeks" per the launch
+  // plan - and are only inserted if missing, so re-running this migration
+  // never resets a value an admin has already changed.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS settings (
       key        TEXT PRIMARY KEY,
@@ -330,15 +332,17 @@ async function migrate() {
     );
   `);
   await pool.query(`
-    INSERT INTO settings (key, value, updated_at)
-    VALUES ('service_fee', '0', NOW())
+    INSERT INTO settings (key, value, updated_at) VALUES
+      ('service_fee_percent', '0', NOW()),
+      ('service_fee_enabled', 'false', NOW()),
+      ('gateway_fee_percent', '0', NOW()),
+      ('gateway_fee_enabled', 'false', NOW())
     ON CONFLICT (key) DO NOTHING;
   `);
-  await pool.query(`
-    INSERT INTO settings (key, value, updated_at)
-    VALUES ('gateway_fee_percent', '0', NOW())
-    ON CONFLICT (key) DO NOTHING;
-  `);
+  // The old flat-rupee 'service_fee' key from before this table had
+  // per-fee enabled toggles is no longer read anywhere - drop it so a
+  // stale value can't cause confusion later.
+  await pool.query(`DELETE FROM settings WHERE key = 'service_fee';`);
 
   // Migration: record what was actually charged for an online payment
   // (print cost is amount_due; these two are the surcharges layered on top

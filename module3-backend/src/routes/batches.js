@@ -5,7 +5,7 @@ const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
 const { RAZORPAY_KEY_ID } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
-const { getPaymentFees } = require('../settings');
+const { getPaymentFees, computeFeeBreakdown } = require('../settings');
 
 const router = express.Router();
 
@@ -29,9 +29,7 @@ router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
 
     const fees = await getPaymentFees();
     const baseAmount = batch.amount_due;
-    const gatewayFee = Math.round((baseAmount * fees.gatewayFeePercent) / 100);
-    const serviceFee = fees.serviceFee;
-    const totalAmount = baseAmount + serviceFee + gatewayFee;
+    const { serviceFee, gatewayFee, totalAmount } = computeFeeBreakdown(baseAmount, fees);
 
     const razorpay = getClient();
     const order = await razorpay.orders.create({
