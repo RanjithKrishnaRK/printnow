@@ -1568,7 +1568,13 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
       .then((f) => {
         if (!cancelled) setFees(f);
       })
-      .catch(() => {});
+      .catch((e) => {
+        // Not shown to the student (a fee-settings hiccup shouldn't block
+        // checkout) but logged so it's diagnosable from browser DevTools -
+        // this silently defaulting to "no fee" was hard to tell apart from
+        // "fees are genuinely off" without this.
+        if (!cancelled) console.error('Could not load payment fee settings:', e);
+      });
     return () => {
       cancelled = true;
     };
