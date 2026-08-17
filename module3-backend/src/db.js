@@ -366,6 +366,30 @@ async function migrate() {
     ALTER TABLE batches ADD COLUMN IF NOT EXISTS gateway_fee INTEGER NOT NULL DEFAULT 0;
   `);
 
+  // Migration: settlements - the platform (admin) periodically pays out a
+  // shop's accumulated ONLINE (Razorpay) earnings to their bank account,
+  // since that money lands in the platform's own Razorpay account first,
+  // not the shop owner's. Cash payments never need a settlement row - the
+  // shop owner already has that cash in hand the moment a student pays it
+  // over the counter. Each row is one payout event: how much, when, and
+  // how (bank transfer, UPI, cash, cheque). The shop owner's Earnings page
+  // shows these read-only; only the admin panel can create/edit/delete them.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settlements (
+      id           TEXT PRIMARY KEY,
+      shop_id      TEXT NOT NULL REFERENCES shops(id),
+      amount       INTEGER NOT NULL,
+      settled_date DATE NOT NULL,
+      mode         TEXT NOT NULL CHECK (mode IN ('bank_transfer','upi','cash','cheque','other')),
+      note         TEXT,
+      created_at   TIMESTAMPTZ NOT NULL,
+      updated_at   TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS settlements_shop_id_idx ON settlements (shop_id);
+  `);
+
   // Migration: a student's name, captured once per phone number. The first
   // time a phone number places an order anywhere, the student app requires
   // a name and this table remembers it - every order after that (at any

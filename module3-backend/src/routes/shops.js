@@ -13,6 +13,7 @@ const { calculateAmountDue, parseColorPages } = require('../pricing');
 const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 const { loginRateLimiter } = require('../rateLimit');
+const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
 
 const router = express.Router();
 
@@ -422,7 +423,7 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
   try {
     const { shopId } = req.params;
     const { rows } = await pool.query(
-      `SELECT auto_print_enabled AS "autoPrintEnabled",
+      `SELECT name, auto_print_enabled AS "autoPrintEnabled",
               price_bw AS "priceBw", price_color AS "priceColor",
               max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"
        FROM shops WHERE id = $1`,
@@ -558,33 +559,37 @@ router.get('/:shopId/public', async (req, res, next) => {
 
 // GET /api/shops/:shopId/earnings
 // Shop-owner-only (JWT required, must match :shopId). Powers the earnings
-// summary in the dashboard header. Revenue only counts jobs the shop owner
-// has actually confirmed payment for (status past 'payment_pending') - an
-// 'uploaded' job was never paid at all, and a 'payment_pending' one is just
-// a claim (screenshot/cash promise) not yet reviewed, so neither is real
-// revenue yet. Same rule the admin panel's stats use, so the numbers agree.
+// summary in the dashboard header AND the Earnings page's headline
+// numbers. Revenue only counts jobs the shop owner has actually confirmed
+// payment for (status past 'payment_pending') - an 'uploaded' job was
+// never paid at all, and 'payment_pending' one is just a claim
+// (screenshot/cash promise) not yet reviewed, so neither is real revenue
+// yet. Same rule the admin panel's stats use, so the numbers agree.
 router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId } = req.params;
 
-    const [totalRes, todayRes, statusRes] = await Promise.all([
+    const [totalRes, todayRes, statusRes, totalByMethod, todayByMethod, settledTotal] = await Promise.all([
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings",
                 COUNT(*)::int AS "totalJobs"
-         FROM print_jobs WHERE shop_id = $1 AND status NOT IN ('uploaded', 'payment_pending')`,
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL}`,
         [shopId]
       ),
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "todayEarnings",
                 COUNT(*)::int AS "todayJobs"
          FROM print_jobs
-         WHERE shop_id = $1 AND status NOT IN ('uploaded', 'payment_pending') AND created_at::date = CURRENT_DATE`,
+         WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL} AND created_at::date = CURRENT_DATE`,
         [shopId]
       ),
       pool.query(
         `SELECT status, COUNT(*)::int AS count FROM print_jobs WHERE shop_id = $1 GROUP BY status`,
         [shopId]
       ),
+      getShopMethodTotals(shopId),
+      getShopMethodTotals(shopId, { today: true }),
+      getSettledTotal(shopId),
     ]);
 
     return res.status(200).json({
@@ -593,7 +598,83 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
       todayEarnings: todayRes.rows[0].todayEarnings,
       todayJobs: todayRes.rows[0].todayJobs,
       jobsByStatus: statusRes.rows,
+      // cash vs online split - what the shop owner actually wants to know
+      // for reconciling the till vs. what's still sitting with the platform
+      totalByMethod,
+      todayByMethod,
+      // Online money only exists as a number until it's actually paid out;
+      // this is "what's still owed to me" at a glance.
+      settledTotal,
+      unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const VALID_GROUP_BY = ['day', 'month', 'year'];
+const GROUP_BY_LIMIT = { day: 30, month: 24, year: 10 };
+
+// GET /api/shops/:shopId/earnings/history?groupBy=day|month|year
+// Shop-owner-only. Powers the Earnings page's history table - earnings
+// bucketed by day (last 30), month (last 24), or year (last 10), each
+// split into cash/online same as the summary above. Only confirmed
+// payments count, same rule as everywhere else.
+router.get('/:shopId/earnings/history', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const groupBy = VALID_GROUP_BY.includes(req.query.groupBy) ? req.query.groupBy : 'day';
+    const truncUnit = groupBy; // Postgres date_trunc accepts 'day'/'month'/'year' directly
+    const limit = GROUP_BY_LIMIT[groupBy];
+
+    const { rows } = await pool.query(
+      `SELECT date_trunc($2, created_at)::date AS period,
+              COALESCE(payment_method, 'unknown') AS method,
+              COALESCE(SUM(amount_due), 0)::int AS total,
+              COUNT(*)::int AS count
+       FROM print_jobs
+       WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL}
+       GROUP BY period, payment_method
+       ORDER BY period DESC
+       LIMIT 500`,
+      [shopId, truncUnit]
+    );
+
+    // Reshape (period, method) rows into one row per period with cash/online
+    // split and a running job count - the frontend renders this directly as
+    // a table, one row per day/month/year.
+    const byPeriod = new Map();
+    for (const row of rows) {
+      const key = row.period.toISOString();
+      if (!byPeriod.has(key)) {
+        byPeriod.set(key, { period: key, cash: 0, online: 0, jobs: 0 });
+      }
+      const bucket = byPeriod.get(key);
+      bucket.jobs += row.count;
+      if (row.method === 'cash') bucket.cash += row.total;
+      else if (row.method === 'razorpay' || row.method === 'upi') bucket.online += row.total;
+    }
+
+    const history = Array.from(byPeriod.values())
+      .sort((a, b) => new Date(b.period) - new Date(a.period))
+      .slice(0, limit)
+      .map((row) => ({ ...row, total: row.cash + row.online }));
+
+    return res.status(200).json({ groupBy, history });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/shops/:shopId/settlements
+// Shop-owner-only, read-only - the admin panel is the only place these get
+// created/edited/deleted (see routes/admin.js). Lets a shop owner see
+// exactly when and how much of their online earnings they've been paid,
+// without having to ask.
+router.get('/:shopId/settlements', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const settlements = await listSettlements(req.params.shopId);
+    return res.status(200).json(settlements);
   } catch (err) {
     next(err);
   }

@@ -3,6 +3,7 @@ import Login from "./components/Login";
 import Signup from "./components/Signup";
 import Dashboard from "./components/Dashboard";
 import Settings from "./components/Settings";
+import Earnings from "./components/Earnings";
 import { loadSession, saveSession } from "./auth";
 import { stopFlashOnFocus } from "./buzzer";
 
@@ -14,7 +15,7 @@ export default function App() {
   // students can't be shown a price of nothing). "dashboard" is normal use;
   // the dashboard header's "Settings" button can jump back to "settings"
   // anytime after that, unrelated to onboarding.
-  const [screen, setScreen] = useState("dashboard"); // "onboarding" | "dashboard" | "settings"
+  const [screen, setScreen] = useState("dashboard"); // "onboarding" | "dashboard" | "settings" | "earnings"
 
   useEffect(() => {
     stopFlashOnFocus();
@@ -67,6 +68,10 @@ export default function App() {
     );
   }
 
+  if (screen === "earnings") {
+    return <Earnings shopId={session.shopId} token={session.token} onBack={() => setScreen("dashboard")} />;
+  }
+
   return (
     <Dashboard
       shopId={session.shopId}
@@ -76,6 +81,7 @@ export default function App() {
       onQrShown={() => setJustSignedUp(false)}
       onLogout={handleLogout}
       onOpenSettings={() => setScreen("settings")}
+      onOpenEarnings={() => setScreen("earnings")}
     />
   );
 }

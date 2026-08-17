@@ -143,7 +143,7 @@ async function realGetSettings(shopId, token) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Could not load settings.");
-  return res.json(); // { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour }
+  return res.json(); // { name, autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId }
 }
 
 async function realGetEarnings(shopId, token) {
@@ -151,7 +151,23 @@ async function realGetEarnings(shopId, token) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Could not load earnings.");
-  return res.json(); // { totalEarnings, totalJobs, todayEarnings, todayJobs, jobsByStatus }
+  return res.json(); // { totalEarnings, totalJobs, todayEarnings, todayJobs, jobsByStatus, totalByMethod: {cash, online}, todayByMethod, settledTotal, unsettledOnline }
+}
+
+async function realGetEarningsHistory(shopId, token, groupBy) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/earnings/history?groupBy=${groupBy}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Could not load earnings history.");
+  return res.json(); // { groupBy, history: [{ period, cash, online, total, jobs }] }
+}
+
+async function realGetSettlements(shopId, token) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/settlements`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Could not load settlement history.");
+  return res.json(); // [{ id, amount, settledDate, mode, note, createdAt }]
 }
 
 async function realUpdateSettings(shopId, token, patch) {
@@ -264,7 +280,7 @@ const mockSignedUpShops = []; // { name, email, password, shopId, token }
 // Mirrors the shape returned by GET/PATCH /api/shops/:shopId/settings.
 // priceBw/priceColor default to the same starter rates the real backend
 // backfills new shops with; maxPagesPerHour null = no cap (default).
-let mockSettings = { autoPrintEnabled: false, priceBw: 2, priceColor: 10, maxPagesPerHour: null, upiId: null };
+let mockSettings = { name: "Campus Xerox", autoPrintEnabled: false, priceBw: 2, priceColor: 10, maxPagesPerHour: null, upiId: null };
 
 async function mockLogin(email, password) {
   await wait(MOCK_LATENCY_MS);
@@ -362,20 +378,66 @@ async function mockGetEarnings(token) {
   await wait(200);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
   const shopJobs = token === MOCK_SHOP.token ? mockJobs : [];
-  const paidJobs = shopJobs.filter((j) => j.status !== "uploaded");
+  const paidJobs = shopJobs.filter((j) => j.status !== "uploaded" && j.status !== "payment_pending");
   const today = new Date().toDateString();
   const todayJobs = paidJobs.filter((j) => new Date(j.createdAt).toDateString() === today);
   const jobsByStatus = {};
   for (const j of shopJobs) {
     jobsByStatus[j.status] = (jobsByStatus[j.status] || 0) + 1;
   }
+  function toMethodTotals(jobList) {
+    const totals = { cash: 0, online: 0 };
+    for (const j of jobList) {
+      if (j.paymentMethod === "cash") totals.cash += j.amountDue || 0;
+      else if (j.paymentMethod === "razorpay" || j.paymentMethod === "upi") totals.online += j.amountDue || 0;
+    }
+    return totals;
+  }
+  const totalByMethod = toMethodTotals(paidJobs);
+  const settledTotal = mockSettlements.reduce((sum, s) => sum + s.amount, 0);
   return {
     totalEarnings: paidJobs.reduce((sum, j) => sum + (j.amountDue || 0), 0),
     totalJobs: paidJobs.length,
     todayEarnings: todayJobs.reduce((sum, j) => sum + (j.amountDue || 0), 0),
     todayJobs: todayJobs.length,
     jobsByStatus: Object.entries(jobsByStatus).map(([status, count]) => ({ status, count })),
+    totalByMethod,
+    todayByMethod: toMethodTotals(todayJobs),
+    settledTotal,
+    unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
   };
+}
+
+async function mockGetEarningsHistory(token, groupBy) {
+  await wait(200);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  const shopJobs = token === MOCK_SHOP.token ? mockJobs : [];
+  const paidJobs = shopJobs.filter((j) => j.status !== "uploaded" && j.status !== "payment_pending");
+  const buckets = new Map();
+  for (const j of paidJobs) {
+    const d = new Date(j.createdAt);
+    let key;
+    if (groupBy === "year") key = `${d.getFullYear()}`;
+    else if (groupBy === "month") key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    else key = d.toISOString().slice(0, 10);
+    if (!buckets.has(key)) buckets.set(key, { period: key, cash: 0, online: 0, jobs: 0 });
+    const b = buckets.get(key);
+    b.jobs += 1;
+    if (j.paymentMethod === "cash") b.cash += j.amountDue || 0;
+    else if (j.paymentMethod === "razorpay" || j.paymentMethod === "upi") b.online += j.amountDue || 0;
+  }
+  const history = Array.from(buckets.values())
+    .sort((a, b) => (a.period < b.period ? 1 : -1))
+    .map((row) => ({ ...row, total: row.cash + row.online }));
+  return { groupBy, history };
+}
+
+let mockSettlements = [];
+
+async function mockGetSettlements(token) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  return [...mockSettlements].sort((a, b) => (a.settledDate < b.settledDate ? 1 : -1));
 }
 
 async function mockUpdateSettings(token, patch) {
@@ -451,6 +513,14 @@ export function getSettings(shopId, token) {
 
 export function getEarnings(shopId, token) {
   return USE_MOCK ? mockGetEarnings(token) : realGetEarnings(shopId, token);
+}
+
+export function getEarningsHistory(shopId, token, groupBy) {
+  return USE_MOCK ? mockGetEarningsHistory(token, groupBy) : realGetEarningsHistory(shopId, token, groupBy);
+}
+
+export function getSettlements(shopId, token) {
+  return USE_MOCK ? mockGetSettlements(token) : realGetSettlements(shopId, token);
 }
 
 export function updateSettings(shopId, token, patch) {

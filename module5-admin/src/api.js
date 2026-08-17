@@ -124,7 +124,61 @@ export async function getShopStats(token, shopId) {
   const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/stats`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  return handle(res); // { totalEarnings, todayEarnings, totalByMethod: {cash, upi}, todayByMethod: {cash, upi}, ... }
+  return handle(res); // { totalEarnings, todayEarnings, totalByMethod: {cash, online}, todayByMethod, settledTotal, unsettledOnline, ... }
+}
+
+export async function getShopSettlements(token, shopId) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/settlements`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // [{ id, shopId, amount, settledDate, mode, note, createdAt, updatedAt }]
+}
+
+export async function createSettlement(token, shopId, { amount, settledDate, mode, note }) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/settlements`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ amount, settledDate, mode, note }),
+  });
+  return handle(res);
+}
+
+export async function updateSettlement(token, settlementId, patch) {
+  const res = await fetch(`${BASE_URL}/api/admin/settlements/${settlementId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(patch),
+  });
+  return handle(res);
+}
+
+export async function deleteSettlement(token, settlementId) {
+  const res = await fetch(`${BASE_URL}/api/admin/settlements/${settlementId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { ok: true }
+}
+
+export async function getUsers(token, query = "") {
+  const qs = query ? `?q=${encodeURIComponent(query)}` : "";
+  const res = await fetch(`${BASE_URL}/api/admin/users${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // [{ phone, name, totalJobs, totalSpent, shopsUsed, lastOrderAt }]
+}
+
+export async function getUserDetail(token, phone) {
+  const res = await fetch(`${BASE_URL}/api/admin/users/${encodeURIComponent(phone)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { phone, name, totalJobs, totalSpent, byShop: [...], orders: [...] }
 }
 
 export async function getShopReviews(token, shopId) {

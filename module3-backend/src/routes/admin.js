@@ -13,8 +13,19 @@ const { hashPassword, comparePassword, signAdminToken, requireAdminAuth } = requ
 const { UPLOAD_DIR } = require('../config');
 const { getPaymentFees, updatePaymentFees } = require('../settings');
 const { loginRateLimiter } = require('../rateLimit');
+const {
+  CONFIRMED_STATUS_SQL,
+  getShopMethodTotals,
+  listSettlements,
+  createSettlement,
+  updateSettlement,
+  deleteSettlement,
+  getSettledTotal,
+} = require('../earnings');
 
 const router = express.Router();
+
+const VALID_SETTLEMENT_MODES = ['bank_transfer', 'upi', 'cash', 'cheque', 'other'];
 
 // POST /api/admin/login
 // body: { email, password } -> { token }
@@ -229,10 +240,10 @@ router.delete('/shops/:shopId', requireAdminAuth, async (req, res, next) => {
 
 // GET /api/admin/shops/:shopId/stats
 // Auth required. Per-shop financial detail: total/today earnings, and both
-// split by payment method (cash vs UPI) - the shop owner's own earnings
-// route (GET /api/shops/:shopId/earnings) shows totals but not this
-// breakdown, since a shop owner doesn't need to see it split that way, but
-// the platform admin does, to understand cash-vs-digital mix across shops.
+// split cash vs online (razorpay + legacy upi) - the shop owner's own
+// earnings route (GET /api/shops/:shopId/earnings) shows the same split for
+// themselves; the admin panel additionally needs settledTotal/
+// unsettledOnline here to know how much is still owed to this shop.
 // Same "confirmed payment only" revenue rule as everywhere else: a job still
 // sitting at 'uploaded' or 'payment_pending' isn't counted.
 router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
@@ -244,44 +255,21 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'Shop not found' });
     }
 
-    const CONFIRMED = `status NOT IN ('uploaded', 'payment_pending')`;
-    const [totalRes, todayRes, byMethodRes, todayByMethodRes] = await Promise.all([
+    const [totalRes, todayRes, totalByMethod, todayByMethod, settledTotal] = await Promise.all([
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings", COUNT(*)::int AS "totalJobs"
-         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED}`,
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL}`,
         [shopId]
       ),
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "todayEarnings", COUNT(*)::int AS "todayJobs"
-         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED} AND created_at::date = CURRENT_DATE`,
+         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL} AND created_at::date = CURRENT_DATE`,
         [shopId]
       ),
-      pool.query(
-        `SELECT COALESCE(payment_method, 'unknown') AS method,
-                COALESCE(SUM(amount_due), 0)::int AS total, COUNT(*)::int AS count
-         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED}
-         GROUP BY payment_method`,
-        [shopId]
-      ),
-      pool.query(
-        `SELECT COALESCE(payment_method, 'unknown') AS method,
-                COALESCE(SUM(amount_due), 0)::int AS total, COUNT(*)::int AS count
-         FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED} AND created_at::date = CURRENT_DATE
-         GROUP BY payment_method`,
-        [shopId]
-      ),
+      getShopMethodTotals(shopId),
+      getShopMethodTotals(shopId, { today: true }),
+      getSettledTotal(shopId),
     ]);
-
-    // Reshape the group-by rows into a flat { cash: N, upi: N } - easier for
-    // the admin UI to render than iterating an array, and guarantees both
-    // keys exist (0) even if a shop has never had one payment method at all.
-    function toMethodTotals(rows) {
-      const totals = { cash: 0, upi: 0 };
-      for (const row of rows) {
-        if (row.method === 'cash' || row.method === 'upi') totals[row.method] = row.total;
-      }
-      return totals;
-    }
 
     return res.status(200).json({
       shopId,
@@ -290,9 +278,104 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
       totalJobs: totalRes.rows[0].totalJobs,
       todayEarnings: todayRes.rows[0].todayEarnings,
       todayJobs: todayRes.rows[0].todayJobs,
-      totalByMethod: toMethodTotals(byMethodRes.rows),
-      todayByMethod: toMethodTotals(todayByMethodRes.rows),
+      totalByMethod,
+      todayByMethod,
+      settledTotal,
+      unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/shops/:shopId/settlements
+// Auth required. Full settlement history for a shop - what's already been
+// paid out.
+router.get('/shops/:shopId/settlements', requireAdminAuth, async (req, res, next) => {
+  try {
+    const settlements = await listSettlements(req.params.shopId);
+    return res.status(200).json(settlements);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/shops/:shopId/settlements
+// Auth required. body: { amount, settledDate, mode, note? } -> the created row
+// Records a payout of the shop's ONLINE earnings (cash never needs this -
+// see db.js migration comment on the settlements table). Doesn't block on
+// amount exceeding unsettledOnline - a shop might genuinely be settled in
+// advance, or the admin might be correcting an earlier under-recorded
+// payout - so this is a ledger entry, not an enforced cap.
+router.post('/shops/:shopId/settlements', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { amount, settledDate, mode, note } = req.body || {};
+
+    const { rows: shopRows } = await pool.query('SELECT id FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!settledDate || Number.isNaN(Date.parse(settledDate))) {
+      return res.status(400).json({ error: 'settledDate must be a valid date (YYYY-MM-DD)' });
+    }
+    if (!VALID_SETTLEMENT_MODES.includes(mode)) {
+      return res.status(400).json({ error: `mode must be one of: ${VALID_SETTLEMENT_MODES.join(', ')}` });
+    }
+
+    const settlement = await createSettlement({ shopId, amount, settledDate, mode, note });
+    return res.status(201).json(settlement);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/settlements/:id
+// Auth required. body: any subset of { amount, settledDate, mode, note } -> the updated row
+router.patch('/settlements/:id', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows: existingRows } = await pool.query('SELECT * FROM settlements WHERE id = $1', [id]);
+    const existing = existingRows[0];
+    if (!existing) {
+      return res.status(404).json({ error: 'Settlement not found' });
+    }
+
+    const amount = req.body?.amount ?? existing.amount;
+    const settledDate = req.body?.settledDate ?? existing.settled_date;
+    const mode = req.body?.mode ?? existing.mode;
+    const note = req.body?.note !== undefined ? req.body.note : existing.note;
+
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!settledDate || Number.isNaN(Date.parse(settledDate))) {
+      return res.status(400).json({ error: 'settledDate must be a valid date (YYYY-MM-DD)' });
+    }
+    if (!VALID_SETTLEMENT_MODES.includes(mode)) {
+      return res.status(400).json({ error: `mode must be one of: ${VALID_SETTLEMENT_MODES.join(', ')}` });
+    }
+
+    const updated = await updateSettlement(id, { amount, settledDate, mode, note });
+    return res.status(200).json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/admin/settlements/:id
+// Auth required. Removes a settlement record entirely - used to correct a
+// mistaken entry (wrong shop, wrong amount, duplicate).
+router.delete('/settlements/:id', requireAdminAuth, async (req, res, next) => {
+  try {
+    const deleted = await deleteSettlement(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Settlement not found' });
+    }
+    return res.status(200).json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -684,6 +767,102 @@ router.delete('/reviews/:reviewId', requireAdminAuth, async (req, res, next) => 
       return res.status(404).json({ error: 'Review not found' });
     }
     return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/users
+// Auth required. Query: ?q= (optional, matches name or phone).
+// Customer directory - one row per distinct student_phone across every job
+// ever placed anywhere on the platform (not scoped to one shop). Reads
+// directly from print_jobs, same as the earnings routes: each row (batched
+// or standalone) already carries its own amount_due, so no separate
+// aggregation over the batches table is needed to avoid double-counting.
+// Name shown is whichever name was most recently attached to that phone
+// number (see studentName.js - a phone can accumulate different names if
+// mistyped once, so "most recent" is the best single guess of "current").
+router.get('/users', requireAdminAuth, async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').trim();
+    const params = [];
+    let whereClause = '';
+    if (q) {
+      params.push(`%${q}%`);
+      whereClause = `WHERE student_phone ILIKE $1 OR student_name ILIKE $1`;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT student_phone AS phone,
+              (ARRAY_AGG(student_name ORDER BY created_at DESC))[1] AS name,
+              COUNT(*)::int AS "totalJobs",
+              COALESCE(SUM(amount_due) FILTER (WHERE ${CONFIRMED_STATUS_SQL}), 0)::int AS "totalSpent",
+              COUNT(DISTINCT shop_id)::int AS "shopsUsed",
+              MAX(created_at) AS "lastOrderAt"
+       FROM print_jobs
+       ${whereClause}
+       GROUP BY student_phone
+       ORDER BY "lastOrderAt" DESC
+       LIMIT 500`,
+      params
+    );
+    return res.status(200).json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/users/:phone
+// Auth required. Full order history for one phone number - every job,
+// which shop, how much, when, and its status/payment method - plus a
+// per-shop spend breakdown so it's clear at a glance whether this student
+// is a regular at one shop or spreads their printing around.
+router.get('/users/:phone', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { phone } = req.params;
+
+    const [ordersRes, byShopRes] = await Promise.all([
+      pool.query(
+        `SELECT pj.id AS "jobId", pj.batch_id AS "batchId", pj.shop_id AS "shopId",
+                s.name AS "shopName", pj.amount_due AS "amountDue", pj.status,
+                pj.payment_method AS "paymentMethod", pj.created_at AS "createdAt",
+                pj.student_name AS "studentName"
+         FROM print_jobs pj
+         JOIN shops s ON s.id = pj.shop_id
+         WHERE pj.student_phone = $1
+         ORDER BY pj.created_at DESC
+         LIMIT 300`,
+        [phone]
+      ),
+      pool.query(
+        `SELECT pj.shop_id AS "shopId", s.name AS "shopName",
+                COUNT(*)::int AS "totalJobs",
+                COALESCE(SUM(pj.amount_due) FILTER (WHERE ${CONFIRMED_STATUS_SQL.replace('status', 'pj.status')}), 0)::int AS "totalSpent"
+         FROM print_jobs pj
+         JOIN shops s ON s.id = pj.shop_id
+         WHERE pj.student_phone = $1
+         GROUP BY pj.shop_id, s.name
+         ORDER BY "totalSpent" DESC`,
+        [phone]
+      ),
+    ]);
+
+    if (ordersRes.rows.length === 0) {
+      return res.status(404).json({ error: 'No orders found for this phone number' });
+    }
+
+    const totalSpent = byShopRes.rows.reduce((sum, r) => sum + r.totalSpent, 0);
+    const totalJobs = ordersRes.rows.length;
+    const name = ordersRes.rows[0].studentName;
+
+    return res.status(200).json({
+      phone,
+      name,
+      totalJobs,
+      totalSpent,
+      byShop: byShopRes.rows,
+      orders: ordersRes.rows,
+    });
   } catch (err) {
     next(err);
   }

@@ -50,6 +50,7 @@ export default function Dashboard({
   onQrShown,
   onLogout,
   onOpenSettings,
+  onOpenEarnings,
 }) {
   const [activeTab, setActiveTab] = useState("queued");
   const [jobs, setJobs] = useState([]);
@@ -61,6 +62,13 @@ export default function Dashboard({
   const [autoPrintEnabled, setAutoPrintEnabled] = useState(false);
   const [autoPrintBusy, setAutoPrintBusy] = useState(false);
   const [earnings, setEarnings] = useState(null);
+  // Fetched here rather than trusting the shopName prop: that prop only
+  // ever got set on the signup screen (never on a normal login, and never
+  // persisted across a refresh either - see auth.js saveSession), so most
+  // shop owners saw a blank header. Settings already returns the shop's
+  // own name, and Dashboard already calls it on mount for the auto-print
+  // toggle below, so this reuses that same call instead of adding a new one.
+  const [shopNameState, setShopNameState] = useState(shopName || "");
 
   // Tracks which job IDs we've already seen, so the buzzer only fires for
   // jobs that are genuinely new since the last poll - not for the shop's
@@ -128,7 +136,10 @@ export default function Dashboard({
 
   useEffect(() => {
     getSettings(shopId, token)
-      .then((s) => setAutoPrintEnabled(!!s.autoPrintEnabled))
+      .then((s) => {
+        setAutoPrintEnabled(!!s.autoPrintEnabled);
+        if (s.name) setShopNameState(s.name);
+      })
       .catch(() => {
         // Non-fatal - the toggle just starts showing "Off" until the next
         // successful load. Not worth surfacing as a page-level error since
@@ -281,13 +292,27 @@ export default function Dashboard({
   return (
     <div className="min-h-screen bg-paper">
       <header className="bg-ink text-white px-4 sm:px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <div className="w-7 h-7 rounded bg-teal flex items-center justify-center shrink-0">
             <span className="font-mono font-bold text-white text-xs">P</span>
           </div>
-          <span className="font-display font-bold text-xl tracking-tight">PrintNow</span>
+          <span className="font-display font-bold text-xl tracking-tight shrink-0">PrintNow</span>
+          {shopNameState && (
+            <>
+              <span className="text-white/30 shrink-0">·</span>
+              <span className="font-body text-sm text-white/80 truncate" title={shopNameState}>
+                {shopNameState}
+              </span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-4">
+          <button
+            onClick={onOpenEarnings}
+            className="text-sm text-white/70 hover:text-white transition-colors"
+          >
+            💰 Earnings
+          </button>
           <button
             onClick={toggleAutoPrint}
             disabled={autoPrintBusy}
