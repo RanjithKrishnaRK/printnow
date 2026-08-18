@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import Login from "./components/Login";
 import Signup from "./components/Signup";
+import ForgotPassword from "./components/ForgotPassword";
 import Dashboard from "./components/Dashboard";
 import Settings from "./components/Settings";
 import Earnings from "./components/Earnings";
@@ -9,7 +10,7 @@ import { stopFlashOnFocus } from "./buzzer";
 
 export default function App() {
   const [session, setSession] = useState(() => loadSession());
-  const [view, setView] = useState("login"); // "login" | "signup"
+  const [view, setView] = useState("login"); // "login" | "signup" | "forgot-password"
   const [justSignedUp, setJustSignedUp] = useState(false);
   // "onboarding" forces Settings first after signup (no pricing set yet -
   // students can't be shown a price of nothing). "dashboard" is normal use;
@@ -40,10 +41,23 @@ export default function App() {
   }
 
   if (!session) {
-    return view === "signup" ? (
-      <Signup onSignedUp={handleSignedUp} onBackToLogin={() => setView("login")} />
-    ) : (
-      <Login onLogin={handleLogin} onGoToSignup={() => setView("signup")} />
+    if (view === "signup") {
+      return <Signup onSignedUp={handleSignedUp} onBackToLogin={() => setView("login")} />;
+    }
+    if (view === "forgot-password") {
+      return (
+        <ForgotPassword
+          onBackToLogin={() => setView("login")}
+          onReset={() => setView("login")}
+        />
+      );
+    }
+    return (
+      <Login
+        onLogin={handleLogin}
+        onGoToSignup={() => setView("signup")}
+        onGoToForgotPassword={() => setView("forgot-password")}
+      />
     );
   }
 

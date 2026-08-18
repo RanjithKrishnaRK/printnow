@@ -70,6 +70,17 @@ module.exports = {
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || null,
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || null,
 
+  // SMTP for sending OTP emails (shop signup verification, forgot password).
+  // Works with any SMTP provider - Gmail (with an app password), Zoho,
+  // Mailgun, Resend's SMTP endpoint, etc. No fallback values - like
+  // Razorpay above, there's no safe default for these, so OTP-sending
+  // routes fail loudly (mailer.js) rather than pretending to work.
+  SMTP_HOST: process.env.SMTP_HOST || null,
+  SMTP_PORT: process.env.SMTP_PORT || null,
+  SMTP_USER: process.env.SMTP_USER || null,
+  SMTP_PASS: process.env.SMTP_PASS || null,
+  SMTP_FROM: process.env.SMTP_FROM || null,
+
   // Comma-separated list of allowed frontend origins, e.g.
   // "http://localhost:5173,http://localhost:5174"
   // Module 1 (student app) and Module 2 (shop dashboard) will run on

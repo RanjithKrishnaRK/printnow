@@ -2,7 +2,7 @@ import { useState } from "react";
 import { login } from "../api";
 import { primeAudio } from "../buzzer";
 
-export default function Login({ onLogin, onGoToSignup }) {
+export default function Login({ onLogin, onGoToSignup, onGoToForgotPassword }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -62,7 +62,7 @@ export default function Login({ onLogin, onGoToSignup }) {
             />
           </div>
 
-          <div className="mb-5">
+          <div className="mb-2">
             <label htmlFor="password" className="block text-sm font-medium text-ink mb-1">
               Password
             </label>
@@ -76,6 +76,16 @@ export default function Login({ onLogin, onGoToSignup }) {
               placeholder="••••••••"
               className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink placeholder:text-collected/70 focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
             />
+          </div>
+
+          <div className="mb-5 text-right">
+            <button
+              type="button"
+              onClick={onGoToForgotPassword}
+              className="text-xs text-collected hover:text-ink underline"
+            >
+              Forgot password?
+            </button>
           </div>
 
           {error && (

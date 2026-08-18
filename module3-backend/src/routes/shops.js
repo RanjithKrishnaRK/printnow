@@ -14,6 +14,8 @@ const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 const { loginRateLimiter } = require('../rateLimit');
 const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
+const { createOtp, verifyOtp } = require('../otp');
+const { sendOtpEmail } = require('../mailer');
 
 const router = express.Router();
 
@@ -53,26 +55,41 @@ router.get('/', async (req, res, next) => {
 // Public - self-service shop owner registration (previously only possible
 // via scripts/seedShop.js run by hand). body: { name, email, password, landmarkId }
 // -> { shopId, token } (signs the new shop straight in, same as /login would)
-router.post('/signup', async (req, res, next) => {
+// Shared validation for the signup form fields - used by request-otp below
+// (verify-otp re-checks uniqueness only, since format/strength don't change
+// between the two steps).
+function validateSignupFields({ name, email, password, landmarkId }) {
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return 'name is required';
+  }
+  if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    return 'a valid email is required';
+  }
+  if (!password || typeof password !== 'string' || password.length < 8) {
+    return 'password is required and must be at least 8 characters';
+  }
+  if (!landmarkId || typeof landmarkId !== 'string') {
+    return 'landmarkId is required';
+  }
+  return null;
+}
+
+// POST /api/shops/signup/request-otp
+// body: { name, email, password, landmarkId } -> { ok: true, email }
+// Step 1 of signup. Validates everything up front and emails a 6-digit
+// code - the account itself isn't created yet, so an abandoned or
+// never-verified signup never leaves a real (but unconfirmed) shop row
+// behind. The pending signup's data travels inside the OTP row's payload
+// (see otp.js) until verify-otp below actually creates the shop.
+router.post('/signup/request-otp', loginRateLimiter('email'), async (req, res, next) => {
   try {
     const { name, email, password, landmarkId } = req.body || {};
-
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      return res.status(400).json({ error: 'name is required' });
-    }
-    if (!email || typeof email !== 'string') {
-      return res.status(400).json({ error: 'email is required' });
-    }
-    if (!password || typeof password !== 'string' || password.length < 8) {
-      return res.status(400).json({ error: 'password is required and must be at least 8 characters' });
-    }
-    if (!landmarkId || typeof landmarkId !== 'string') {
-      return res.status(400).json({ error: 'landmarkId is required' });
+    const validationError = validateSignupFields({ name, email, password, landmarkId });
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
     }
 
-    const { rows: landmarkRows } = await pool.query('SELECT id FROM landmarks WHERE id = $1', [
-      landmarkId,
-    ]);
+    const { rows: landmarkRows } = await pool.query('SELECT id FROM landmarks WHERE id = $1', [landmarkId]);
     if (landmarkRows.length === 0) {
       return res.status(400).json({ error: 'Unknown landmarkId' });
     }
@@ -80,8 +97,6 @@ router.post('/signup', async (req, res, next) => {
     const trimmedName = name.trim();
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Case-insensitive checks: "Ravi@x.in" and "ravi@x.in" (or "Sharma
-    // Xerox" and "sharma xerox") are the same for our purposes.
     const { rows: existingEmailRows } = await pool.query(
       'SELECT id FROM shops WHERE LOWER(email) = LOWER($1)',
       [normalizedEmail]
@@ -89,30 +104,89 @@ router.post('/signup', async (req, res, next) => {
     if (existingEmailRows.length > 0) {
       return res.status(409).json({ error: 'A shop with this email already exists' });
     }
-
     const { rows: existingNameRows } = await pool.query(
       'SELECT id FROM shops WHERE LOWER(name) = LOWER($1)',
       [trimmedName]
     );
     if (existingNameRows.length > 0) {
-      return res
-        .status(409)
-        .json({ error: 'A shop with this name already exists. Try a more specific name (e.g. add your area or landmark).' });
+      return res.status(409).json({
+        error: 'A shop with this name already exists. Try a more specific name (e.g. add your area or landmark).',
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+    const otp = await createOtp({
+      email: normalizedEmail,
+      purpose: 'shop_signup',
+      payload: { name: trimmedName, email: normalizedEmail, passwordHash, landmarkId },
+    });
+
+    try {
+      await sendOtpEmail(normalizedEmail, otp, 'shop_signup');
+    } catch (mailErr) {
+      // eslint-disable-next-line no-console
+      console.error('Could not send signup OTP email:', mailErr.message);
+      return res.status(500).json({ error: 'Could not send the verification email right now. Please try again shortly.' });
+    }
+
+    return res.status(200).json({ ok: true, email: normalizedEmail });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/signup/verify-otp
+// body: { email, otp } -> { shopId, token, shopName }
+// Step 2 - on a correct, unexpired code, actually creates the shop from the
+// data stashed in request-otp above and logs them straight in, exactly
+// like the old one-step /signup used to.
+router.post('/signup/verify-otp', loginRateLimiter('email'), async (req, res, next) => {
+  try {
+    const { email, otp } = req.body || {};
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'email and otp are required' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const result = await verifyOtp({ email: normalizedEmail, purpose: 'shop_signup', otp });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    const { name, passwordHash, landmarkId } = result.payload;
+
+    // Re-check uniqueness/landmark validity - the OTP window (up to 10
+    // minutes) is long enough for someone else to have taken this email,
+    // name, or for the landmark to have been removed, since request-otp
+    // checked them.
+    const { rows: landmarkRows } = await pool.query('SELECT id FROM landmarks WHERE id = $1', [landmarkId]);
+    if (landmarkRows.length === 0) {
+      return res.status(400).json({ error: 'That landmark no longer exists. Please start signup again.' });
+    }
+    const { rows: existingEmailRows } = await pool.query(
+      'SELECT id FROM shops WHERE LOWER(email) = LOWER($1)',
+      [normalizedEmail]
+    );
+    if (existingEmailRows.length > 0) {
+      return res.status(409).json({ error: 'A shop with this email already exists' });
+    }
+    const { rows: existingNameRows } = await pool.query('SELECT id FROM shops WHERE LOWER(name) = LOWER($1)', [
+      name,
+    ]);
+    if (existingNameRows.length > 0) {
+      return res.status(409).json({
+        error: 'A shop with this name was just taken. Please start signup again with a different name.',
+      });
     }
 
     const id = randomUUID();
-    const passwordHash = await hashPassword(password);
-
     try {
       await pool.query(
         `INSERT INTO shops (id, name, email, password_hash, landmark_id, price_bw, price_color, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-        [id, trimmedName, normalizedEmail, passwordHash, landmarkId, PRICING.bw, PRICING.color]
+        [id, name, normalizedEmail, passwordHash, landmarkId, PRICING.bw, PRICING.color]
       );
     } catch (err) {
-      // Race-condition fallback: two signups for the same email/name landing
-      // between our SELECT check above and this INSERT. The DB-level unique
-      // indexes (see db.js migrate()) catch it here as Postgres error 23505.
       if (err.code === '23505') {
         return res.status(409).json({ error: 'A shop with this name or email already exists' });
       }
@@ -120,7 +194,74 @@ router.post('/signup', async (req, res, next) => {
     }
 
     const token = signShopToken({ id });
-    return res.status(201).json({ shopId: id, token });
+    return res.status(201).json({ shopId: id, token, shopName: name });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/forgot-password
+// body: { email } -> { ok: true } (ALWAYS, whether or not the email is
+// registered - responding differently would let anyone probe which emails
+// have a shop account, so this stays deliberately generic. If the email
+// does belong to a shop, an OTP is emailed to it.)
+router.post('/forgot-password', loginRateLimiter('email'), async (req, res, next) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'email is required' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const { rows } = await pool.query('SELECT id FROM shops WHERE LOWER(email) = LOWER($1)', [normalizedEmail]);
+    if (rows.length > 0) {
+      const otp = await createOtp({ email: normalizedEmail, purpose: 'shop_password_reset' });
+      try {
+        await sendOtpEmail(normalizedEmail, otp, 'shop_password_reset');
+      } catch (mailErr) {
+        // eslint-disable-next-line no-console
+        console.error('Could not send password reset OTP email:', mailErr.message);
+        // Still returns the generic { ok: true } below - see comment above.
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/reset-password
+// body: { email, otp, newPassword } -> { ok: true }
+router.post('/reset-password', loginRateLimiter('email'), async (req, res, next) => {
+  try {
+    const { email, otp, newPassword } = req.body || {};
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'email and otp are required' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      return res.status(400).json({ error: 'newPassword is required and must be at least 8 characters' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const result = await verifyOtp({ email: normalizedEmail, purpose: 'shop_password_reset', otp });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    const newHash = await hashPassword(newPassword);
+    const { rowCount } = await pool.query(
+      'UPDATE shops SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = LOWER($2)',
+      [newHash, normalizedEmail]
+    );
+    if (rowCount === 0) {
+      // The OTP verified fine (it was created only when the shop existed,
+      // seconds or minutes ago), but the shop is now gone - too rare/edge
+      // to build a UX around, a generic error is fine here.
+      return res.status(404).json({ error: 'Shop account not found' });
+    }
+
+    return res.status(200).json({ ok: true });
   } catch (err) {
     next(err);
   }

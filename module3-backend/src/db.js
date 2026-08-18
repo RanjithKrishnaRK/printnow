@@ -390,6 +390,31 @@ async function migrate() {
     CREATE INDEX IF NOT EXISTS settlements_shop_id_idx ON settlements (shop_id);
   `);
 
+  // Migration: one-time codes for shop owner email verification - both
+  // "verify your email before your signup completes" and "forgot password"
+  // reuse this same table, distinguished by purpose. payload carries
+  // whatever the OTP needs to unlock once verified (the pending signup's
+  // name/email/password hash/landmark for shop_signup; nothing needed for
+  // shop_password_reset since the email itself identifies the shop). Only
+  // one live OTP per (email, purpose) is kept at a time - requesting a new
+  // code deletes any earlier unconsumed one for that same purpose, so
+  // "resend code" always means the latest code is the only valid one.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS otps (
+      id          TEXT PRIMARY KEY,
+      email       TEXT NOT NULL,
+      purpose     TEXT NOT NULL CHECK (purpose IN ('shop_signup', 'shop_password_reset')),
+      otp_hash    TEXT NOT NULL,
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      payload     JSONB,
+      created_at  TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS otps_email_purpose_idx ON otps (email, purpose);
+  `);
+
   // Migration: a student's name, captured once per phone number. The first
   // time a phone number places an order anywhere, the student app requires
   // a name and this table remembers it - every order after that (at any
