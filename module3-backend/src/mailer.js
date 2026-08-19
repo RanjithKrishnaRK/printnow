@@ -24,6 +24,15 @@ function getTransporter() {
       port: Number(SMTP_PORT),
       secure: Number(SMTP_PORT) === 465, // 465 = implicit TLS; 587/others use STARTTLS
       auth: { user: SMTP_USER, pass: SMTP_PASS },
+      // Without these, a blocked/unreachable SMTP port (common on some
+      // hosts, which block outbound SMTP by default) hangs the connection
+      // attempt for a long time with no error - the request just never
+      // resolves, which looks like a frozen "Sending code…" button with no
+      // way to tell what's wrong. Short timeouts turn that into a fast,
+      // clear failure instead.
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 10_000,
     });
   }
   return transporter;
