@@ -70,7 +70,7 @@ module.exports = {
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || null,
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || null,
 
-  // SMTP for sending OTP emails (shop signup verification, forgot password).
+  // SMTP for shop-owner email OTPs (signup verification, forgot password).
   // Works with any SMTP provider - Gmail (with an app password), Zoho,
   // Mailgun, Resend's SMTP endpoint, etc. No fallback values - like
   // Razorpay above, there's no safe default for these, so OTP-sending
@@ -80,6 +80,16 @@ module.exports = {
   SMTP_USER: process.env.SMTP_USER || null,
   SMTP_PASS: process.env.SMTP_PASS || null,
   SMTP_FROM: process.env.SMTP_FROM || null,
+
+  // Resend's HTTP API - the PREFERRED way to send OTP emails, since it's a
+  // plain HTTPS call (works on hosts, like Render, that block outbound SMTP
+  // ports entirely) rather than a raw SMTP connection. If set, mailer.js
+  // uses this instead of the SMTP_* settings above. Get a key at
+  // https://resend.com - RESEND_FROM must be an address on a domain you've
+  // verified there (their onboarding@resend.dev sender only works for
+  // sending to your own Resend account email, not real students/shops).
+  RESEND_API_KEY: process.env.RESEND_API_KEY || null,
+  RESEND_FROM: process.env.RESEND_FROM || null,
 
   // Comma-separated list of allowed frontend origins, e.g.
   // "http://localhost:5173,http://localhost:5174"

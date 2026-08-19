@@ -1,11 +1,26 @@
 // src/mailer.js
 //
-// Sends OTP emails via SMTP - works with Gmail (app password), Zoho,
-// Mailgun, Resend's SMTP endpoint, or any other SMTP provider. Only touched
-// by otp.js/routes/shops.js; if email sending ever needs to change provider
-// or become an HTTP API instead of SMTP, this is the only file that changes.
+// Sends OTP emails two possible ways:
+// 1. Resend's HTTP API (preferred, if RESEND_API_KEY is set) - a plain
+//    HTTPS POST, so it works on hosts that block outbound SMTP ports
+//    entirely (a common restriction, and what turned out to be happening
+//    on this deploy - see the ENETUNREACH/connection-timeout history in
+//    git log for this file).
+// 2. SMTP via nodemailer (fallback) - works with Gmail (app password),
+//    Zoho, Mailgun, or any other SMTP provider, for hosts where outbound
+//    SMTP isn't blocked.
+// Only touched by otp.js/routes/shops.js; if email needs to change
+// provider again, this is the only file that changes.
 const nodemailer = require('nodemailer');
-const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = require('./config');
+const {
+  SMTP_HOST,
+  SMTP_PORT,
+  SMTP_USER,
+  SMTP_PASS,
+  SMTP_FROM,
+  RESEND_API_KEY,
+  RESEND_FROM,
+} = require('./config');
 
 let transporter = null;
 
@@ -15,7 +30,7 @@ function getTransporter() {
     // the whole server at boot - lets everything else keep working in an
     // environment where email just hasn't been set up yet.
     throw new Error(
-      'Email is not configured - set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM'
+      'Email is not configured - set RESEND_API_KEY (recommended) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/SMTP_FROM'
     );
   }
   if (!transporter) {
@@ -54,7 +69,7 @@ const HEADING_BY_PURPOSE = {
   shop_password_reset: 'Reset your PrintNow password',
 };
 
-async function sendOtpEmail(toEmail, otp, purpose) {
+function buildEmail(otp, purpose) {
   const subject = SUBJECT_BY_PURPOSE[purpose] || 'Your PrintNow verification code';
   const heading = HEADING_BY_PURPOSE[purpose] || 'Your verification code';
   const html = `
@@ -67,7 +82,32 @@ async function sendOtpEmail(toEmail, otp, purpose) {
       </p>
     </div>
   `;
+  return { subject, html };
+}
 
+async function sendViaResend(toEmail, otp, purpose) {
+  const { subject, html } = buildEmail(otp, purpose);
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM || 'PrintNow <onboarding@resend.dev>',
+      to: toEmail,
+      subject,
+      html,
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Resend API error (${response.status}): ${body || 'unknown error'}`);
+  }
+}
+
+async function sendViaSmtp(toEmail, otp, purpose) {
+  const { subject, html } = buildEmail(otp, purpose);
   const mailer = getTransporter();
   await mailer.sendMail({
     from: SMTP_FROM || SMTP_USER,
@@ -75,6 +115,13 @@ async function sendOtpEmail(toEmail, otp, purpose) {
     subject,
     html,
   });
+}
+
+async function sendOtpEmail(toEmail, otp, purpose) {
+  if (RESEND_API_KEY) {
+    return sendViaResend(toEmail, otp, purpose);
+  }
+  return sendViaSmtp(toEmail, otp, purpose);
 }
 
 module.exports = { sendOtpEmail };
