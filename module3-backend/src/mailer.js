@@ -24,6 +24,13 @@ function getTransporter() {
       port: Number(SMTP_PORT),
       secure: Number(SMTP_PORT) === 465, // 465 = implicit TLS; 587/others use STARTTLS
       auth: { user: SMTP_USER, pass: SMTP_PASS },
+      // Force IPv4. Render (like several other hosts) has no outbound IPv6
+      // route, but Node's default DNS resolution can still hand back an
+      // IPv6 address for smtp.gmail.com - the connection then fails with
+      // ENETUNREACH on an address that was never reachable from this host
+      // in the first place. family: 4 makes the DNS lookup only consider
+      // IPv4 addresses, so this can't happen.
+      family: 4,
       // Without these, a blocked/unreachable SMTP port (common on some
       // hosts, which block outbound SMTP by default) hangs the connection
       // attempt for a long time with no error - the request just never
