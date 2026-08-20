@@ -125,19 +125,19 @@ function UserDetailModal({ token, phone, onClose }) {
   }, [token, phone]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/40 p-3 sm:p-6 overflow-y-auto">
-      <div className="bg-card rounded-xl shadow-xl border border-black/5 w-full max-w-2xl my-6">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-black/5">
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/40 p-3 sm:p-6">
+      <div className="bg-card rounded-xl shadow-xl border border-black/5 w-full max-w-2xl my-6 max-h-[90vh] flex flex-col">
+        <div className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-black/5">
           <div>
             <h2 className="text-lg font-semibold text-ink">{detail?.name || "Customer"}</h2>
             <p className="text-xs text-collected font-mono">{phone}</p>
           </div>
-          <button onClick={onClose} className="text-collected hover:text-ink text-sm font-medium">
+          <button onClick={onClose} className="text-collected hover:text-ink text-sm font-medium shrink-0">
             Close
           </button>
         </div>
 
-        <div className="px-5 py-4 space-y-6">
+        <div className="px-5 py-4 space-y-6 overflow-y-auto">
           {loading ? (
             <p className="text-sm text-collected py-8 text-center">Loading…</p>
           ) : error ? (
