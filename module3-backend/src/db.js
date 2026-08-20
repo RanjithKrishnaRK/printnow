@@ -405,6 +405,13 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE shops ADD COLUMN IF NOT EXISTS temp_password_expires_at TIMESTAMPTZ;
   `);
+  // shops never had an updated_at column at all (unlike print_jobs,
+  // batches, settlements) - the new change-password route needs one to
+  // record when the password last changed, which is what actually
+  // surfaced this gap (a 500 from referencing a column that didn't exist).
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+  `);
 
   // Migration: a student's name, captured once per phone number. The first
   // time a phone number places an order anywhere, the student app requires
