@@ -238,16 +238,29 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
   }
 
   return (
-    <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
-      <h2 className="font-display font-bold text-2xl text-ink mb-4">Settings</h2>
-      {loading ? (
-        <div className="text-center text-collected py-16">Loading…</div>
-      ) : (
-        <div className="space-y-6">
-          {formCard}
-          <ChangePasswordCard shopId={shopId} token={token} startOpen={mustChangePassword} />
+    <div className="min-h-screen bg-paper">
+      <header className="bg-ink text-white px-4 sm:px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 rounded bg-teal flex items-center justify-center shrink-0">
+            <span className="font-mono font-bold text-white text-xs">P</span>
+          </div>
+          <span className="font-display font-bold text-xl tracking-tight">Settings</span>
         </div>
-      )}
+        <button onClick={onDone} className="text-sm text-white/70 hover:text-white transition-colors">
+          ← Back to dashboard
+        </button>
+      </header>
+
+      <main className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+        {loading ? (
+          <div className="text-center text-collected py-16">Loading…</div>
+        ) : (
+          <div className="space-y-6">
+            {formCard}
+            <ChangePasswordCard shopId={shopId} token={token} startOpen={mustChangePassword} />
+          </div>
+        )}
+      </main>
     </div>
   );
 }
