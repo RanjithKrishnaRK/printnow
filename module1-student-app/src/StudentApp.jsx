@@ -8,18 +8,42 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
 // Reads a PDF's actual page count client-side (no server round trip) so the
 // "Pages" field can default to - and be capped at - the real number instead
-// of trusting whatever the student happens to type. If the file turns out
-// not to be a well-formed PDF (or parsing fails for any other reason),
-// resolves to null rather than throwing - the caller falls back to manual
-// entry with no cap, so a slightly unusual PDF never blocks someone from
-// ordering a print.
-async function countPdfPages(file) {
+// of trusting whatever the student happens to type, and renders a small
+// preview image of the first page so a document card shows roughly what's
+// about to print rather than just a filename. One parse does both, since
+// pdfjs only needs to load the file once for either. If the file turns out
+// not to be a well-formed PDF (or parsing/rendering fails for any other
+// reason), page count and/or thumbnail come back null rather than
+// throwing - the caller falls back to manual page entry and no preview
+// image, so a slightly unusual PDF never blocks someone from ordering a
+// print.
+async function analyzePdf(file) {
   try {
     const buffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
-    return pdf.numPages;
+    const numPages = pdf.numPages;
+
+    let thumbnailUrl = null;
+    try {
+      const page = await pdf.getPage(1);
+      const unscaledViewport = page.getViewport({ scale: 1 });
+      // A thumbnail, not a full-resolution page - 320px wide is plenty to
+      // recognize "yes, that's my assignment" at a glance.
+      const targetWidth = 320;
+      const viewport = page.getViewport({ scale: targetWidth / unscaledViewport.width });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      thumbnailUrl = canvas.toDataURL("image/png");
+    } catch (err) {
+      // Page count above still succeeded even if the render step failed -
+      // keep going with no thumbnail rather than losing the count too.
+    }
+
+    return { numPages, thumbnailUrl };
   } catch (err) {
-    return null;
+    return { numPages: null, thumbnailUrl: null };
   }
 }
 
@@ -70,8 +94,8 @@ async function processChosenFile(chosenFile) {
     }
   }
 
-  const detectedPages = await countPdfPages(fileToUse);
-  return { file: fileToUse, detectedPages };
+  const { numPages: detectedPages, thumbnailUrl } = await analyzePdf(fileToUse);
+  return { file: fileToUse, detectedPages, thumbnailUrl };
 }
 
 let docIdCounter = 0;
@@ -1014,6 +1038,8 @@ function makeDefaultDocument() {
     sides: "single",
     colorMode: "bw",
     colorPages: "",
+    thumbnailUrl: null, // small first-page preview image (data URL) for PDFs
+    previewUrl: null, // object URL of the actual file, for the full preview modal
   };
 }
 
@@ -1036,12 +1062,15 @@ function deriveDocument(doc, rates) {
 // One document's settings card within the multi-file upload flow - pages,
 // copies, sides, color mode/pages, plus a per-document price and a remove
 // button. Identical field set to what UploadStep used to render once for
-// its single file; now rendered once per document.
+// its single file; now rendered once per document. Also shows a thumbnail
+// of the first page (tap to open a full preview) so a student can confirm
+// "yes, that's the right file" before paying, not just read a filename.
 function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRemove }) {
   const { pagesNum, colorPageCount, rangeError, estimate } = deriveDocument(
     doc,
     shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null
   );
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   function handlePagesChange(e) {
     let n = parseInt(e.target.value, 10) || 0;
@@ -1052,11 +1081,46 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
   return (
     <div className="rounded-lg border border-stone-300 bg-white px-3.5 py-3.5 shadow-sm shadow-stone-900/[0.03]">
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-[11px] font-medium uppercase tracking-wide text-stone-400">
-            Document {index + 1}
-          </p>
-          <p className="truncate text-sm font-medium text-stone-900">{doc.fileName}</p>
+        <div className="flex min-w-0 items-start gap-3">
+          {doc.thumbnailUrl ? (
+            <button
+              type="button"
+              onClick={() => setPreviewOpen(true)}
+              className="shrink-0 overflow-hidden rounded-md border border-stone-200 active:opacity-80"
+              aria-label={`Preview ${doc.fileName}`}
+            >
+              <img
+                src={doc.thumbnailUrl}
+                alt=""
+                className="h-16 w-12 object-cover object-top"
+              />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => doc.previewUrl && setPreviewOpen(true)}
+              disabled={!doc.previewUrl}
+              className="flex h-16 w-12 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-stone-50 text-[9px] font-medium uppercase tracking-wide text-stone-400"
+              aria-label={`Preview ${doc.fileName}`}
+            >
+              PDF
+            </button>
+          )}
+          <div className="min-w-0">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-stone-400">
+              Document {index + 1}
+            </p>
+            <p className="truncate text-sm font-medium text-stone-900">{doc.fileName}</p>
+            {doc.previewUrl && (
+              <button
+                type="button"
+                onClick={() => setPreviewOpen(true)}
+                className="mt-0.5 text-[11px] font-medium text-[#2F6E68] underline"
+              >
+                Preview
+              </button>
+            )}
+          </div>
         </div>
         {showRemove && (
           <button
@@ -1189,6 +1253,47 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
           <span className="font-mono font-semibold text-stone-900">₹{estimate}</span>
         </div>
       )}
+
+      {previewOpen && doc.previewUrl && (
+        <DocumentPreviewModal
+          fileUrl={doc.previewUrl}
+          fileName={doc.fileName}
+          onClose={() => setPreviewOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Full-size look at the actual PDF being ordered - opened by tapping a
+// document's thumbnail or "Preview" link. Renders via <iframe> pointed at
+// the file's own object URL: every mobile and desktop browser already has
+// a built-in PDF viewer for this (pinch-zoom, scroll through every page,
+// etc.), so this needs no PDF-rendering logic of its own - just get out of
+// the way and let the browser do what it already does well.
+function DocumentPreviewModal({ fileUrl, fileName, onClose }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-black/60"
+      onClick={onClose}
+    >
+      <div className="flex items-center justify-between px-4 py-3 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{fileName}</p>
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 rounded-md bg-white/10 px-3 py-1.5 text-sm font-medium active:bg-white/20"
+        >
+          Close
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 px-2 pb-2 sm:px-6 sm:pb-6" onClick={(e) => e.stopPropagation()}>
+        <iframe
+          src={fileUrl}
+          title={fileName}
+          className="h-full w-full rounded-lg bg-white"
+        />
+      </div>
     </div>
   );
 }
@@ -1280,29 +1385,55 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   }
 
   function removeDoc(id) {
-    setOrder((prev) => ({ ...prev, documents: prev.documents.filter((d) => d.id !== id) }));
+    setOrder((prev) => {
+      const removed = prev.documents.find((d) => d.id === id);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return { ...prev, documents: prev.documents.filter((d) => d.id !== id) };
+    });
   }
 
-  // Adds one more document to the order - each upload picks a single file,
-  // gets processed (docx/photo -> PDF, page count detected), then joins the
-  // list with its own default settings. Students who want just one document
-  // never notice anything changed: pick a file, settings appear, submit.
-  async function handleFileChosen(chosenFile) {
-    if (!chosenFile) return;
+  // Adds one or more documents to the order in one go - each file gets
+  // processed (docx/photo -> PDF, page count + thumbnail detected), then
+  // joins the list with its own default settings. Runs sequentially rather
+  // than in parallel: pdfjs rendering is memory-heavy enough that firing
+  // off many at once on a budget phone risks stalling or crashing the tab,
+  // and sequential also means documents appear in the card list in the
+  // same order the student picked them, one by one, rather than in
+  // whatever order finished processing first.
+  async function handleFilesChosen(fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
     setAddingFile(true);
     setAddError(null);
     try {
-      const { file, detectedPages } = await processChosenFile(chosenFile);
-      const newDoc = {
-        ...makeDefaultDocument(),
-        file,
-        fileName: file.name,
-        detectedPages,
-        pages: detectedPages ? String(detectedPages) : "",
-      };
-      setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
-    } catch (err) {
-      setAddError(err.message || "Could not process that file.");
+      for (const chosenFile of files) {
+        try {
+          const { file, detectedPages, thumbnailUrl } = await processChosenFile(chosenFile);
+          const newDoc = {
+            ...makeDefaultDocument(),
+            file,
+            fileName: file.name,
+            detectedPages,
+            pages: detectedPages ? String(detectedPages) : "",
+            thumbnailUrl,
+            // Object URL of the actual (post-conversion) PDF - used for the
+            // "view full document" preview modal. Kept alongside the file
+            // itself for the whole document's lifetime in this order; see
+            // the cleanup effect below that revokes these on unmount.
+            previewUrl: URL.createObjectURL(file),
+          };
+          setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
+        } catch (err) {
+          // One bad file (corrupt PDF, unsupported photo format, etc.)
+          // shouldn't stop the rest of a multi-file selection from being
+          // added - report it and move on to the next file.
+          setAddError(
+            files.length > 1
+              ? `"${chosenFile.name}": ${err.message || "Could not process that file."}`
+              : err.message || "Could not process that file."
+          );
+        }
+      }
     } finally {
       setAddingFile(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -1449,8 +1580,8 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
             {addingFile
               ? "Processing…"
               : documents.length > 0
-              ? "+ Add another document"
-              : "Choose a PDF, Word doc, or photo"}
+              ? "+ Add more documents"
+              : "Choose PDFs, Word docs, or photos"}
           </span>
           <span className="ml-3 shrink-0 rounded-md bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-50">
             {addingFile ? "…" : "Browse"}
@@ -1459,14 +1590,20 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
         <input
           ref={fileInputRef}
           type="file"
+          multiple
           accept="application/pdf,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
           className="hidden"
           disabled={addingFile}
-          onChange={(e) => handleFileChosen(e.target.files?.[0] || null)}
+          onChange={(e) => handleFilesChosen(e.target.files)}
         />
+        {documents.length === 0 && (
+          <p className="mt-1 text-[11px] text-stone-500">
+            Select multiple files at once if you're printing more than one document.
+          </p>
+        )}
         {addingFile && (
           <p className="mt-1 text-[11px] text-stone-500">
-            Reading your file and detecting pages — usually just a few seconds…
+            Reading your files and detecting pages — usually just a few seconds…
           </p>
         )}
         {addError && <p className="mt-1 text-[11px] text-red-700">{addError}</p>}
