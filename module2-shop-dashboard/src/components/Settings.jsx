@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
-import { getSettings, updateSettings } from "../api";
+import { getSettings, updateSettings, changePassword } from "../api";
 
 // Shown two ways: (1) mandatory first screen right after signup, via
 // `firstTime`, so a shop can't start receiving orders priced at nothing;
 // (2) anytime after, from the dashboard header's "Settings" button. Both
 // cases render the same form - `firstTime` only changes the framing copy
 // and swaps "Cancel" for nothing (there's nothing to cancel back to yet).
-export default function Settings({ shopId, token, firstTime = false, onDone }) {
+export default function Settings({ shopId, token, firstTime = false, mustChangePassword = false, onDone }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -243,8 +243,153 @@ export default function Settings({ shopId, token, firstTime = false, onDone }) {
       {loading ? (
         <div className="text-center text-collected py-16">Loading…</div>
       ) : (
-        formCard
+        <div className="space-y-6">
+          {formCard}
+          <ChangePasswordCard shopId={shopId} token={token} startOpen={mustChangePassword} />
+        </div>
       )}
     </div>
+  );
+}
+
+// Self-contained: owns its own form state, separate from the pricing form
+// above (different save action, different validation, no reason to share
+// state). startOpen is true right after logging in with a temporary
+// password (see App.jsx/Dashboard.jsx) - not required, but skips a click
+// for the one moment this is most likely to be exactly what someone
+// clicked "Settings" to do.
+function ChangePasswordCard({ shopId, token, startOpen = false }) {
+  const [open, setOpen] = useState(startOpen);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    if (newPassword.length < 8) {
+      return setError("New password must be at least 8 characters.");
+    }
+    if (newPassword !== confirmPassword) {
+      return setError("New password and confirmation don't match.");
+    }
+    setSaving(true);
+    try {
+      await changePassword(shopId, token, currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1800);
+    } catch (err) {
+      setError(err.message || "Could not change your password. Try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <div className="bg-card rounded-xl shadow-sm border border-black/5 p-6">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="text-sm font-medium text-teal hover:text-teal-dark"
+        >
+          Change password
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="bg-card rounded-xl shadow-sm border border-black/5 p-6">
+      <p className="mb-4 text-xs font-medium uppercase tracking-wide text-collected">
+        Change password
+      </p>
+
+      {!startOpen && (
+        <div className="mb-4">
+          <label htmlFor="currentPassword" className="block text-sm font-medium text-ink mb-1">
+            Current password
+          </label>
+          <input
+            id="currentPassword"
+            type="password"
+            autoComplete="current-password"
+            required
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            className="w-full max-w-xs rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+          />
+        </div>
+      )}
+
+      <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-xl">
+        <div>
+          <label htmlFor="newPassword" className="block text-sm font-medium text-ink mb-1">
+            New password
+          </label>
+          <input
+            id="newPassword"
+            type="password"
+            autoComplete="new-password"
+            required
+            minLength={8}
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder="At least 8 characters"
+            className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+          />
+        </div>
+        <div>
+          <label htmlFor="confirmPassword" className="block text-sm font-medium text-ink mb-1">
+            Confirm new password
+          </label>
+          <input
+            id="confirmPassword"
+            type="password"
+            autoComplete="new-password"
+            required
+            minLength={8}
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+          />
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2 max-w-xl">
+          {error}
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={saving}
+          className="bg-teal hover:bg-teal-dark disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium rounded-lg px-5 py-2.5 transition-colors"
+        >
+          {saving ? "Saving…" : "Update password"}
+        </button>
+        {!startOpen && (
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              setError("");
+            }}
+            className="text-sm text-collected hover:text-ink"
+          >
+            Cancel
+          </button>
+        )}
+        {saved && <span className="text-sm text-ready font-medium">Saved ✓</span>}
+      </div>
+    </form>
   );
 }

@@ -9,6 +9,7 @@ import {
   createSettlement,
   updateSettlement,
   deleteSettlement,
+  generateShopTempPassword,
 } from "../api";
 
 const SETTLEMENT_MODES = [
@@ -177,6 +178,9 @@ export default function ShopDetail({ token, shop, onClose }) {
                 )}
               </section>
 
+              {/* Temporary password - the whole "forgot password" flow for shops */}
+              <TempPasswordSection token={token} shop={shop} />
+
               {/* Settlements - payouts of this shop's online earnings */}
               <SettlementsSection token={token} shop={shop} stats={stats} statsError={statsError} />
 
@@ -299,6 +303,75 @@ export default function ShopDetail({ token, shop, onClose }) {
 // so ShopDetail's already-large state doesn't have to grow just for this.
 // Settlements are only ever recorded against ONLINE earnings - cash never
 // needs settling since the shop owner already has it in hand.
+// Self-contained: this IS the whole "forgot password" flow for shops - no
+// email, no self-service. The admin generates a 6-digit numeric password
+// valid for 10 minutes, relays it to the shop owner directly (phone call,
+// in person), and they log in with it via the normal shop login form. It's
+// shown here once, right after generating it, and never retrievable again
+// after this component's state resets (only the hash is stored server-side).
+function TempPasswordSection({ token, shop }) {
+  const [result, setResult] = useState(null); // { tempPassword, expiresAt } | null
+  const [error, setError] = useState("");
+  const [generating, setGenerating] = useState(false);
+
+  async function handleGenerate() {
+    setError("");
+    setGenerating(true);
+    try {
+      const res = await generateShopTempPassword(token, shop.shopId);
+      setResult(res);
+    } catch (err) {
+      setError(err.message || "Could not generate a temporary password.");
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3 className="text-xs font-medium uppercase tracking-wide text-collected mb-2">
+        Shop owner locked out?
+      </h3>
+      <p className="text-xs text-collected mb-3">
+        Generates a 6-digit temporary password, valid for 10 minutes. Tell it to the shop owner
+        directly (phone/in person) - they log in with it on the normal login screen, then set a
+        real password from Settings.
+      </p>
+
+      {result ? (
+        <div className="rounded-lg border border-teal/30 bg-teal/5 px-4 py-3">
+          <p className="text-xs text-collected mb-1">Temporary password (valid 10 minutes)</p>
+          <p className="font-mono text-2xl font-bold tracking-[0.2em] text-ink mb-2">
+            {result.tempPassword}
+          </p>
+          <p className="text-xs text-collected mb-3">
+            Expires at {new Date(result.expiresAt).toLocaleTimeString()}. This won't be shown
+            again after you leave this page.
+          </p>
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            className="text-xs font-medium text-teal hover:text-teal/80 disabled:opacity-50"
+          >
+            {generating ? "Generating…" : "Generate a new one"}
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={handleGenerate}
+          disabled={generating}
+          className="rounded-lg border border-black/10 bg-paper px-4 py-2 text-sm font-medium text-ink hover:bg-black/5 disabled:opacity-50 transition-colors"
+        >
+          {generating ? "Generating…" : "Generate temporary password"}
+        </button>
+      )}
+
+      {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
+    </section>
+  );
+}
+
+
 function SettlementsSection({ token, shop, stats, statsError }) {
   const [settlements, setSettlements] = useState([]);
   const [loading, setLoading] = useState(true);

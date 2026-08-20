@@ -45,57 +45,34 @@ async function realLogin(email, password) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || "Login failed. Check your email and password.");
   }
-  return res.json(); // { shopId, token }
+  return res.json(); // { shopId, token, mustChangePassword? }
 }
 
-async function realRequestSignupOtp(name, email, password, landmarkId) {
-  const res = await fetch(`${BASE_URL}/api/shops/signup/request-otp`, {
+async function realSignup(name, email, password, landmarkId) {
+  const res = await fetch(`${BASE_URL}/api/shops/signup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, email, password, landmarkId }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Could not send the verification code. Please try again.");
-  }
-  return res.json(); // { ok: true, email }
-}
-
-async function realVerifySignupOtp(email, otp) {
-  const res = await fetch(`${BASE_URL}/api/shops/signup/verify-otp`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, otp }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Could not verify that code. Please try again.");
+    throw new Error(body.error || "Signup failed. Please try again.");
   }
   return res.json(); // { shopId, token, shopName }
 }
 
-async function realForgotPassword(email) {
-  const res = await fetch(`${BASE_URL}/api/shops/forgot-password`, {
+async function realChangePassword(shopId, token, currentPassword, newPassword) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/change-password`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ currentPassword, newPassword }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Could not process that request. Please try again.");
-  }
-  return res.json(); // { ok: true }
-}
-
-async function realResetPassword(email, otp, newPassword) {
-  const res = await fetch(`${BASE_URL}/api/shops/reset-password`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, otp, newPassword }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Could not reset your password. Please try again.");
+    throw new Error(body.error || "Could not change your password. Please try again.");
   }
   return res.json(); // { ok: true }
 }
@@ -336,10 +313,7 @@ async function mockLogin(email, password) {
   throw new Error("Invalid email or password.");
 }
 
-const MOCK_OTP = "000000"; // fixed dev code - mock mode has no real inbox to check
-const mockPendingSignups = new Map(); // email -> { name, email, password, landmarkId }
-
-async function mockRequestSignupOtp(name, email, password, landmarkId) {
+async function mockSignup(name, email, password, landmarkId) {
   await wait(MOCK_LATENCY_MS);
   if (!landmarkId) throw new Error("landmarkId is required");
   const normalizedEmail = email.trim().toLowerCase();
@@ -347,51 +321,24 @@ async function mockRequestSignupOtp(name, email, password, landmarkId) {
     normalizedEmail === MOCK_SHOP.email ||
     mockSignedUpShops.some((s) => s.email.toLowerCase() === normalizedEmail);
   if (exists) throw new Error("A shop with this email already exists");
-  mockPendingSignups.set(normalizedEmail, { name, email: normalizedEmail, password, landmarkId });
-  // eslint-disable-next-line no-console
-  console.log(`[MOCK] Signup OTP for ${normalizedEmail}: ${MOCK_OTP}`);
-  return { ok: true, email: normalizedEmail };
-}
-
-async function mockVerifySignupOtp(email, otp) {
-  await wait(MOCK_LATENCY_MS);
-  const normalizedEmail = email.trim().toLowerCase();
-  const pending = mockPendingSignups.get(normalizedEmail);
-  if (!pending) throw new Error("No verification code found for this email. Please request a new one.");
-  if (otp !== MOCK_OTP) throw new Error("Incorrect code. Please try again.");
-  mockPendingSignups.delete(normalizedEmail);
   const shopId = `mock_shop_${Date.now()}`;
   const token = `mock-token-${Date.now()}`;
-  mockSignedUpShops.push({ ...pending, shopId, token });
-  return { shopId, token, shopName: pending.name };
+  mockSignedUpShops.push({ name, email: normalizedEmail, password, shopId, token });
+  return { shopId, token, shopName: name };
 }
 
-const mockPendingResets = new Map(); // email -> true (mock: any registered email "has" a code)
-
-async function mockForgotPassword(email) {
+async function mockChangePassword(shopId, token, currentPassword, newPassword) {
   await wait(MOCK_LATENCY_MS);
-  const normalizedEmail = email.trim().toLowerCase();
-  const isRegistered =
-    normalizedEmail === MOCK_SHOP.email ||
-    mockSignedUpShops.some((s) => s.email.toLowerCase() === normalizedEmail);
-  if (isRegistered) {
-    mockPendingResets.set(normalizedEmail, true);
-    // eslint-disable-next-line no-console
-    console.log(`[MOCK] Password reset OTP for ${normalizedEmail}: ${MOCK_OTP}`);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  if (shopId === MOCK_SHOP.shopId) {
+    if (currentPassword !== MOCK_SHOP.password) throw new Error("Current password is incorrect");
+    MOCK_SHOP.password = newPassword; // demo-only mutation, resets on page reload
+    return { ok: true };
   }
-  return { ok: true }; // generic response either way, matching the real endpoint
-}
-
-async function mockResetPassword(email, otp, newPassword) {
-  await wait(MOCK_LATENCY_MS);
-  const normalizedEmail = email.trim().toLowerCase();
-  if (!mockPendingResets.get(normalizedEmail)) {
-    throw new Error("No verification code found for this email. Please request a new one.");
-  }
-  if (otp !== MOCK_OTP) throw new Error("Incorrect code. Please try again.");
-  mockPendingResets.delete(normalizedEmail);
-  const shop = mockSignedUpShops.find((s) => s.email.toLowerCase() === normalizedEmail);
-  if (shop) shop.password = newPassword;
+  const shop = mockSignedUpShops.find((s) => s.shopId === shopId);
+  if (!shop) throw new Error("Shop not found");
+  if (currentPassword !== shop.password) throw new Error("Current password is incorrect");
+  shop.password = newPassword;
   return { ok: true };
 }
 
@@ -566,22 +513,16 @@ export function login(email, password) {
   return USE_MOCK ? mockLogin(email, password) : realLogin(email, password);
 }
 
-export function requestSignupOtp(name, email, password, landmarkId) {
+export function signup(name, email, password, landmarkId) {
   return USE_MOCK
-    ? mockRequestSignupOtp(name, email, password, landmarkId)
-    : realRequestSignupOtp(name, email, password, landmarkId);
+    ? mockSignup(name, email, password, landmarkId)
+    : realSignup(name, email, password, landmarkId);
 }
 
-export function verifySignupOtp(email, otp) {
-  return USE_MOCK ? mockVerifySignupOtp(email, otp) : realVerifySignupOtp(email, otp);
-}
-
-export function forgotPassword(email) {
-  return USE_MOCK ? mockForgotPassword(email) : realForgotPassword(email);
-}
-
-export function resetPassword(email, otp, newPassword) {
-  return USE_MOCK ? mockResetPassword(email, otp, newPassword) : realResetPassword(email, otp, newPassword);
+export function changePassword(shopId, token, currentPassword, newPassword) {
+  return USE_MOCK
+    ? mockChangePassword(shopId, token, currentPassword, newPassword)
+    : realChangePassword(shopId, token, currentPassword, newPassword);
 }
 
 export function getLandmarks() {

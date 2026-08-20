@@ -51,6 +51,7 @@ export default function Dashboard({
   onLogout,
   onOpenSettings,
   onOpenEarnings,
+  mustChangePassword = false,
 }) {
   const [activeTab, setActiveTab] = useState("queued");
   const [jobs, setJobs] = useState([]);
@@ -355,6 +356,20 @@ export default function Dashboard({
           </button>
         </div>
       </header>
+
+      {mustChangePassword && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-6 py-2.5 flex items-center justify-between gap-3">
+          <p className="text-sm text-amber-800">
+            You logged in with a temporary password. Set a real one now so it doesn't expire on you.
+          </p>
+          <button
+            onClick={onOpenSettings}
+            className="text-sm font-medium text-amber-900 underline shrink-0"
+          >
+            Go to Settings
+          </button>
+        </div>
+      )}
 
       {showQr && <ShopQrCode shopId={shopId} shopName={shopName} onClose={closeQr} />}
 

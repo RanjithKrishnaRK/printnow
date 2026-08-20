@@ -2,7 +2,7 @@ import { useState } from "react";
 import { login } from "../api";
 import { primeAudio } from "../buzzer";
 
-export default function Login({ onLogin, onGoToSignup, onGoToForgotPassword }) {
+export default function Login({ onLogin, onGoToSignup }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -18,8 +18,8 @@ export default function Login({ onLogin, onGoToSignup, onGoToForgotPassword }) {
     // before it's ever actually needed.
     primeAudio();
     try {
-      const { shopId, token } = await login(email, password);
-      onLogin(shopId, token);
+      const { shopId, token, mustChangePassword } = await login(email, password);
+      onLogin(shopId, token, mustChangePassword);
     } catch (err) {
       setError(err.message || "Something went wrong. Try again.");
     } finally {
@@ -62,7 +62,7 @@ export default function Login({ onLogin, onGoToSignup, onGoToForgotPassword }) {
             />
           </div>
 
-          <div className="mb-2">
+          <div className="mb-5">
             <label htmlFor="password" className="block text-sm font-medium text-ink mb-1">
               Password
             </label>
@@ -78,21 +78,15 @@ export default function Login({ onLogin, onGoToSignup, onGoToForgotPassword }) {
             />
           </div>
 
-          <div className="mb-5 text-right">
-            <button
-              type="button"
-              onClick={onGoToForgotPassword}
-              className="text-xs text-collected hover:text-ink underline"
-            >
-              Forgot password?
-            </button>
-          </div>
-
           {error && (
             <div className="mb-4 text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
               {error}
             </div>
           )}
+
+          <p className="mb-4 text-xs text-collected">
+            Lost your password? Contact PrintNow support and we'll get you a temporary one.
+          </p>
 
           <button
             type="submit"

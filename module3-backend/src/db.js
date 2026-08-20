@@ -390,29 +390,20 @@ async function migrate() {
     CREATE INDEX IF NOT EXISTS settlements_shop_id_idx ON settlements (shop_id);
   `);
 
-  // Migration: one-time codes for shop owner email verification - both
-  // "verify your email before your signup completes" and "forgot password"
-  // reuse this same table, distinguished by purpose. payload carries
-  // whatever the OTP needs to unlock once verified (the pending signup's
-  // name/email/password hash/landmark for shop_signup; nothing needed for
-  // shop_password_reset since the email itself identifies the shop). Only
-  // one live OTP per (email, purpose) is kept at a time - requesting a new
-  // code deletes any earlier unconsumed one for that same purpose, so
-  // "resend code" always means the latest code is the only valid one.
+  // Migration: admin-issued temporary passwords for shop owners who lose
+  // access. Deliberately NOT self-service (no email OTP) - the admin
+  // generates a numeric temp password out-of-band (see
+  // POST /api/admin/shops/:shopId/temp-password) and relays it to the shop
+  // owner directly (phone/in person), who logs in with it via the normal
+  // login form. It's checked as a fallback in POST /api/shops/login only
+  // when the real password doesn't match, expires after 10 minutes, and is
+  // consumed (cleared) the moment it's used - a temp password only ever
+  // gets someone in the door once.
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS otps (
-      id          TEXT PRIMARY KEY,
-      email       TEXT NOT NULL,
-      purpose     TEXT NOT NULL CHECK (purpose IN ('shop_signup', 'shop_password_reset')),
-      otp_hash    TEXT NOT NULL,
-      attempts    INTEGER NOT NULL DEFAULT 0,
-      expires_at  TIMESTAMPTZ NOT NULL,
-      payload     JSONB,
-      created_at  TIMESTAMPTZ NOT NULL
-    );
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS temp_password_hash TEXT;
   `);
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS otps_email_purpose_idx ON otps (email, purpose);
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS temp_password_expires_at TIMESTAMPTZ;
   `);
 
   // Migration: a student's name, captured once per phone number. The first

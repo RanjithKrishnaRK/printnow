@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import Login from "./components/Login";
 import Signup from "./components/Signup";
-import ForgotPassword from "./components/ForgotPassword";
 import Dashboard from "./components/Dashboard";
 import Settings from "./components/Settings";
 import Earnings from "./components/Earnings";
@@ -10,8 +9,12 @@ import { stopFlashOnFocus } from "./buzzer";
 
 export default function App() {
   const [session, setSession] = useState(() => loadSession());
-  const [view, setView] = useState("login"); // "login" | "signup" | "forgot-password"
+  const [view, setView] = useState("login"); // "login" | "signup"
   const [justSignedUp, setJustSignedUp] = useState(false);
+  // True right after logging in with an admin-issued temporary password
+  // (see routes/shops.js POST /login) - prompts the owner to set a real
+  // password before the "change your temp password" banner goes away.
+  const [mustChangePassword, setMustChangePassword] = useState(false);
   // "onboarding" forces Settings first after signup (no pricing set yet -
   // students can't be shown a price of nothing). "dashboard" is normal use;
   // the dashboard header's "Settings" button can jump back to "settings"
@@ -22,9 +25,10 @@ export default function App() {
     stopFlashOnFocus();
   }, []);
 
-  function handleLogin(shopId, token) {
+  function handleLogin(shopId, token, tempPasswordUsed) {
     saveSession(shopId, token);
     setSession({ shopId, token });
+    setMustChangePassword(!!tempPasswordUsed);
     setScreen("dashboard");
   }
 
@@ -37,6 +41,7 @@ export default function App() {
 
   function handleLogout() {
     setSession(null);
+    setMustChangePassword(false);
     setView("login");
   }
 
@@ -44,21 +49,7 @@ export default function App() {
     if (view === "signup") {
       return <Signup onSignedUp={handleSignedUp} onBackToLogin={() => setView("login")} />;
     }
-    if (view === "forgot-password") {
-      return (
-        <ForgotPassword
-          onBackToLogin={() => setView("login")}
-          onReset={() => setView("login")}
-        />
-      );
-    }
-    return (
-      <Login
-        onLogin={handleLogin}
-        onGoToSignup={() => setView("signup")}
-        onGoToForgotPassword={() => setView("forgot-password")}
-      />
-    );
+    return <Login onLogin={handleLogin} onGoToSignup={() => setView("signup")} />;
   }
 
   if (screen === "onboarding") {
@@ -77,7 +68,11 @@ export default function App() {
       <Settings
         shopId={session.shopId}
         token={session.token}
-        onDone={() => setScreen("dashboard")}
+        mustChangePassword={mustChangePassword}
+        onDone={() => {
+          setMustChangePassword(false);
+          setScreen("dashboard");
+        }}
       />
     );
   }
@@ -96,6 +91,7 @@ export default function App() {
       onLogout={handleLogout}
       onOpenSettings={() => setScreen("settings")}
       onOpenEarnings={() => setScreen("earnings")}
+      mustChangePassword={mustChangePassword}
     />
   );
 }

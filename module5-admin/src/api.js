@@ -127,6 +127,14 @@ export async function getShopStats(token, shopId) {
   return handle(res); // { totalEarnings, todayEarnings, totalByMethod: {cash, online}, todayByMethod, settledTotal, unsettledOnline, ... }
 }
 
+export async function generateShopTempPassword(token, shopId) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/temp-password`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { tempPassword, expiresAt }
+}
+
 export async function getShopSettlements(token, shopId) {
   const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/settlements`, {
     headers: { Authorization: `Bearer ${token}` },

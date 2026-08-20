@@ -13,9 +13,14 @@ async function comparePassword(plain, hash) {
   return bcrypt.compare(plain, hash);
 }
 
-function signShopToken(shop) {
-  // Token payload only ever carries shopId - keep it minimal.
-  return jwt.sign({ shopId: shop.id }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+function signShopToken(shop, { viaTempPassword = false } = {}) {
+  // Token payload only ever carries shopId (plus this one flag) - keep it
+  // minimal. viaTempPassword marks a session that started with an
+  // admin-issued temporary password (see routes/shops.js POST /login) -
+  // routes/shops.js' change-password route uses this to skip requiring the
+  // current password, since by definition someone who needed a temp
+  // password doesn't know it.
+  return jwt.sign({ shopId: shop.id, viaTempPassword }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
 function signAdminToken(admin) {
@@ -40,6 +45,7 @@ function requireShopAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.shopId = payload.shopId;
+    req.viaTempPassword = !!payload.viaTempPassword;
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });

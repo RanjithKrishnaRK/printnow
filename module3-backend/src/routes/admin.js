@@ -288,6 +288,41 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
   }
 });
 
+const TEMP_PASSWORD_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// POST /api/admin/shops/:shopId/temp-password
+// Auth required. -> { tempPassword, expiresAt }
+// Generates a 6-digit numeric password valid for 10 minutes, for the admin
+// to relay to a locked-out shop owner directly (phone call, in person -
+// there's no email/SMS step here, this IS the whole "forgot password" flow
+// for shops). Only the hash is stored - tempPassword is returned once, in
+// this response, and never retrievable again after. It works as an
+// alternate login credential (see POST /api/shops/login) until either it
+// expires or gets used once, whichever comes first; generating a new one
+// immediately invalidates any earlier unused one for this shop.
+router.post('/shops/:shopId/temp-password', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { rows: shopRows } = await pool.query('SELECT id FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+
+    const tempPassword = String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
+    const tempPasswordHash = await hashPassword(tempPassword);
+    const expiresAt = new Date(Date.now() + TEMP_PASSWORD_TTL_MS);
+
+    await pool.query(
+      'UPDATE shops SET temp_password_hash = $1, temp_password_expires_at = $2 WHERE id = $3',
+      [tempPasswordHash, expiresAt, shopId]
+    );
+
+    return res.status(200).json({ tempPassword, expiresAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/admin/shops/:shopId/settlements
 // Auth required. Full settlement history for a shop - what's already been
 // paid out.
