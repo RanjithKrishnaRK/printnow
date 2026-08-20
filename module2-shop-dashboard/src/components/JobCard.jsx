@@ -3,6 +3,7 @@
 // at a glance from across the counter.
 import PrintDetails from "./PrintDetails";
 import PaymentReview from "./PaymentReview";
+import PaymentBadge from "./PaymentBadge";
 
 const STATUS_EDGE = {
   payment_pending: "border-l-amber-500",
@@ -63,6 +64,11 @@ export default function JobCard({ job, onAdvance, onConfirmPayment, onRejectPaym
           <div className="text-xs text-collected mt-0.5">
             {STATUS_LABEL[job.status]} · {timeAgo(job.createdAt)}
           </div>
+          {job.status !== "payment_pending" && (
+            <div className="mt-1.5">
+              <PaymentBadge paymentMethod={job.paymentMethod} amountDue={job.amountDue} />
+            </div>
+          )}
           {job.studentPhone && (
             <a
               href={`tel:${job.studentPhone}`}

@@ -7,6 +7,7 @@
 // paid for and queued together in the first place.
 import PrintDetails from "./PrintDetails";
 import PaymentReview from "./PaymentReview";
+import PaymentBadge from "./PaymentBadge";
 
 const STATUS_EDGE = {
   payment_pending: "border-l-amber-500",
@@ -72,6 +73,11 @@ export default function BatchCard({ jobs, onAdvanceAll, onConfirmPayment, onReje
             <div className="text-xs text-collected mt-0.5">
               {STATUS_LABEL[status]} · {timeAgo(oldestCreatedAt)}
             </div>
+            {status !== "payment_pending" && (
+              <div className="mt-1.5">
+                <PaymentBadge paymentMethod={jobs[0].paymentMethod} amountDue={totalAmountDue} />
+              </div>
+            )}
             {jobs[0].studentPhone && (
               <a
                 href={`tel:${jobs[0].studentPhone}`}

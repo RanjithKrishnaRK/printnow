@@ -73,7 +73,19 @@ async function imageFileToPdfFile(file) {
 // it can be called once per document when a student adds several files at
 // once. Throws with a user-facing message on failure; caller decides how to
 // surface it (which document card gets the error).
+// Matches the server's own limit (see module3-backend/src/routes/uploads.js
+// and routes/convert.js MAX_*_BYTES) - checked here too so an oversized
+// file is rejected instantly with a clear message, instead of only being
+// discovered after a slow upload attempt fails with a confusing raw
+// network error.
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
 async function processChosenFile(chosenFile) {
+  if (chosenFile.size > MAX_UPLOAD_BYTES) {
+    const sizeMb = (chosenFile.size / (1024 * 1024)).toFixed(1);
+    throw new Error(`That file is ${sizeMb}MB - please choose a file under 50MB.`);
+  }
+
   let fileToUse = chosenFile;
   const isDocx =
     chosenFile.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||

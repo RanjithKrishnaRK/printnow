@@ -22,9 +22,14 @@ const { randomUUID } = require('crypto');
 
 const router = express.Router();
 
+const MAX_DOCX_BYTES = 50 * 1024 * 1024; // 50MB - was 20MB; a .docx with several embedded
+// images/scans from a PC can exceed that easily, and hitting multer's
+// limit mid-stream (rather than being rejected up front) surfaces to the
+// client as a raw network failure - see rejectIfTooLarge below.
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }, // same cap as the main PDF upload
+  limits: { fileSize: MAX_DOCX_BYTES },
   fileFilter: (req, file, cb) => {
     const okMime =
       file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -33,6 +38,23 @@ const upload = multer({
     cb(null, true);
   },
 });
+
+// Rejects an oversized upload from its Content-Length header before
+// multer/busboy starts reading the body - see the identical helper (and
+// full rationale) in routes/uploads.js. Without this, an oversized file
+// gets caught mid-stream instead, which can surface to the client as a
+// raw "Failed to fetch" rather than a clean, readable error.
+function rejectIfTooLarge(maxBytes) {
+  return (req, res, next) => {
+    const contentLength = Number(req.headers['content-length']);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      return res.status(413).json({
+        error: `That file is too large (max ${Math.round(maxBytes / (1024 * 1024))}MB).`,
+      });
+    }
+    next();
+  };
+}
 
 // LibreOffice needs its own scratch profile dir per run (sharing one
 // across concurrent conversions causes lock-file contention/corruption -
@@ -84,9 +106,12 @@ async function convertDocxToPdf(docxBuffer) {
 // frontend hands the returned bytes straight back into the existing "pick
 // a file" step as a normal in-memory File, so from that point on it's
 // indistinguishable from a student picking a PDF directly.
-router.post('/docx-to-pdf', (req, res) => {
+router.post('/docx-to-pdf', rejectIfTooLarge(MAX_DOCX_BYTES), (req, res) => {
   upload.single('file')(req, res, async (err) => {
-    if (err) return res.status(400).json({ error: err.message });
+    if (err) {
+      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ error: err.message });
+    }
     if (!req.file) return res.status(400).json({ error: 'No file uploaded (expected field name "file")' });
 
     try {

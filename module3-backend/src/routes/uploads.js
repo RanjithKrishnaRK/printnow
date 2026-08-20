@@ -28,6 +28,9 @@ const router = express.Router();
 // client calls the file, it's saved as <uuid>.pdf or <uuid>.jpg/.png, full stop.
 const PDF_EXT = '.pdf';
 const IMAGE_EXT_BY_MIMETYPE = { 'image/jpeg': '.jpg', 'image/png': '.png' };
+const MAX_PDF_BYTES = 50 * 1024 * 1024; // 50MB - a scanned/compiled assignment PDF from a PC can run
+// well past the old 20MB cap; this is comfortably above what a typical
+// multi-page scan produces.
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
@@ -36,7 +39,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB - generous for a scanned assignment/notes PDF
+  limits: { fileSize: MAX_PDF_BYTES },
   fileFilter: (req, file, cb) => {
     if (file.mimetype !== 'application/pdf') {
       return cb(new Error('Only PDF files are accepted'));
@@ -45,13 +48,36 @@ const upload = multer({
   },
 });
 
+// Rejects an oversized upload from its Content-Length header, before
+// multer/busboy ever starts reading the request body. Without this, a
+// file that exceeds multer's own limit gets caught mid-stream instead -
+// busboy stops consuming the body once the limit is hit, but the browser
+// is often still mid-upload sending the rest of a large file, and the
+// resulting broken connection surfaces to the client as a raw "Failed to
+// fetch" network error rather than the clean 400 JSON response the route
+// normally sends. Checking Content-Length up front means an oversized
+// file gets a fast, readable error instead - for the common case of a
+// single file with a known size (which fetch() + FormData always sends).
+function rejectIfTooLarge(maxBytes) {
+  return (req, res, next) => {
+    const contentLength = Number(req.headers['content-length']);
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      return res.status(413).json({
+        error: `That file is too large (max ${Math.round(maxBytes / (1024 * 1024))}MB).`,
+      });
+    }
+    next();
+  };
+}
+
 // POST /api/uploads
 // multipart/form-data, field name: "file"
 // -> { fileUrl: string }
-router.post('/', (req, res) => {
+router.post('/', rejectIfTooLarge(MAX_PDF_BYTES), (req, res) => {
   upload.single('file')(req, res, (err) => {
     if (err) {
-      return res.status(400).json({ error: err.message });
+      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ error: err.message });
     }
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded (expected field name "file")' });
