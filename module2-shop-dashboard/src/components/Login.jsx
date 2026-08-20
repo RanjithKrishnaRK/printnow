@@ -97,11 +97,6 @@ export default function Login({ onLogin, onGoToSignup }) {
           </button>
         </form>
 
-        <p className="mt-4 text-xs text-center text-collected">
-          Demo login — email <span className="font-mono">owner@campusxerox.in</span>, password{" "}
-          <span className="font-mono">printshop123</span>
-        </p>
-
         <p className="mt-3 text-sm text-center text-collected">
           New shop?{" "}
           <button onClick={onGoToSignup} className="text-teal font-medium underline">
