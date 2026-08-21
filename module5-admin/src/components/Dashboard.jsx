@@ -7,6 +7,7 @@ import Reviews from "./Reviews";
 import Users from "./Users";
 import ChangePassword from "./ChangePassword";
 import PaymentFees from "./PaymentFees";
+import UploadFlags from "./UploadFlags";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -73,6 +74,7 @@ export default function Dashboard({ token, email, onLogout }) {
           <div className="space-y-6">
             <ChangePassword token={token} />
             <PaymentFees token={token} />
+            <UploadFlags token={token} />
           </div>
         )}
       </main>

@@ -11,7 +11,7 @@ const { randomUUID } = require('crypto');
 const { pool } = require('../db');
 const { hashPassword, comparePassword, signAdminToken, requireAdminAuth } = require('../auth');
 const { UPLOAD_DIR } = require('../config');
-const { getPaymentFees, updatePaymentFees } = require('../settings');
+const { getPaymentFees, updatePaymentFees, getUploadFlags, updateUploadFlags } = require('../settings');
 const { loginRateLimiter } = require('../rateLimit');
 const {
   CONFIRMED_STATUS_SQL,
@@ -152,6 +152,37 @@ router.patch('/settings/payment-fees', requireAdminAuth, async (req, res, next) 
       gatewayFeeTier1Flat,
       gatewayFeeTier2Flat,
     });
+    return res.status(200).json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/settings/upload-flags
+// Auth required. -> { docxConversionEnabled, imageConversionEnabled }
+router.get('/settings/upload-flags', requireAdminAuth, async (req, res, next) => {
+  try {
+    const flags = await getUploadFlags();
+    return res.status(200).json(flags);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/settings/upload-flags
+// Auth required. body: { docxConversionEnabled, imageConversionEnabled } -> the updated flags
+// Controls whether the student app offers .docx / photo uploads at all.
+// docx conversion needs LibreOffice on PATH (Docker-only - see
+// routes/convert.js), so it's meant to stay off until that's actually
+// deployed; this route doesn't enforce that, since the admin is in the
+// best position to know when it's genuinely ready.
+router.patch('/settings/upload-flags', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { docxConversionEnabled, imageConversionEnabled } = req.body || {};
+    if (typeof docxConversionEnabled !== 'boolean' || typeof imageConversionEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'docxConversionEnabled and imageConversionEnabled must be booleans' });
+    }
+    const updated = await updateUploadFlags({ docxConversionEnabled, imageConversionEnabled });
     return res.status(200).json(updated);
   } catch (err) {
     next(err);

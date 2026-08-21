@@ -96,4 +96,48 @@ function computeFeeBreakdown(baseAmount, fees) {
   return { serviceFee, gatewayFee, totalAmount: baseAmount + serviceFee + gatewayFee };
 }
 
-module.exports = { getPaymentFees, updatePaymentFees, computeFeeBreakdown };
+const UPLOAD_FLAG_KEYS = ['docx_conversion_enabled', 'image_conversion_enabled'];
+
+// docx -> PDF conversion (routes/convert.js) needs the `soffice`
+// (LibreOffice headless) binary on PATH, which only exists on a
+// Docker-based deploy - it silently fails on Render's default native Node
+// runtime. Rather than delete the feature outright, it's gated behind this
+// admin toggle (off by default, since it doesn't actually work in the
+// current deploy) so it can be switched back on the moment the backend
+// moves to Docker, with no code changes needed at that point. Image -> PDF
+// (imageFileToPdfFile in the student app) runs entirely client-side via
+// pdf-lib and works regardless of hosting - defaults to on - but gets the
+// same toggle for consistency and in case it's ever worth turning off too.
+async function getUploadFlags() {
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key = ANY($1)`, [
+    UPLOAD_FLAG_KEYS,
+  ]);
+  const map = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  return {
+    docxConversionEnabled: map.docx_conversion_enabled === 'true',
+    imageConversionEnabled: map.image_conversion_enabled !== 'false', // defaults on if unset
+  };
+}
+
+async function updateUploadFlags({ docxConversionEnabled, imageConversionEnabled }) {
+  const entries = [
+    ['docx_conversion_enabled', String(!!docxConversionEnabled)],
+    ['image_conversion_enabled', String(!!imageConversionEnabled)],
+  ];
+  for (const [key, value] of entries) {
+    await pool.query(
+      `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, value]
+    );
+  }
+  return getUploadFlags();
+}
+
+module.exports = {
+  getPaymentFees,
+  updatePaymentFees,
+  computeFeeBreakdown,
+  getUploadFlags,
+  updateUploadFlags,
+};

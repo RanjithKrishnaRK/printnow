@@ -80,7 +80,7 @@ async function imageFileToPdfFile(file) {
 // network error.
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
-async function processChosenFile(chosenFile) {
+async function processChosenFile(chosenFile, uploadFlags) {
   if (chosenFile.size > MAX_UPLOAD_BYTES) {
     const sizeMb = (chosenFile.size / (1024 * 1024)).toFixed(1);
     throw new Error(`That file is ${sizeMb}MB - please choose a file under 50MB.`);
@@ -91,6 +91,17 @@ async function processChosenFile(chosenFile) {
     chosenFile.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
     /\.docx$/i.test(chosenFile.name);
   const isImage = chosenFile.type === "image/jpeg" || chosenFile.type === "image/png";
+
+  // Enforced here too (not just via the file input's `accept` attribute),
+  // since accept is only a picker hint - drag-and-drop, a stale cached
+  // page, or just renaming a file's extension can all still hand this
+  // function a type the admin has turned off.
+  if (isDocx && !uploadFlags?.docxConversionEnabled) {
+    throw new Error("Word document upload is currently unavailable. Please upload a PDF instead.");
+  }
+  if (isImage && !uploadFlags?.imageConversionEnabled) {
+    throw new Error("Photo upload is currently unavailable. Please upload a PDF instead.");
+  }
 
   if (isDocx) {
     try {
@@ -467,6 +478,13 @@ const mockApi = {
       gatewayFeeTier2Flat: 1.5,
     };
   },
+  // Mock mode has no admin panel writing real settings, and no server-side
+  // LibreOffice constraint to worry about either - both on, so the mock
+  // demo shows every upload path working.
+  async getUploadFlags() {
+    await delay(150);
+    return { docxConversionEnabled: true, imageConversionEnabled: true };
+  },
   async getJob(jobId) {
     await delay(350);
     const job = mockDb.get(jobId);
@@ -748,6 +766,17 @@ const realApi = {
       throw new Error(body.error || "Could not load payment fee settings");
     }
     return res.json(); // { serviceFeePercent, serviceFeeEnabled, gatewayFeePercent, gatewayFeeEnabled }
+  },
+  // Public, no auth - admin-editable (see admin panel's Settings tab).
+  // Controls whether the upload picker offers .docx / photo files at all -
+  // read once when the upload screen loads.
+  async getUploadFlags() {
+    const res = await fetch(`${API_BASE_URL}/api/settings/upload-flags`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load upload settings");
+    }
+    return res.json(); // { docxConversionEnabled, imageConversionEnabled }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -1320,7 +1349,28 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState(null);
   const [shopInfo, setShopInfo] = useState(null);
+  const [uploadFlags, setUploadFlags] = useState({
+    docxConversionEnabled: false,
+    imageConversionEnabled: true,
+  });
   const fileInputRef = useRef(null);
+
+  // Admin-editable (see admin panel's Settings tab) - controls whether this
+  // screen offers .docx / photo uploads. Fetched once on load; falls back
+  // to "docx off, image on" (the platform's real defaults) if this fails,
+  // rather than blocking the upload screen over a settings-read error.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getUploadFlags()
+      .then((flags) => {
+        if (!cancelled) setUploadFlags(flags);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // Name capture: once the phone number is a valid 10 digits, check whether
   // it's ordered before anywhere (see api.checkStudent / GET
   // /api/students/:phone) - a known number shows a friendly "welcome back"
@@ -1420,7 +1470,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
     try {
       for (const chosenFile of files) {
         try {
-          const { file, detectedPages, thumbnailUrl } = await processChosenFile(chosenFile);
+          const { file, detectedPages, thumbnailUrl } = await processChosenFile(chosenFile, uploadFlags);
           const newDoc = {
             ...makeDefaultDocument(),
             file,
@@ -1532,6 +1582,32 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
     }
   }
 
+  // What the file picker actually offers, driven by the admin's upload
+  // flags (see admin panel's Settings tab) - PDF is always available since
+  // it needs no conversion at all. docx defaults off (needs LibreOffice on
+  // the server, Docker-only - see routes/convert.js); photos default on
+  // (converted entirely client-side, works regardless of hosting).
+  const acceptedMimeTypes = ["application/pdf"];
+  const acceptedLabelParts = ["PDF"];
+  if (uploadFlags.docxConversionEnabled) {
+    acceptedMimeTypes.push(
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      ".docx"
+    );
+    acceptedLabelParts.push("Word doc");
+  }
+  if (uploadFlags.imageConversionEnabled) {
+    acceptedMimeTypes.push("image/jpeg", "image/png");
+    acceptedLabelParts.push("photo");
+  }
+  const acceptedFileTypes = acceptedMimeTypes.join(",");
+  const acceptedTypesLabel =
+    acceptedLabelParts.length === 1
+      ? `${acceptedLabelParts[0]}s`
+      : acceptedLabelParts.length === 2
+      ? `${acceptedLabelParts[0]}s or ${acceptedLabelParts[1]}s`
+      : `${acceptedLabelParts.slice(0, -1).join("s, ")}s, or ${acceptedLabelParts[acceptedLabelParts.length - 1]}s`;
+
   return (
     <div className="space-y-5">
       {onBack && (
@@ -1579,7 +1655,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
       <div>
         {documents.length === 0 && (
           <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
-            Document (PDF, Word, or photo)
+            Document ({acceptedTypesLabel})
           </label>
         )}
         <button
@@ -1593,7 +1669,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
               ? "Processing…"
               : documents.length > 0
               ? "+ Add more documents"
-              : "Choose PDFs, Word docs, or photos"}
+              : `Choose ${acceptedTypesLabel}`}
           </span>
           <span className="ml-3 shrink-0 rounded-md bg-stone-900 px-2.5 py-1.5 text-[11px] font-medium text-stone-50">
             {addingFile ? "…" : "Browse"}
@@ -1603,7 +1679,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
           ref={fileInputRef}
           type="file"
           multiple
-          accept="application/pdf,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
+          accept={acceptedFileTypes}
           className="hidden"
           disabled={addingFile}
           onChange={(e) => handleFilesChosen(e.target.files)}

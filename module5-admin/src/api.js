@@ -52,6 +52,25 @@ export async function updatePaymentFees(token, fees) {
   return handle(res);
 }
 
+export async function getUploadFlags(token) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/upload-flags`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { docxConversionEnabled, imageConversionEnabled }
+}
+
+export async function updateUploadFlags(token, flags) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/upload-flags`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(flags),
+  });
+  return handle(res);
+}
+
 export async function getStats(token) {
   const res = await fetch(`${BASE_URL}/api/admin/stats`, {
     headers: { Authorization: `Bearer ${token}` },

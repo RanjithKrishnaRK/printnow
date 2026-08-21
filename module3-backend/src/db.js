@@ -348,6 +348,20 @@ async function migrate() {
   // stale value can't cause confusion later.
   await pool.query(`DELETE FROM settings WHERE key = 'service_fee';`);
 
+  // Migration: docx-to-pdf conversion needs LibreOffice on PATH, which
+  // only exists on a Docker-based deploy - it doesn't work on Render's
+  // default native Node runtime. Off by default rather than deleting the
+  // feature, so it can be switched back on with zero code changes once the
+  // backend moves to Docker. Image-to-PDF is client-side (pdf-lib) and
+  // works regardless of hosting, so it defaults on - see settings.js
+  // getUploadFlags for the exact default logic.
+  await pool.query(`
+    INSERT INTO settings (key, value, updated_at) VALUES
+      ('docx_conversion_enabled', 'false', NOW()),
+      ('image_conversion_enabled', 'true', NOW())
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
   // Migration: record what was actually charged for an online payment
   // (print cost is amount_due; these two are the surcharges layered on top
   // at the moment the Razorpay order was created), so the fee breakdown a

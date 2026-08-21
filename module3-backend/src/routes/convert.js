@@ -19,6 +19,7 @@ const os = require('os');
 const fs = require('fs/promises');
 const { execFile } = require('child_process');
 const { randomUUID } = require('crypto');
+const { getUploadFlags } = require('../settings');
 
 const router = express.Router();
 
@@ -106,7 +107,18 @@ async function convertDocxToPdf(docxBuffer) {
 // frontend hands the returned bytes straight back into the existing "pick
 // a file" step as a normal in-memory File, so from that point on it's
 // indistinguishable from a student picking a PDF directly.
-router.post('/docx-to-pdf', rejectIfTooLarge(MAX_DOCX_BYTES), (req, res) => {
+router.post('/docx-to-pdf', rejectIfTooLarge(MAX_DOCX_BYTES), async (req, res, next) => {
+  try {
+    const { docxConversionEnabled } = await getUploadFlags();
+    if (!docxConversionEnabled) {
+      return res.status(403).json({
+        error: 'Word document upload is currently unavailable. Please upload a PDF instead.',
+      });
+    }
+  } catch (err) {
+    return next(err);
+  }
+
   upload.single('file')(req, res, async (err) => {
     if (err) {
       const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
