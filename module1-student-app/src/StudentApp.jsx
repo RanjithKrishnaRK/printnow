@@ -1345,7 +1345,14 @@ function DocumentPreviewModal({ fileUrl, fileName, onClose }) {
 function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onBack }) {
   const { documents, phone, name } = order;
   const [addingFile, setAddingFile] = useState(false);
-  const [addError, setAddError] = useState(null);
+  // Files that were selected but couldn't be added (wrong type currently
+  // disabled by the admin, too large, corrupt, etc.) - kept separate from
+  // `documents` (which only ever holds successfully processed files, so
+  // handleSubmit/deriveDocument never need to special-case a broken entry)
+  // and shown as their own small dismissible cards, so a mistaken
+  // selection is visible and removable rather than vanishing into a
+  // single top-of-form error message.
+  const [failedFiles, setFailedFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState(null);
   const [shopInfo, setShopInfo] = useState(null);
@@ -1466,7 +1473,6 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
     const files = Array.from(fileList || []);
     if (files.length === 0) return;
     setAddingFile(true);
-    setAddError(null);
     try {
       for (const chosenFile of files) {
         try {
@@ -1486,20 +1492,28 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
           };
           setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
         } catch (err) {
-          // One bad file (corrupt PDF, unsupported photo format, etc.)
-          // shouldn't stop the rest of a multi-file selection from being
-          // added - report it and move on to the next file.
-          setAddError(
-            files.length > 1
-              ? `"${chosenFile.name}": ${err.message || "Could not process that file."}`
-              : err.message || "Could not process that file."
-          );
+          // One bad file (wrong type currently disabled, too large,
+          // corrupt, etc.) shouldn't stop the rest of a multi-file
+          // selection from being added - it becomes its own dismissible
+          // card instead (see failedFiles below), and the rest continue.
+          setFailedFiles((prev) => [
+            ...prev,
+            {
+              id: makeDocId(),
+              fileName: chosenFile.name,
+              error: err.message || "Could not process that file.",
+            },
+          ]);
         }
       }
     } finally {
       setAddingFile(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
+  }
+
+  function removeFailedFile(id) {
+    setFailedFiles((prev) => prev.filter((f) => f.id !== id));
   }
 
   const rates = shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null;
@@ -1646,8 +1660,31 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
               shopInfo={shopInfo}
               onChange={(fields) => patchDoc(doc.id, fields)}
               onRemove={() => removeDoc(doc.id)}
-              showRemove={documents.length > 1}
+              showRemove
             />
+          ))}
+        </div>
+      )}
+
+      {failedFiles.length > 0 && (
+        <div className="space-y-2">
+          {failedFiles.map((f) => (
+            <div
+              key={f.id}
+              className="flex items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3.5 py-3"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium text-red-900">{f.fileName}</p>
+                <p className="mt-0.5 text-xs text-red-700">{f.error}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => removeFailedFile(f.id)}
+                className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-100"
+              >
+                Remove
+              </button>
+            </div>
           ))}
         </div>
       )}
@@ -1694,7 +1731,6 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
             Reading your files and detecting pages — usually just a few seconds…
           </p>
         )}
-        {addError && <p className="mt-1 text-[11px] text-red-700">{addError}</p>}
       </div>
 
       <div>
