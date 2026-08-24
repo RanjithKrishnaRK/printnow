@@ -61,3 +61,8 @@ function calculateAmountDue({ pages, copies, colorMode, colorPages, rates }) {
 }
 
 module.exports = { calculateAmountDue, parseColorPages };
+// parseColorPages is a general "1-3,5,8-10" range parser with nothing
+// color-specific about it - the same function also validates which pages
+// a student wants printed at all (see routes/shops.js's pageSelection
+// handling). Exported under both names so each call site reads clearly.
+module.exports.parsePageRange = parseColorPages;

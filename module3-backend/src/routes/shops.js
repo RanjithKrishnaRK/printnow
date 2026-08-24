@@ -9,13 +9,13 @@ const {
   requireShopAuth,
   requireOwnShop,
 } = require('../auth');
-const { calculateAmountDue, parseColorPages } = require('../pricing');
+const { calculateAmountDue, parseColorPages, parsePageRange } = require('../pricing');
 const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 const { loginRateLimiter } = require('../rateLimit');
 const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
-const { getRealPageCount } = require('../pdfPages');
+const { getRealPageCount, extractPdfPages, deleteUploadedFile } = require('../pdfPages');
 
 const router = express.Router();
 
@@ -134,8 +134,9 @@ router.post('/signup', async (req, res, next) => {
 router.post('/:shopId/jobs', async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { fileUrl, copies, colorMode, studentPhone, sides, colorPages, fileName, studentName } = req.body || {};
-    let { pages } = req.body || {};
+    const { copies, colorMode, studentPhone, sides, colorPages, fileName, studentName, pageSelection } =
+      req.body || {};
+    let { pages, fileUrl } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
       'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
@@ -169,6 +170,32 @@ router.post('/:shopId/jobs', async (req, res, next) => {
       return res.status(400).json({ error: 'Could not verify the uploaded file. Please upload it again.' });
     }
     pages = realPages;
+
+    // pageSelection lets a student print only some pages of a larger
+    // document ("just pages 1-3") instead of the whole thing - optional,
+    // same "1-3,5,8-10" syntax as colorPages. When present, this is where
+    // the actual page count and fileUrl the rest of the order is built
+    // from get replaced: a brand-new PDF containing only the selected
+    // pages is generated server-side, and every downstream step (pricing,
+    // the file the shop dashboard/print agent ever fetches, colorPages
+    // numbering) works from that extracted subset - never the full
+    // original document. This is what makes "shop only ever receives the
+    // paid-for pages" actually true rather than just a client-side promise.
+    if (pageSelection) {
+      const { pageSet, error: selectionError } = parsePageRange(pageSelection, pages);
+      if (selectionError) {
+        return res.status(400).json({ error: `pageSelection: ${selectionError}` });
+      }
+      const selectedPages = Array.from(pageSet).sort((a, b) => a - b);
+      const extracted = await extractPdfPages(fileUrl, selectedPages);
+      // Best-effort - the original full upload is no longer referenced by
+      // anything once the extracted subset takes its place, but a failed
+      // cleanup here should never block the order itself.
+      deleteUploadedFile(fileUrl).catch(() => {});
+      fileUrl = extracted.fileUrl;
+      pages = extracted.pageCount;
+    }
+
     if (!Number.isInteger(copies) || copies < 1) {
       return res.status(400).json({ error: 'copies must be a positive integer' });
     }
@@ -274,8 +301,8 @@ router.post('/:shopId/batches', async (req, res, next) => {
     const prepared = [];
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i] || {};
-      const { fileUrl, copies, colorMode, sides, colorPages, fileName } = doc;
-      let { pages } = doc;
+      const { copies, colorMode, sides, colorPages, fileName, pageSelection } = doc;
+      let { pages, fileUrl } = doc;
       const label = `documents[${i}]`;
 
       if (!fileUrl || typeof fileUrl !== 'string') {
@@ -295,6 +322,22 @@ router.post('/:shopId/batches', async (req, res, next) => {
         return res.status(400).json({ error: `${label}: could not verify the uploaded file. Please upload it again.` });
       }
       pages = realPages;
+
+      // Same "print only pages 1-3" handling as the single-job route -
+      // see that route's comment for the full rationale. Each document in
+      // a batch can select its own page range independently.
+      if (pageSelection) {
+        const { pageSet, error: selectionError } = parsePageRange(pageSelection, pages);
+        if (selectionError) {
+          return res.status(400).json({ error: `${label}.pageSelection: ${selectionError}` });
+        }
+        const selectedPages = Array.from(pageSet).sort((a, b) => a - b);
+        const extracted = await extractPdfPages(fileUrl, selectedPages);
+        deleteUploadedFile(fileUrl).catch(() => {});
+        fileUrl = extracted.fileUrl;
+        pages = extracted.pageCount;
+      }
+
       if (!Number.isInteger(copies) || copies < 1) {
         return res.status(400).json({ error: `${label}.copies must be a positive integer` });
       }

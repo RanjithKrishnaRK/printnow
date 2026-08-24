@@ -1079,6 +1079,13 @@ function makeDefaultDocument() {
     sides: "single",
     colorMode: "bw",
     colorPages: "",
+    // Empty = print every page. Otherwise a "1-3,5,8-10"-style range - see
+    // parsePageRange. Only the selected pages ever leave this browser as a
+    // real file: the server extracts just that subset into a brand-new PDF
+    // before the shop dashboard/print agent ever sees it (routes/shops.js,
+    // pdfPages.js extractPdfPages), so "print only pages 1-3" is a real
+    // guarantee, not just a display filter.
+    pageSelection: "",
     thumbnailUrl: null, // small first-page preview image (data URL) for PDFs
     previewUrl: null, // object URL of the actual file, for the full preview modal
   };
@@ -1088,16 +1095,29 @@ function makeDefaultDocument() {
 // shared between DocumentSettingsCard (per-doc display) and UploadStep
 // (total estimate, submit validation).
 function deriveDocument(doc, rates) {
-  const pagesNum = parseInt(doc.pages, 10) || 0;
+  const totalPages = parseInt(doc.pages, 10) || 0;
+
+  // "Print only some pages" - if set, this (not totalPages) is what
+  // actually gets billed and printed. Validated against the document's
+  // real total, same "1-3,5,8-10" syntax as colorPages.
+  const hasSelection = !!(doc.pageSelection && doc.pageSelection.trim());
+  const selectionResult = hasSelection && totalPages > 0 ? parsePageRange(doc.pageSelection, totalPages) : null;
+  const selectionError = hasSelection ? selectionResult?.error : null;
+  const printPagesNum = hasSelection && selectionResult && !selectionResult.error ? selectionResult.pages.size : totalPages;
+
+  // Custom color-page numbering is relative to the SELECTED pages, not the
+  // original document - "page 1" here means the first page that's actually
+  // going to print, since that's the only numbering a shop owner or
+  // student would ever see once the file's been extracted server-side.
   const rangeResult =
-    doc.colorMode === "mixed" && pagesNum > 0 ? parsePageRange(doc.colorPages, pagesNum) : null;
+    doc.colorMode === "mixed" && printPagesNum > 0 ? parsePageRange(doc.colorPages, printPagesNum) : null;
   const colorPageCount = rangeResult ? rangeResult.pages.size : 0;
   const rangeError = doc.colorMode === "mixed" && doc.colorPages.trim() ? rangeResult?.error : null;
   const estimate =
-    pagesNum > 0
-      ? computeEstimate({ pages: pagesNum, copies: doc.copies, colorMode: doc.colorMode, colorPageCount, rates })
+    printPagesNum > 0
+      ? computeEstimate({ pages: printPagesNum, copies: doc.copies, colorMode: doc.colorMode, colorPageCount, rates })
       : 0;
-  return { pagesNum, colorPageCount, rangeError, estimate };
+  return { pagesNum: totalPages, printPagesNum, selectionError, colorPageCount, rangeError, estimate };
 }
 
 // One document's settings card within the multi-file upload flow - pages,
@@ -1107,15 +1127,15 @@ function deriveDocument(doc, rates) {
 // of the first page (tap to open a full preview) so a student can confirm
 // "yes, that's the right file" before paying, not just read a filename.
 function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRemove }) {
-  const { pagesNum, colorPageCount, rangeError, estimate } = deriveDocument(
+  const { pagesNum, printPagesNum, selectionError, colorPageCount, rangeError, estimate } = deriveDocument(
     doc,
     shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null
   );
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [selectingPages, setSelectingPages] = useState(!!doc.pageSelection.trim());
 
   function handlePagesChange(e) {
-    let n = parseInt(e.target.value, 10) || 0;
-    if (doc.detectedPages && n > doc.detectedPages) n = doc.detectedPages;
+    const n = parseInt(e.target.value, 10) || 0;
     onChange({ pages: n ? String(n) : "" });
   }
 
@@ -1179,19 +1199,24 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
           <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
             Pages
           </label>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={doc.detectedPages || undefined}
-            value={doc.pages}
-            onChange={handlePagesChange}
-            placeholder="e.g. 12"
-            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
-          />
+          {doc.detectedPages ? (
+            <div className="flex h-[42px] items-center rounded-lg border border-stone-200 bg-stone-50 px-3.5 text-sm text-stone-700">
+              {doc.detectedPages} page{doc.detectedPages > 1 ? "s" : ""} total
+            </div>
+          ) : (
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              value={doc.pages}
+              onChange={handlePagesChange}
+              placeholder="e.g. 12"
+              className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
+            />
+          )}
           <p className="mt-1 text-[11px] text-stone-500">
             {doc.detectedPages
-              ? `Detected ${doc.detectedPages} page${doc.detectedPages > 1 ? "s" : ""} — reduce if you only need some.`
+              ? "Want to print only some pages? Use the option below."
               : "Couldn't auto-detect page count — enter it manually."}
           </p>
         </div>
@@ -1209,6 +1234,62 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
           />
         </div>
       </div>
+
+      {doc.detectedPages > 1 && (
+        <div className="mt-3">
+          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
+            Which pages to print
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setSelectingPages(false);
+                onChange({ pageSelection: "" });
+              }}
+              className={`rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
+                !selectingPages
+                  ? "border-stone-900 bg-stone-900 text-stone-50"
+                  : "border-stone-300 bg-white text-stone-600"
+              }`}
+            >
+              All {doc.detectedPages} pages
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectingPages(true)}
+              className={`rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
+                selectingPages
+                  ? "border-stone-900 bg-stone-900 text-stone-50"
+                  : "border-stone-300 bg-white text-stone-600"
+              }`}
+            >
+              Specific pages
+            </button>
+          </div>
+          {selectingPages && (
+            <div className="mt-2">
+              <input
+                type="text"
+                inputMode="numeric"
+                value={doc.pageSelection}
+                onChange={(e) => onChange({ pageSelection: e.target.value })}
+                placeholder="e.g. 1-3,5"
+                className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
+              />
+              {selectionError ? (
+                <p className="mt-1 text-[11px] text-red-700">{selectionError}</p>
+              ) : (
+                <p className="mt-1 text-[11px] text-stone-500">
+                  {doc.pageSelection.trim()
+                    ? `You'll only be charged for ${printPagesNum} page${printPagesNum > 1 ? "s" : ""} — the shop only ever receives those pages, never the full document.`
+                    : `Pages 1-${doc.detectedPages}. Use e.g. 1-3,5.`}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="mt-3">
         <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
@@ -1270,25 +1351,25 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
               value={doc.colorPages}
               onChange={(e) => onChange({ colorPages: e.target.value })}
               placeholder="e.g. 1-3,7,10"
-              disabled={pagesNum === 0}
+              disabled={printPagesNum === 0}
               className="w-full rounded-md border border-stone-300 bg-white px-3 py-2 text-sm focus:border-stone-500 focus:outline-none disabled:bg-stone-100"
             />
             <p className="mt-1 text-[11px] text-stone-500">
-              {pagesNum === 0
+              {printPagesNum === 0
                 ? "Enter the page count above first."
                 : rangeError
                 ? rangeError
                 : colorPageCount > 0
                 ? `${colorPageCount} page${colorPageCount > 1 ? "s" : ""} in color, ${
-                    pagesNum - colorPageCount
-                  } in black & white.`
+                    printPagesNum - colorPageCount
+                  } in black & white${doc.pageSelection.trim() ? " (numbered within your selected pages)" : ""}.`
                 : "All other pages print in black & white."}
             </p>
           </div>
         )}
       </div>
 
-      {pagesNum > 0 && (
+      {printPagesNum > 0 && (
         <div className="mt-3 flex items-center justify-between border-t border-dashed border-stone-200 pt-2.5 text-sm">
           <span className="text-stone-500">This document</span>
           <span className="font-mono font-semibold text-stone-900">₹{estimate}</span>
@@ -1523,8 +1604,15 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   const allDocsValid =
     documents.length > 0 &&
     documents.every((d, i) => {
-      const { pagesNum, rangeError } = derivedDocs[i];
-      return d.file && pagesNum > 0 && d.copies > 0 && (d.colorMode !== "mixed" || (d.colorPages.trim() && !rangeError));
+      const { pagesNum, printPagesNum, selectionError, rangeError } = derivedDocs[i];
+      return (
+        d.file &&
+        pagesNum > 0 &&
+        printPagesNum > 0 &&
+        !selectionError &&
+        d.copies > 0 &&
+        (d.colorMode !== "mixed" || (d.colorPages.trim() && !rangeError))
+      );
     });
 
   const phoneValid = /^[6-9]\d{9}$/.test(phone.trim());
@@ -1550,23 +1638,28 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
       const uploaded = [];
       for (let i = 0; i < documents.length; i++) {
         const doc = documents[i];
-        const { pagesNum, estimate } = derivedDocs[i];
+        const { pagesNum, printPagesNum, estimate } = derivedDocs[i];
         const { fileUrl } = await api.uploadFile(doc.file);
         uploaded.push({
           fileUrl,
           fileName: doc.fileName,
+          // Total detected pages - the server independently re-verifies
+          // this against the actual file regardless, then extracts just
+          // the selected subset (if any) before it ever reaches the shop.
           pages: pagesNum,
+          printPages: printPagesNum, // display-only, for the summary below - not part of the API contract
           copies: doc.copies,
           colorMode: doc.colorMode,
           sides: doc.sides, // ⚠️ beyond locked contract — see file header
           amountDueEstimate: estimate,
           ...(doc.colorMode === "mixed" ? { colorPages: doc.colorPages.trim() } : {}), // ⚠️ beyond locked contract
+          ...(doc.pageSelection.trim() ? { pageSelection: doc.pageSelection.trim() } : {}), // ⚠️ beyond locked contract
         });
       }
 
       const summaryDocs = uploaded.map((u) => ({
         fileName: u.fileName,
-        pages: u.pages,
+        pages: u.printPages,
         copies: u.copies,
         sides: u.sides,
         colorMode: u.colorMode,
