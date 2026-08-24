@@ -34,4 +34,27 @@ const loginRateLimiter = (field) =>
     message: { error: 'Too many login attempts. Please wait a few minutes and try again.' },
   });
 
-module.exports = { loginRateLimiter };
+// Plain per-IP limiter (no field-keying) for public endpoints that don't
+// have a natural "account" to key by, but are still worth slowing down:
+// - GET /api/students/:phone(/jobs) has no auth at all by design (see
+//   routes/students.js) - anyone who knows a phone number can see that
+//   number's order history. Without this, the same lack of auth means
+//   anyone could script through thousands of numbers per minute looking
+//   for real ones; this doesn't fix the underlying trust model (a
+//   documented, accepted MVP tradeoff) but makes bulk enumeration
+//   impractical rather than trivial.
+// - POST /api/uploads(/payment-screenshot) and /api/convert/docx-to-pdf
+//   are all unauthenticated by necessity (students aren't logged in) -
+//   without any limit, either could be hammered to fill disk space,
+//   burn bandwidth, or (for docx conversion specifically) spawn many
+//   concurrent LibreOffice processes.
+const publicRateLimiter = ({ windowMs = 15 * 60 * 1000, max = 30 } = {}) =>
+  rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please wait a few minutes and try again.' },
+  });
+
+module.exports = { loginRateLimiter, publicRateLimiter };

@@ -14,6 +14,8 @@ const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 const { loginRateLimiter } = require('../rateLimit');
 const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
+const { isValidUploadedFileUrl } = require('../uploadUrl');
+const { getRealPageCount } = require('../pdfPages');
 
 const router = express.Router();
 
@@ -51,11 +53,7 @@ router.get('/', async (req, res, next) => {
 
 // POST /api/shops/signup
 // Public - self-service shop owner registration (previously only possible
-// via scripts/seedShop.js run by hand). body: { name, email, password, landmarkId }
-// -> { shopId, token } (signs the new shop straight in, same as /login would)
-// Shared validation for the signup form fields - used by request-otp below
-// (verify-otp re-checks uniqueness only, since format/strength don't change
-// POST /api/shops/signup
+// via scripts/seedShop.js run by hand).
 // body: { name, email, password, landmarkId } -> { shopId, token, shopName }
 router.post('/signup', async (req, res, next) => {
   try {
@@ -136,7 +134,8 @@ router.post('/signup', async (req, res, next) => {
 router.post('/:shopId/jobs', async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { fileUrl, pages, copies, colorMode, studentPhone, sides, colorPages, fileName, studentName } = req.body || {};
+    const { fileUrl, copies, colorMode, studentPhone, sides, colorPages, fileName, studentName } = req.body || {};
+    let { pages } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
       'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
@@ -150,9 +149,26 @@ router.post('/:shopId/jobs', async (req, res, next) => {
     if (!fileUrl || typeof fileUrl !== 'string') {
       return res.status(400).json({ error: 'fileUrl is required' });
     }
+    if (!isValidUploadedFileUrl(fileUrl)) {
+      return res.status(400).json({ error: 'fileUrl must reference a file uploaded through this platform' });
+    }
     if (!Number.isInteger(pages) || pages < 1) {
       return res.status(400).json({ error: 'pages must be a positive integer' });
     }
+
+    // Pricing is computed from the ACTUAL file, never the client's claimed
+    // `pages` - without this, a request could claim a 50-page document was
+    // 1 page and be charged accordingly. Every upload is a real PDF on
+    // disk by this point (images/docx are converted client-side before
+    // reaching /api/uploads), so this should always succeed for a
+    // genuinely-uploaded file; a null result means the file is missing or
+    // not a well-formed PDF, which is itself worth rejecting rather than
+    // falling back to trusting the client number.
+    const realPages = await getRealPageCount(fileUrl);
+    if (realPages === null) {
+      return res.status(400).json({ error: 'Could not verify the uploaded file. Please upload it again.' });
+    }
+    pages = realPages;
     if (!Number.isInteger(copies) || copies < 1) {
       return res.status(400).json({ error: 'copies must be a positive integer' });
     }
@@ -258,15 +274,27 @@ router.post('/:shopId/batches', async (req, res, next) => {
     const prepared = [];
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i] || {};
-      const { fileUrl, pages, copies, colorMode, sides, colorPages, fileName } = doc;
+      const { fileUrl, copies, colorMode, sides, colorPages, fileName } = doc;
+      let { pages } = doc;
       const label = `documents[${i}]`;
 
       if (!fileUrl || typeof fileUrl !== 'string') {
         return res.status(400).json({ error: `${label}.fileUrl is required` });
       }
+      if (!isValidUploadedFileUrl(fileUrl)) {
+        return res.status(400).json({ error: `${label}.fileUrl must reference a file uploaded through this platform` });
+      }
       if (!Number.isInteger(pages) || pages < 1) {
         return res.status(400).json({ error: `${label}.pages must be a positive integer` });
       }
+
+      // Same reasoning as the single-job route above - pricing comes from
+      // the actual file, never the client's claimed pages.
+      const realPages = await getRealPageCount(fileUrl);
+      if (realPages === null) {
+        return res.status(400).json({ error: `${label}: could not verify the uploaded file. Please upload it again.` });
+      }
+      pages = realPages;
       if (!Number.isInteger(copies) || copies < 1) {
         return res.status(400).json({ error: `${label}.copies must be a positive integer` });
       }

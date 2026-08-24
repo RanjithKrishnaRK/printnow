@@ -12,10 +12,16 @@
 // if this ever needs to be tamper-resistant.
 const express = require('express');
 const { pool } = require('../db');
+const { publicRateLimiter } = require('../rateLimit');
 
 const router = express.Router();
 
 const PHONE_REGEX = /^[6-9]\d{9}$/;
+
+// 20 lookups per 15 min per IP - a genuine student checking their own
+// number a few times is nowhere near this; scripted enumeration through
+// many numbers is.
+const phoneLookupLimiter = publicRateLimiter({ max: 20 });
 
 // GET /api/students/:phone
 // Public. -> { phone, name } if this number has ordered before (anywhere),
@@ -24,7 +30,7 @@ const PHONE_REGEX = /^[6-9]\d{9}$/;
 // number -> a name is required before submitting the order (see
 // POST /:shopId/jobs and POST /:shopId/batches, which do the actual
 // first-time-insert once that name is provided).
-router.get('/:phone', async (req, res, next) => {
+router.get('/:phone', phoneLookupLimiter, async (req, res, next) => {
   try {
     const { phone } = req.params;
     if (!PHONE_REGEX.test(phone)) {
@@ -48,7 +54,7 @@ router.get('/:phone', async (req, res, next) => {
 // Public. -> [{ jobId, shopId, shopName, status, tokenNumber, amountDue,
 //               pages, copies, colorMode, createdAt }, ...]
 // Most recent first, capped at 20 so this can't become an unbounded dump.
-router.get('/:phone/jobs', async (req, res, next) => {
+router.get('/:phone/jobs', phoneLookupLimiter, async (req, res, next) => {
   try {
     const { phone } = req.params;
 

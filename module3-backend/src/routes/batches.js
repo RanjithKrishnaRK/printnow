@@ -6,6 +6,7 @@ const { generateTokenNumber } = require('../tokenGenerator');
 const { RAZORPAY_KEY_ID } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
 const { getPaymentFees, computeFeeBreakdown } = require('../settings');
+const { isValidUploadedFileUrl } = require('../uploadUrl');
 
 const router = express.Router();
 
@@ -142,6 +143,9 @@ router.post('/:batchId/submit-payment', async (req, res, next) => {
     }
     if (method === 'upi' && (!screenshotUrl || typeof screenshotUrl !== 'string')) {
       return res.status(400).json({ error: 'screenshotUrl is required for method "upi"' });
+    }
+    if (method === 'upi' && !isValidUploadedFileUrl(screenshotUrl)) {
+      return res.status(400).json({ error: 'screenshotUrl must reference a file uploaded through this platform' });
     }
 
     const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);

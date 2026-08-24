@@ -11,8 +11,15 @@ const express = require('express');
 const multer = require('multer');
 const { randomUUID } = require('crypto');
 const { UPLOAD_DIR } = require('../config');
+const { publicRateLimiter } = require('../rateLimit');
 
 const router = express.Router();
+
+// 40 uploads per 15 min per IP - a real order (even a multi-document
+// batch) never comes close; unauthenticated by necessity (students aren't
+// logged in), so this is what stands between the endpoint and someone
+// scripting disk-filling or bandwidth-burning uploads.
+const uploadLimiter = publicRateLimiter({ max: 40 });
 
 // Extensions are derived ONLY from the mimetype we've already validated in
 // fileFilter below - never from file.originalname. originalname is
@@ -73,7 +80,7 @@ function rejectIfTooLarge(maxBytes) {
 // POST /api/uploads
 // multipart/form-data, field name: "file"
 // -> { fileUrl: string }
-router.post('/', rejectIfTooLarge(MAX_PDF_BYTES), (req, res) => {
+router.post('/', uploadLimiter, rejectIfTooLarge(MAX_PDF_BYTES), (req, res) => {
   upload.single('file')(req, res, (err) => {
     if (err) {
       const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
@@ -112,7 +119,7 @@ const uploadScreenshot = multer({
 // -> { screenshotUrl: string }
 // Used by POST /api/jobs/:jobId/submit-payment and
 // POST /api/batches/:batchId/submit-payment's { method: "upi", screenshotUrl }.
-router.post('/payment-screenshot', (req, res) => {
+router.post('/payment-screenshot', uploadLimiter, (req, res) => {
   uploadScreenshot.single('file')(req, res, (err) => {
     if (err) {
       return res.status(400).json({ error: err.message });

@@ -20,8 +20,14 @@ const fs = require('fs/promises');
 const { execFile } = require('child_process');
 const { randomUUID } = require('crypto');
 const { getUploadFlags } = require('../settings');
+const { publicRateLimiter } = require('../rateLimit');
 
 const router = express.Router();
+
+// 15 conversions per 15 min per IP - each one spawns a real LibreOffice
+// process; without a limit this endpoint could be used to exhaust server
+// CPU/memory by firing off many concurrent conversions.
+const convertLimiter = publicRateLimiter({ max: 15 });
 
 const MAX_DOCX_BYTES = 50 * 1024 * 1024; // 50MB - was 20MB; a .docx with several embedded
 // images/scans from a PC can exceed that easily, and hitting multer's
@@ -107,7 +113,7 @@ async function convertDocxToPdf(docxBuffer) {
 // frontend hands the returned bytes straight back into the existing "pick
 // a file" step as a normal in-memory File, so from that point on it's
 // indistinguishable from a student picking a PDF directly.
-router.post('/docx-to-pdf', rejectIfTooLarge(MAX_DOCX_BYTES), async (req, res, next) => {
+router.post('/docx-to-pdf', convertLimiter, rejectIfTooLarge(MAX_DOCX_BYTES), async (req, res, next) => {
   try {
     const { docxConversionEnabled } = await getUploadFlags();
     if (!docxConversionEnabled) {
