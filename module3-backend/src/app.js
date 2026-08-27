@@ -15,6 +15,7 @@ const convertRouter = require('./routes/convert');
 const batchesRouter = require('./routes/batches');
 const reviewsRouter = require('./routes/reviews');
 const settingsRouter = require('./routes/settings');
+const webhooksRouter = require('./routes/webhooks');
 
 const app = express();
 
@@ -40,6 +41,12 @@ app.use(
     origin: CORS_ORIGINS, // both Module 1 and Module 2 origins go in .env CORS_ORIGINS
   })
 );
+
+// Mounted before express.json() below - webhook signature verification
+// needs the exact raw bytes Cashfree sent (see routes/webhooks.js), which
+// a global JSON body parser would already have consumed and re-serialized
+// by the time a route handler saw it.
+app.use('/api/webhooks', webhooksRouter);
 
 app.use(express.json());
 

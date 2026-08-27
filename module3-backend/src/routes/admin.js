@@ -203,6 +203,7 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
         s.email,
         s.created_at AS "createdAt",
         l.name AS "landmarkName",
+        s.vendor_status AS "vendorStatus",
         COUNT(pj.id)::int AS "totalJobs",
         COALESCE(SUM(CASE WHEN pj.status NOT IN ('uploaded', 'payment_pending') THEN pj.amount_due ELSE 0 END), 0)::int AS "totalRevenue"
       FROM shops s

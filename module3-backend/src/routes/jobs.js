@@ -6,8 +6,9 @@ const { pool } = require('../db');
 const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
 const { notifyStudent } = require('../notify');
-const { UPLOAD_DIR, RAZORPAY_KEY_ID } = require('../config');
+const { UPLOAD_DIR, RAZORPAY_KEY_ID, STUDENT_APP_URL } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
+const { createOrder: createCashfreeOrder, getOrder: getCashfreeOrder, createOrderSplit } = require('../cashfree');
 const { getPaymentFees, computeFeeBreakdown } = require('../settings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
 
@@ -126,6 +127,143 @@ router.post('/:jobId/razorpay/verify', async (req, res, next) => {
            razorpay_order_id = $2, razorpay_payment_id = $3, updated_at = NOW()
        WHERE id = $4`,
       [tokenNumber, razorpayOrderId, razorpayPaymentId, jobId]
+    );
+
+    return res.status(200).json({ jobId, status: 'queued', tokenNumber });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:jobId/cashfree/create-order
+// Public. -> { paymentSessionId, cashfreeOrderId, jobId, baseAmount, serviceFee, gatewayFee, totalAmount, splitConfigured }
+// Cashfree equivalent of the Razorpay route above - same fee computation,
+// same "amount always comes from the job's own amount_due" rule. The
+// difference: if this shop has completed vendor (bank account)
+// onboarding (see POST /api/shops/:shopId/vendor), a split is attached so
+// baseAmount (the print cost, NOT the platform's service/gateway fee)
+// settles straight to the shop's own bank account - splitConfigured tells
+// the frontend whether that actually happened, purely informational.
+// A shop that hasn't onboarded yet still works exactly as before: the
+// full amount goes to this platform's own Cashfree balance, unsplit.
+router.post('/:jobId/cashfree/create-order', async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const { rows } = await pool.query(
+      `SELECT pj.*, s.cashfree_vendor_id, s.vendor_status
+       FROM print_jobs pj JOIN shops s ON s.id = pj.shop_id
+       WHERE pj.id = $1`,
+      [jobId]
+    );
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (job.status !== 'uploaded') {
+      return res.status(409).json({
+        error: `Cannot start payment for a job in status "${job.status}" (expected "uploaded")`,
+      });
+    }
+
+    const fees = await getPaymentFees();
+    const baseAmount = job.amount_due;
+    const { serviceFee, gatewayFee, totalAmount } = computeFeeBreakdown(baseAmount, fees);
+
+    const cashfreeOrderId = `job_${jobId}_${Date.now()}`;
+    const order = await createCashfreeOrder({
+      orderId: cashfreeOrderId,
+      amount: totalAmount,
+      customerPhone: job.student_phone,
+      returnUrl: `${STUDENT_APP_URL}?cfOrderId={order_id}&kind=job&refId=${jobId}`,
+    });
+
+    let splitConfigured = false;
+    if (job.cashfree_vendor_id && job.vendor_status && job.vendor_status !== 'REJECTED') {
+      try {
+        await createOrderSplit({ orderId: cashfreeOrderId, vendorId: job.cashfree_vendor_id, vendorAmount: baseAmount });
+        splitConfigured = true;
+      } catch (splitErr) {
+        // Non-fatal - the payment itself still works, it just settles
+        // fully into this platform's own balance this time instead of
+        // splitting, same as if the shop hadn't onboarded at all. Logged
+        // clearly so this doesn't go unnoticed if it starts happening a lot.
+        // eslint-disable-next-line no-console
+        console.error(`Cashfree split failed for job ${jobId}:`, splitErr.message, splitErr.cashfreeResponse);
+      }
+    }
+
+    await pool.query(
+      `UPDATE print_jobs
+       SET cashfree_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [cashfreeOrderId, serviceFee, gatewayFee, jobId]
+    );
+
+    return res.status(200).json({
+      paymentSessionId: order.payment_session_id,
+      cashfreeOrderId,
+      jobId,
+      baseAmount,
+      serviceFee,
+      gatewayFee,
+      totalAmount,
+      splitConfigured,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:jobId/cashfree/verify
+// Public. body: { cashfreeOrderId } -> { jobId, status: "queued", tokenNumber }
+// Cashfree's checkout redirects the browser back to STUDENT_APP_URL with
+// the order id in the query string (see create-order above) rather than
+// handing back anything like Razorpay's client-side signature - so there
+// is nothing to "verify" from what the client submits. This is purely a
+// pointer: the actual confirmation is the server-to-server
+// getCashfreeOrder call below, asking Cashfree directly what that order's
+// real status is. A client claiming a fake cashfreeOrderId just gets a
+// 404/mismatch, never a queued job.
+router.post('/:jobId/cashfree/verify', async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const { cashfreeOrderId } = req.body || {};
+    if (!cashfreeOrderId) {
+      return res.status(400).json({ error: 'cashfreeOrderId is required' });
+    }
+
+    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Idempotent, same reasoning as the Razorpay route above - a retried
+    // verify call for a job already queued by this exact order just
+    // returns the existing result rather than erroring.
+    if (job.status !== 'uploaded') {
+      if (job.cashfree_order_id === cashfreeOrderId) {
+        return res.status(200).json({ jobId, status: job.status, tokenNumber: job.token_number });
+      }
+      return res.status(409).json({
+        error: `Cannot verify payment for a job in status "${job.status}" (expected "uploaded")`,
+      });
+    }
+    if (job.cashfree_order_id !== cashfreeOrderId) {
+      return res.status(400).json({ error: 'Order does not match this job' });
+    }
+
+    const order = await getCashfreeOrder(cashfreeOrderId);
+    if (order.order_status !== 'PAID') {
+      return res.status(400).json({ error: `Payment not completed yet (status: ${order.order_status})` });
+    }
+
+    const tokenNumber = await generateTokenNumber(job.shop_id);
+    await pool.query(
+      `UPDATE print_jobs
+       SET status = 'queued', token_number = $1, payment_method = 'cashfree', updated_at = NOW()
+       WHERE id = $2`,
+      [tokenNumber, jobId]
     );
 
     return res.status(200).json({ jobId, status: 'queued', tokenNumber });

@@ -3,8 +3,9 @@ const express = require('express');
 const { pool } = require('../db');
 const { requireShopAuth } = require('../auth');
 const { generateTokenNumber } = require('../tokenGenerator');
-const { RAZORPAY_KEY_ID } = require('../config');
+const { RAZORPAY_KEY_ID, STUDENT_APP_URL } = require('../config');
 const { getClient, verifyPaymentSignature } = require('../razorpay');
+const { createOrder: createCashfreeOrder, getOrder: getCashfreeOrder, createOrderSplit } = require('../cashfree');
 const { getPaymentFees, computeFeeBreakdown } = require('../settings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
 
@@ -117,6 +118,136 @@ router.post('/:batchId/razorpay/verify', async (req, res, next) => {
     await pool.query(
       `UPDATE print_jobs
        SET status = 'queued', token_number = $1, payment_method = 'razorpay', updated_at = NOW()
+       WHERE batch_id = $2`,
+      [tokenNumber, batchId]
+    );
+
+    return res.status(200).json({ batchId, status: 'queued', tokenNumber });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/batches/:batchId/cashfree/create-order
+// Public. -> { paymentSessionId, cashfreeOrderId, batchId, baseAmount, serviceFee, gatewayFee, totalAmount, splitConfigured }
+// Mirrors POST /api/jobs/:jobId/cashfree/create-order - see that route's
+// comment for the full split-payment rationale. One order for the whole
+// batch's combined amount_due, same as every other payment method already
+// does for batches.
+router.post('/:batchId/cashfree/create-order', async (req, res, next) => {
+  try {
+    const { batchId } = req.params;
+    const { rows } = await pool.query(
+      `SELECT b.*, s.cashfree_vendor_id, s.vendor_status
+       FROM batches b JOIN shops s ON s.id = b.shop_id
+       WHERE b.id = $1`,
+      [batchId]
+    );
+    const batch = rows[0];
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    if (batch.status !== 'uploaded') {
+      return res.status(409).json({
+        error: `Cannot start payment for a batch in status "${batch.status}" (expected "uploaded")`,
+      });
+    }
+
+    const fees = await getPaymentFees();
+    const baseAmount = batch.amount_due;
+    const { serviceFee, gatewayFee, totalAmount } = computeFeeBreakdown(baseAmount, fees);
+
+    const cashfreeOrderId = `batch_${batchId}_${Date.now()}`;
+    const order = await createCashfreeOrder({
+      orderId: cashfreeOrderId,
+      amount: totalAmount,
+      customerPhone: batch.student_phone,
+      returnUrl: `${STUDENT_APP_URL}?cfOrderId={order_id}&kind=batch&refId=${batchId}`,
+    });
+
+    let splitConfigured = false;
+    if (batch.cashfree_vendor_id && batch.vendor_status && batch.vendor_status !== 'REJECTED') {
+      try {
+        await createOrderSplit({ orderId: cashfreeOrderId, vendorId: batch.cashfree_vendor_id, vendorAmount: baseAmount });
+        splitConfigured = true;
+      } catch (splitErr) {
+        // Non-fatal, same reasoning as the per-job route - the payment
+        // still goes through, just fully into this platform's own
+        // balance instead of splitting.
+        // eslint-disable-next-line no-console
+        console.error(`Cashfree split failed for batch ${batchId}:`, splitErr.message, splitErr.cashfreeResponse);
+      }
+    }
+
+    await pool.query(
+      `UPDATE batches
+       SET cashfree_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [cashfreeOrderId, serviceFee, gatewayFee, batchId]
+    );
+
+    return res.status(200).json({
+      paymentSessionId: order.payment_session_id,
+      cashfreeOrderId,
+      batchId,
+      baseAmount,
+      serviceFee,
+      gatewayFee,
+      totalAmount,
+      splitConfigured,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/batches/:batchId/cashfree/verify
+// Public. body: { cashfreeOrderId } -> { batchId, status: "queued", tokenNumber }
+// Same server-to-server confirmation model as the per-job route - see
+// that route's comment. Mints one token for the whole batch and mirrors
+// it onto every print_jobs row under it, exactly like every other
+// payment method already does for batches.
+router.post('/:batchId/cashfree/verify', async (req, res, next) => {
+  try {
+    const { batchId } = req.params;
+    const { cashfreeOrderId } = req.body || {};
+    if (!cashfreeOrderId) {
+      return res.status(400).json({ error: 'cashfreeOrderId is required' });
+    }
+
+    const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);
+    const batch = rows[0];
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    if (batch.status !== 'uploaded') {
+      if (batch.cashfree_order_id === cashfreeOrderId) {
+        return res.status(200).json({ batchId, status: batch.status, tokenNumber: batch.token_number });
+      }
+      return res.status(409).json({
+        error: `Cannot verify payment for a batch in status "${batch.status}" (expected "uploaded")`,
+      });
+    }
+    if (batch.cashfree_order_id !== cashfreeOrderId) {
+      return res.status(400).json({ error: 'Order does not match this batch' });
+    }
+
+    const order = await getCashfreeOrder(cashfreeOrderId);
+    if (order.order_status !== 'PAID') {
+      return res.status(400).json({ error: `Payment not completed yet (status: ${order.order_status})` });
+    }
+
+    const tokenNumber = await generateTokenNumber(batch.shop_id);
+    await pool.query(
+      `UPDATE batches
+       SET status = 'queued', token_number = $1, payment_method = 'cashfree', updated_at = NOW()
+       WHERE id = $2`,
+      [tokenNumber, batchId]
+    );
+    await pool.query(
+      `UPDATE print_jobs
+       SET status = 'queued', token_number = $1, payment_method = 'cashfree', updated_at = NOW()
        WHERE batch_id = $2`,
       [tokenNumber, batchId]
     );

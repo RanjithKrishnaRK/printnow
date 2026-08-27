@@ -16,6 +16,7 @@ const { loginRateLimiter } = require('../rateLimit');
 const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
 const { getRealPageCount, extractPdfPages, deleteUploadedFile } = require('../pdfPages');
+const { createVendor } = require('../cashfree');
 
 const router = express.Router();
 
@@ -625,6 +626,112 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       return res.status(404).json({ error: 'Shop not found' });
     }
     return res.status(200).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const IFSC_REGEX = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+const BANK_ACCOUNT_REGEX = /^\d{9,18}$/;
+
+// GET /api/shops/:shopId/vendor-status
+// Shop-owner-only. -> { vendorStatus, bankAccountLast4, bankIfsc, bankAccountHolder, pan }
+// Never returns the full account number back to the browser once saved -
+// only enough (last 4 digits) to confirm "yes, that's the right account"
+// without re-displaying the whole thing on every page load.
+router.get('/:shopId/vendor-status', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT vendor_status AS "vendorStatus", bank_account_number AS "bankAccountNumber",
+              bank_ifsc AS "bankIfsc", bank_account_holder AS "bankAccountHolder", pan
+       FROM shops WHERE id = $1`,
+      [req.params.shopId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const row = rows[0];
+    return res.status(200).json({
+      vendorStatus: row.vendorStatus,
+      bankAccountLast4: row.bankAccountNumber ? row.bankAccountNumber.slice(-4) : null,
+      bankIfsc: row.bankIfsc,
+      bankAccountHolder: row.bankAccountHolder,
+      pan: row.pan,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/:shopId/vendor
+// Shop-owner-only. body: { bankAccountNumber, bankIfsc, bankAccountHolder, pan }
+// -> { vendorStatus }
+// Registers (or re-registers, if called again) this shop as a Cashfree
+// Easy Split vendor - the one-time step that lets their share of a future
+// online payment settle straight to this bank account instead of sitting
+// in the platform's own Cashfree balance. Calling this again with updated
+// details creates a fresh vendor record under the same vendorId (Cashfree
+// treats a repeat Create Vendor call as an update).
+router.post('/:shopId/vendor', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { bankAccountNumber, bankIfsc, bankAccountHolder, pan } = req.body || {};
+
+    if (!bankAccountNumber || !BANK_ACCOUNT_REGEX.test(String(bankAccountNumber))) {
+      return res.status(400).json({ error: 'bankAccountNumber must be 9-18 digits' });
+    }
+    const normalizedIfsc = String(bankIfsc || '').trim().toUpperCase();
+    if (!IFSC_REGEX.test(normalizedIfsc)) {
+      return res.status(400).json({ error: 'bankIfsc must be a valid IFSC code (e.g. HDFC0001234)' });
+    }
+    if (!bankAccountHolder || typeof bankAccountHolder !== 'string' || !bankAccountHolder.trim()) {
+      return res.status(400).json({ error: 'bankAccountHolder is required' });
+    }
+    const normalizedPan = String(pan || '').trim().toUpperCase();
+    if (!PAN_REGEX.test(normalizedPan)) {
+      return res.status(400).json({ error: 'pan must be a valid PAN (e.g. ABCDE1234F)' });
+    }
+
+    const { rows: shopRows } = await pool.query('SELECT name, email, cashfree_vendor_id FROM shops WHERE id = $1', [
+      shopId,
+    ]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    const shop = shopRows[0];
+    // Stable per-shop vendor ID, generated once and reused on every later
+    // call (including re-submission) - never Cashfree-assigned, since we
+    // need to know it before the first API call.
+    const vendorId = shop.cashfree_vendor_id || `shop_${shopId}`.slice(0, 40);
+
+    let vendor;
+    try {
+      vendor = await createVendor({
+        vendorId,
+        name: shop.name,
+        email: shop.email,
+        phone: 9999999999, // TODO: collect a real contact number at signup; Cashfree requires one
+        bankAccountNumber: String(bankAccountNumber),
+        bankIfsc: normalizedIfsc,
+        bankAccountHolder: bankAccountHolder.trim(),
+        pan: normalizedPan,
+      });
+    } catch (cfErr) {
+      // eslint-disable-next-line no-console
+      console.error('Cashfree createVendor failed:', cfErr.message, cfErr.cashfreeResponse);
+      return res.status(502).json({ error: 'Could not register with the payment provider. Please try again.' });
+    }
+
+    await pool.query(
+      `UPDATE shops
+       SET cashfree_vendor_id = $1, vendor_status = $2, bank_account_number = $3,
+           bank_ifsc = $4, bank_account_holder = $5, pan = $6, updated_at = NOW()
+       WHERE id = $7`,
+      [vendorId, vendor.status || 'PENDING', String(bankAccountNumber), normalizedIfsc, bankAccountHolder.trim(), normalizedPan, shopId]
+    );
+
+    return res.status(200).json({ vendorStatus: vendor.status || 'PENDING' });
   } catch (err) {
     next(err);
   }

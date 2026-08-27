@@ -297,19 +297,30 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE batches ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT;
   `);
+  // Cashfree Easy Split order tracking - parallel to the razorpay_* columns
+  // above, added alongside (not replacing) Razorpay so the existing,
+  // working payment flow keeps functioning while Cashfree is rolled out
+  // shop-by-shop as each one completes vendor (bank account) onboarding -
+  // see the cashfree_vendor_id/vendor_status columns further down.
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS cashfree_order_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS cashfree_order_id TEXT;
+  `);
   await pool.query(`
     ALTER TABLE print_jobs DROP CONSTRAINT IF EXISTS print_jobs_payment_method_check;
   `);
   await pool.query(`
     ALTER TABLE print_jobs ADD CONSTRAINT print_jobs_payment_method_check
-      CHECK (payment_method IN ('upi','cash','razorpay'));
+      CHECK (payment_method IN ('upi','cash','razorpay','cashfree'));
   `);
   await pool.query(`
     ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_payment_method_check;
   `);
   await pool.query(`
     ALTER TABLE batches ADD CONSTRAINT batches_payment_method_check
-      CHECK (payment_method IN ('upi','cash','razorpay'));
+      CHECK (payment_method IN ('upi','cash','razorpay','cashfree'));
   `);
 
   // Migration: generic admin-editable settings (key/value), starting with
@@ -425,6 +436,36 @@ async function migrate() {
   // surfaced this gap (a 500 from referencing a column that didn't exist).
   await pool.query(`
     ALTER TABLE shops ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+  `);
+
+  // Migration: Cashfree Easy Split vendor onboarding. Each shop that wants
+  // online payments settled straight to their own bank (rather than
+  // sitting in this platform's account until an admin manually settles it
+  // out) submits these once; the backend uses them to register the shop
+  // as a Cashfree "vendor". cashfree_vendor_id is our own generated ID
+  // (not something Cashfree assigns), sent on every split/order call.
+  // vendor_status tracks Cashfree's own onboarding state for that vendor
+  // (e.g. 'IN_BENE_CREATION' right after creation, 'ACTIVE' once bank
+  // details are verified) - a shop can't actually receive a split until
+  // it reaches an active state, so routes/jobs.js checks this before
+  // ever creating a split payment for that shop.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS cashfree_vendor_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS vendor_status TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS bank_account_number TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS bank_ifsc TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS bank_account_holder TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS pan TEXT;
   `);
 
   // Migration: a student's name, captured once per phone number. The first

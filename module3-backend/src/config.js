@@ -70,6 +70,26 @@ module.exports = {
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || null,
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || null,
 
+  // Cashfree Easy Split - lets each shop receive their own share of a
+  // payment directly to their own bank account (T+1 settlement by
+  // default), instead of money sitting in this platform's own payment
+  // account until an admin manually settles it out. Get these from the
+  // Cashfree Merchant Dashboard -> Developers -> API Keys. Sandbox keys
+  // and production keys are different pairs - CASHFREE_ENV picks which
+  // base URL gets used, independent of which keys happen to be set, so
+  // switching environments doesn't silently point at the wrong one.
+  CASHFREE_CLIENT_ID: process.env.CASHFREE_CLIENT_ID || null,
+  CASHFREE_CLIENT_SECRET: process.env.CASHFREE_CLIENT_SECRET || null,
+  CASHFREE_ENV: process.env.CASHFREE_ENV || 'sandbox', // 'sandbox' | 'production'
+  CASHFREE_API_VERSION: process.env.CASHFREE_API_VERSION || '2023-08-01',
+
+  // Where Cashfree redirects the student's browser back to after they pay
+  // (or cancel) on Cashfree's own checkout page - unlike Razorpay's popup,
+  // Cashfree's flow leaves this site entirely and comes back. Server-side
+  // (not client-supplied) specifically so a payment can never be pointed
+  // at an attacker-controlled redirect target.
+  STUDENT_APP_URL: process.env.STUDENT_APP_URL || 'http://localhost:5173',
+
   // Comma-separated list of allowed frontend origins, e.g.
   // "http://localhost:5173,http://localhost:5174"
   // Module 1 (student app) and Module 2 (shop dashboard) will run on
