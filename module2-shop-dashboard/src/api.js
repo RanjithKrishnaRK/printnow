@@ -77,6 +77,30 @@ async function realChangePassword(shopId, token, currentPassword, newPassword) {
   return res.json(); // { ok: true }
 }
 
+async function realGetVendorStatus(shopId, token) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/vendor-status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Could not load your payout settings.");
+  return res.json(); // { vendorStatus, bankAccountLast4, bankIfsc, bankAccountHolder, pan }
+}
+
+async function realSubmitVendorDetails(shopId, token, details) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/vendor`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(details),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not save your bank details. Please try again.");
+  }
+  return res.json(); // { vendorStatus }
+}
+
 async function realGetLandmarks() {
   const res = await fetch(`${BASE_URL}/api/landmarks`);
   if (!res.ok) throw new Error("Could not load landmarks.");
@@ -342,6 +366,38 @@ async function mockChangePassword(shopId, token, currentPassword, newPassword) {
   return { ok: true };
 }
 
+let mockVendor = { vendorStatus: null, bankAccountLast4: null, bankIfsc: null, bankAccountHolder: null, pan: null };
+
+async function mockGetVendorStatus(shopId, token) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  return { ...mockVendor };
+}
+
+async function mockSubmitVendorDetails(shopId, token, details) {
+  await wait(400);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  // Mimics the backend's own validation so the mock demo behaves the same
+  // way as a real submission would.
+  if (!/^\d{9,18}$/.test(String(details.bankAccountNumber || ""))) {
+    throw new Error("bankAccountNumber must be 9-18 digits");
+  }
+  if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(String(details.bankIfsc || "").toUpperCase())) {
+    throw new Error("bankIfsc must be a valid IFSC code (e.g. HDFC0001234)");
+  }
+  if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(String(details.pan || "").toUpperCase())) {
+    throw new Error("pan must be a valid PAN (e.g. ABCDE1234F)");
+  }
+  mockVendor = {
+    vendorStatus: "ACTIVE", // instant in mock mode, since there's no real bank to verify against
+    bankAccountLast4: String(details.bankAccountNumber).slice(-4),
+    bankIfsc: String(details.bankIfsc).toUpperCase(),
+    bankAccountHolder: details.bankAccountHolder,
+    pan: String(details.pan).toUpperCase(),
+  };
+  return { vendorStatus: mockVendor.vendorStatus };
+}
+
 async function mockGetLandmarks() {
   await wait(200);
   return MOCK_LANDMARKS;
@@ -523,6 +579,16 @@ export function changePassword(shopId, token, currentPassword, newPassword) {
   return USE_MOCK
     ? mockChangePassword(shopId, token, currentPassword, newPassword)
     : realChangePassword(shopId, token, currentPassword, newPassword);
+}
+
+export function getVendorStatus(shopId, token) {
+  return USE_MOCK ? mockGetVendorStatus(shopId, token) : realGetVendorStatus(shopId, token);
+}
+
+export function submitVendorDetails(shopId, token, details) {
+  return USE_MOCK
+    ? mockSubmitVendorDetails(shopId, token, details)
+    : realSubmitVendorDetails(shopId, token, details);
 }
 
 export function getLandmarks() {

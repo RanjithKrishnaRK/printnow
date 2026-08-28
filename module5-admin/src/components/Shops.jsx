@@ -4,6 +4,37 @@ import ShopDetail from "./ShopDetail";
 
 const POLL_MS = 15000;
 
+// Cashfree Easy Split onboarding state, at a glance across every shop -
+// null/undefined means the shop hasn't started (their online payments
+// still settle fully into this platform's own account, unsplit, exactly
+// like before this feature existed).
+function VendorStatusBadge({ status }) {
+  if (!status) {
+    return <span className="text-xs text-collected">Not set up</span>;
+  }
+  const styles = {
+    ACTIVE: "bg-ready/10 text-ready border-ready/20",
+    PENDING: "bg-amber-50 text-amber-700 border-amber-200",
+    IN_BENE_CREATION: "bg-amber-50 text-amber-700 border-amber-200",
+    REJECTED: "bg-red-50 text-red-700 border-red-200",
+  };
+  const labels = {
+    ACTIVE: "Active",
+    PENDING: "Verifying",
+    IN_BENE_CREATION: "Verifying",
+    REJECTED: "Rejected",
+  };
+  return (
+    <span
+      className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${
+        styles[status] || "bg-black/5 text-collected border-black/10"
+      }`}
+    >
+      {labels[status] || status}
+    </span>
+  );
+}
+
 export default function Shops({ token }) {
   const [shops, setShops] = useState([]);
   const [error, setError] = useState("");
@@ -78,6 +109,7 @@ export default function Shops({ token }) {
                 <th className="text-left px-4 py-3 font-medium">Shop</th>
                 <th className="text-left px-4 py-3 font-medium">Email</th>
                 <th className="text-left px-4 py-3 font-medium">Landmark</th>
+                <th className="text-left px-4 py-3 font-medium">Payouts</th>
                 <th className="text-right px-4 py-3 font-medium">Total jobs</th>
                 <th className="text-right px-4 py-3 font-medium">Revenue</th>
                 <th className="text-left px-4 py-3 font-medium">Registered</th>
@@ -87,7 +119,7 @@ export default function Shops({ token }) {
             <tbody className="divide-y divide-black/5">
               {shops.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="text-center text-collected py-10">
+                  <td colSpan={8} className="text-center text-collected py-10">
                     No shops registered yet.
                   </td>
                 </tr>
@@ -105,6 +137,9 @@ export default function Shops({ token }) {
                     </td>
                     <td className="px-4 py-3 text-collected">{s.email}</td>
                     <td className="px-4 py-3 text-collected">{s.landmarkName || "—"}</td>
+                    <td className="px-4 py-3">
+                      <VendorStatusBadge status={s.vendorStatus} />
+                    </td>
                     <td className="px-4 py-3 text-right text-ink">{s.totalJobs}</td>
                     <td className="px-4 py-3 text-right text-ink font-medium">
                       ₹{s.totalRevenue?.toLocaleString?.("en-IN") ?? s.totalRevenue}
