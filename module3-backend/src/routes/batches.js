@@ -162,7 +162,7 @@ router.post('/:batchId/cashfree/create-order', async (req, res, next) => {
       orderId: cashfreeOrderId,
       amount: totalAmount,
       customerPhone: batch.student_phone,
-      returnUrl: `${STUDENT_APP_URL}?cfOrderId={order_id}&kind=batch&refId=${batchId}`,
+      returnUrl: `${STUDENT_APP_URL}?batchId=${batchId}&cfOrderId={order_id}`,
     });
 
     let splitConfigured = false;

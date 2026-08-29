@@ -174,7 +174,7 @@ router.post('/:jobId/cashfree/create-order', async (req, res, next) => {
       orderId: cashfreeOrderId,
       amount: totalAmount,
       customerPhone: job.student_phone,
-      returnUrl: `${STUDENT_APP_URL}?cfOrderId={order_id}&kind=job&refId=${jobId}`,
+      returnUrl: `${STUDENT_APP_URL}?jobId=${jobId}&cfOrderId={order_id}`,
     });
 
     let splitConfigured = false;

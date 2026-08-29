@@ -180,6 +180,11 @@ function makeDocId() {
 // standalone with zero backend dependency.
 const MOCK_MODE = import.meta.env.VITE_USE_MOCK !== "false";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
+// Defaults to sandbox rather than production - an unset env var should
+// never accidentally start processing real payments. Set
+// VITE_CASHFREE_MODE=production explicitly once real Cashfree keys are
+// live on the backend.
+const CASHFREE_MODE = import.meta.env.VITE_CASHFREE_MODE === "production" ? "production" : "sandbox";
 
 // Loaded lazily (not a static <script> tag in index.html) since most
 // sessions won't necessarily use online payment - no reason to pull this
@@ -201,6 +206,27 @@ function loadRazorpayScript() {
     });
   }
   return razorpayScriptPromise;
+}
+
+// Same lazy-load reasoning as Razorpay's loader above. window.Cashfree is a
+// factory function (not a constructor you check for existence the same
+// way), so this checks the script tag itself rather than a global object.
+let cashfreeScriptPromise = null;
+function loadCashfreeScript() {
+  if (window.Cashfree) return Promise.resolve();
+  if (!cashfreeScriptPromise) {
+    cashfreeScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://sdk.cashfree.com/js/v3/cashfree.js";
+      script.onload = () => resolve();
+      script.onerror = () => {
+        cashfreeScriptPromise = null;
+        reject(new Error("Could not load the payment gateway. Check your connection and try again."));
+      };
+      document.body.appendChild(script);
+    });
+  }
+  return cashfreeScriptPromise;
 }
 
 const RATE_PER_PAGE = { bw: 2, color: 8 }; // INR — client-side ESTIMATE only.
@@ -457,6 +483,44 @@ const mockApi = {
         if (job) {
           job.status = "queued";
           job.paymentMethod = "razorpay";
+          job.tokenNumber = obj.tokenNumber;
+        }
+      }
+    }
+    return { [kind === "batch" ? "batchId" : "jobId"]: id, status: "queued", tokenNumber: obj.tokenNumber };
+  },
+  // Mock mode has no real Cashfree checkout to open, so this returns a
+  // fake session and verify just marks the order paid immediately - a UI
+  // smoke test, not a real payment demo, same spirit as the Razorpay mock
+  // above.
+  async createCashfreeOrder(kind, id) {
+    await delay(400);
+    const obj = mockDb.get(id);
+    if (!obj) throw new Error("Order not found");
+    return {
+      paymentSessionId: `session_mock_${Date.now()}`,
+      cashfreeOrderId: `order_mock_${Date.now()}`,
+      baseAmount: obj.amountDue,
+      serviceFee: 0,
+      gatewayFee: 0,
+      totalAmount: obj.amountDue,
+      splitConfigured: false,
+      [kind === "batch" ? "batchId" : "jobId"]: id,
+    };
+  },
+  async verifyCashfreePayment(kind, id) {
+    await delay(500);
+    const obj = mockDb.get(id);
+    if (!obj) throw new Error("Order not found");
+    obj.status = "queued";
+    obj.paymentMethod = "cashfree";
+    obj.tokenNumber = obj.tokenNumber || String(Math.floor(100 + Math.random() * 800));
+    if (obj.isBatch) {
+      for (const jobId of obj.documentJobIds) {
+        const job = mockDb.get(jobId);
+        if (job) {
+          job.status = "queued";
+          job.paymentMethod = "cashfree";
           job.tokenNumber = obj.tokenNumber;
         }
       }
@@ -756,9 +820,38 @@ const realApi = {
     }
     return res.json(); // { jobId/batchId, status: "queued", tokenNumber }
   },
+  // kind: "job" | "batch". Cashfree equivalent of createRazorpayOrder
+  // above - same "server decides the amount" rule. Unlike Razorpay's
+  // popup, Cashfree's checkout leaves this page and comes back via a
+  // return_url the backend controls (see routes/jobs.js/batches.js) - the
+  // app resumes on the existing "status" screen and verifies from there
+  // (see StatusStep's cashfreeOrderIdToVerify handling), not from wherever
+  // checkout was originally opened.
+  async createCashfreeOrder(kind, id) {
+    const path = kind === "batch" ? `/api/batches/${id}/cashfree/create-order` : `/api/jobs/${id}/cashfree/create-order`;
+    const res = await fetch(`${API_BASE_URL}${path}`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not start online payment");
+    }
+    return res.json(); // { paymentSessionId, cashfreeOrderId, baseAmount, serviceFee, gatewayFee, totalAmount, splitConfigured, jobId/batchId }
+  },
+  async verifyCashfreePayment(kind, id, cashfreeOrderId) {
+    const path = kind === "batch" ? `/api/batches/${id}/cashfree/verify` : `/api/jobs/${id}/cashfree/verify`;
+    const res = await fetch(`${API_BASE_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cashfreeOrderId }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Payment could not be verified");
+    }
+    return res.json(); // { jobId/batchId, status: "queued", tokenNumber }
+  },
   // Public, no auth - admin-editable fee settings (see admin panel's
-  // Settings tab). Read before opening checkout so the "Pay online" button
-  // can show the real total, rather than surprising the student mid-payment.
+  // Settings tab). Read before opening checkout so the order summary can
+  // show the real total, rather than surprising the student mid-payment.
   async getPaymentFees() {
     const res = await fetch(`${API_BASE_URL}/api/settings/payment-fees`);
     if (!res.ok) {
@@ -1997,54 +2090,52 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     }
   }
 
-  // Online payment via Razorpay Checkout - the one path that skips the
-  // shop owner's manual confirm step entirely, since the gateway's
-  // signature (verified server-side in verifyRazorpayPayment) IS the
-  // confirmation. setSubmitting stays true for the whole modal lifetime so
-  // the rest of this screen can't be interacted with mid-payment; every
-  // exit (success, failure, or the student just closing the popup) clears it.
+  // Online payment via Cashfree Checkout. Unlike Razorpay's popup, this
+  // opens Cashfree's own hosted payment page in a modal iframe
+  // (redirectTarget: "_modal") - closer to the old Razorpay UX than a
+  // full-page redirect, but Cashfree can still redirect the whole page
+  // (return_url, set server-side - see routes/jobs.js/batches.js) if the
+  // modal can't be used (some mobile browsers, some payment methods like
+  // UPI intent that hand off to another app). Either way, the actual
+  // confirmation happens on the "status" screen after this, not here -
+  // see StatusStep's cashfreeOrderIdToVerify handling for the redirect
+  // case, and the .then() below for the modal-completes-in-place case.
   async function handlePayOnline() {
     setError(null);
     setSubmitting(true);
     try {
-      await loadRazorpayScript();
-      const order = await api.createRazorpayOrder(kind, orderId);
+      await loadCashfreeScript();
+      const order = await api.createCashfreeOrder(kind, orderId);
 
-      const rzp = new window.Razorpay({
-        key: order.keyId,
-        amount: order.amount,
-        currency: order.currency,
-        name: "PrintNow",
-        description: `Order ${orderId}`,
-        order_id: order.orderId,
-        theme: { color: "#2F6E68" },
-        handler: async (response) => {
-          try {
-            await api.verifyRazorpayPayment(kind, orderId, {
-              razorpayOrderId: response.razorpay_order_id,
-              razorpayPaymentId: response.razorpay_payment_id,
-              razorpaySignature: response.razorpay_signature,
-            });
-            onSubmitted();
-          } catch (e) {
-            setError(
-              e.message ||
-                "Payment went through but we couldn't verify it. Please show the shop your payment confirmation."
-            );
-            setSubmitting(false);
-          }
-        },
-        modal: {
-          // Student closed the popup without paying - not an error, just
-          // back to a normal, retryable state.
-          ondismiss: () => setSubmitting(false),
-        },
+      const cashfree = await window.Cashfree({ mode: CASHFREE_MODE });
+      const result = await cashfree.checkout({
+        paymentSessionId: order.paymentSessionId,
+        redirectTarget: "_modal",
       });
-      rzp.on("payment.failed", (resp) => {
-        setError(resp.error?.description || "Payment failed. Please try again.");
+
+      if (result.error) {
+        // Student closed the modal without paying, or it failed outright -
+        // either way, back to a normal, retryable state rather than an
+        // alarming error banner for a simple "changed my mind" dismissal.
+        if (result.error.message && !/cancel|closed/i.test(result.error.message)) {
+          setError(result.error.message);
+        }
         setSubmitting(false);
-      });
-      rzp.open();
+        return;
+      }
+
+      // Completed inside the modal without leaving the page - verify right
+      // here rather than waiting for a redirect that isn't going to happen.
+      try {
+        await api.verifyCashfreePayment(kind, orderId, order.cashfreeOrderId);
+        onSubmitted();
+      } catch (e) {
+        setError(
+          e.message ||
+            "Payment went through but we couldn't verify it. Please show the shop your payment confirmation."
+        );
+        setSubmitting(false);
+      }
     } catch (e) {
       setError(e.message || "Could not start online payment. Please try again.");
       setSubmitting(false);
@@ -2190,12 +2281,67 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
 // ---------------------------------------------------------------------------
 // Step 3 — Token + status page (polls GET /jobs/:jobId)
 // ---------------------------------------------------------------------------
-function StatusStep({ kind, orderId, shopId, onBack, onRetryPayment }) {
+function StatusStep({ kind, orderId, shopId, cashfreeOrderIdToVerify, onBack, onRetryPayment }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [confirmingPayment, setConfirmingPayment] = useState(!!cashfreeOrderIdToVerify);
   const isBatch = kind === "batch";
+
+  // Only reached when Cashfree's checkout redirected the whole page back
+  // here (see the App component's initialCashfreeOrderId) instead of
+  // completing inside ReviewPaymentStep's in-page modal - runs once, before
+  // fetchStatus's normal polling even starts, so the very first status the
+  // student sees already reflects a completed payment rather than
+  // "uploaded" for a few seconds. Silently gives up on failure - the
+  // ongoing 4s poll below will just keep showing whatever the true status
+  // actually is, and the "Pay online" retry button (rendered further down
+  // when status is still "uploaded") covers the case where this genuinely
+  // didn't go through.
+  useEffect(() => {
+    if (!cashfreeOrderIdToVerify) return;
+    const verify = isBatch
+      ? api.verifyCashfreePayment("batch", orderId, cashfreeOrderIdToVerify)
+      : api.verifyCashfreePayment("job", orderId, cashfreeOrderIdToVerify);
+    verify.catch(() => {}).finally(() => setConfirmingPayment(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const [retrying, setRetrying] = useState(false);
+
+  // Self-contained retry, deliberately not routed through the "review"
+  // phase (which needs order/amountDue state that only exists if this
+  // session actually went through the upload flow) - landing on this
+  // screen via a saved link, a shared status link, or a Cashfree redirect
+  // that didn't complete are all cases where that state was never
+  // populated. job.amountDue (from the status fetch this component
+  // already does) is all that's actually needed to open checkout again.
+  async function handleRetryOnline() {
+    setError(null);
+    setRetrying(true);
+    try {
+      await loadCashfreeScript();
+      const order = await api.createCashfreeOrder(kind, orderId);
+      const cashfree = await window.Cashfree({ mode: CASHFREE_MODE });
+      const result = await cashfree.checkout({
+        paymentSessionId: order.paymentSessionId,
+        redirectTarget: "_modal",
+      });
+      if (result.error) {
+        if (result.error.message && !/cancel|closed/i.test(result.error.message)) {
+          setError(result.error.message);
+        }
+        return;
+      }
+      await api.verifyCashfreePayment(kind, orderId, order.cashfreeOrderId);
+      await fetchStatus();
+    } catch (e) {
+      setError(e.message || "Could not start online payment. Please try again.");
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   // Optional review, offered once the order is past payment review (queued
   // or later - see routes/shops.js POST /:shopId/reviews for why). For a
@@ -2316,6 +2462,12 @@ function StatusStep({ kind, orderId, shopId, onBack, onRetryPayment }) {
         </>
       )}
 
+      {confirmingPayment && (
+        <div className="mb-6 rounded-lg border border-[#2F6E68]/25 bg-[#2F6E68]/5 px-4 py-3 text-sm text-[#2F6E68]">
+          Confirming your payment…
+        </div>
+      )}
+
       {job.status === "uploaded" && job.paymentRejectionReason && (
         <div className="mb-6 rounded-lg border border-red-800/25 bg-red-800/5 px-4 py-3 text-sm text-red-900">
           <p className="font-medium">The shop couldn't verify your payment</p>
@@ -2328,6 +2480,20 @@ function StatusStep({ kind, orderId, shopId, onBack, onRetryPayment }) {
               Try payment again
             </button>
           )}
+        </div>
+      )}
+
+      {job.status === "uploaded" && !job.paymentRejectionReason && !confirmingPayment && (
+        <div className="mb-6 rounded-lg border border-stone-300 bg-white px-4 py-3 text-sm text-stone-800">
+          <p className="mb-2">This order hasn't been paid for yet.</p>
+          {error && <p className="mb-2 text-xs text-red-700">{error}</p>}
+          <button type="button"
+            onClick={handleRetryOnline}
+            disabled={retrying}
+            className="w-full rounded-lg bg-[#2F6E68] py-2.5 text-sm font-semibold text-white shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {retrying ? "Opening secure payment\u2026" : `Pay online — ₹${job.amountDue}`}
+          </button>
         </div>
       )}
 
@@ -3073,6 +3239,11 @@ export default function App() {
   const shopIdParam = getParam("shopId");
   const initialJobId = getParam("jobId");
   const initialBatchId = getParam("batchId");
+  // Present only when Cashfree redirected the whole page back here after
+  // checkout (see routes/jobs.js/batches.js return_url) rather than
+  // completing inside the in-page modal - StatusStep uses this to confirm
+  // the payment itself once, on load, before its normal polling starts.
+  const initialCashfreeOrderId = getParam("cfOrderId");
 
   const [shopId, setShopId] = useState(shopIdParam);
   const [phase, setPhase] = useState(
@@ -3335,6 +3506,7 @@ export default function App() {
           kind={orderKind}
           orderId={orderId}
           shopId={shopId}
+          cashfreeOrderIdToVerify={initialCashfreeOrderId}
           onBack={handleBackToHome}
           onRetryPayment={handleRetryPayment}
         />
