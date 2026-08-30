@@ -8,6 +8,7 @@ import Users from "./Users";
 import ChangePassword from "./ChangePassword";
 import PaymentFees from "./PaymentFees";
 import UploadFlags from "./UploadFlags";
+import PaymentGateway from "./PaymentGateway";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -73,6 +74,7 @@ export default function Dashboard({ token, email, onLogout }) {
         {activeTab === "settings" && (
           <div className="space-y-6">
             <ChangePassword token={token} />
+            <PaymentGateway token={token} />
             <PaymentFees token={token} />
             <UploadFlags token={token} />
           </div>

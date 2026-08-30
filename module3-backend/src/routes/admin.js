@@ -335,7 +335,7 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'Shop not found' });
     }
 
-    const [totalRes, todayRes, totalByMethod, todayByMethod, settledTotal] = await Promise.all([
+    const [totalRes, todayRes, totalByMethod, todayByMethod, settledTotal, commission] = await Promise.all([
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings", COUNT(*)::int AS "totalJobs"
          FROM print_jobs WHERE shop_id = $1 AND ${CONFIRMED_STATUS_SQL}`,
@@ -349,6 +349,7 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
       getShopMethodTotals(shopId),
       getShopMethodTotals(shopId, { today: true }),
       getSettledTotal(shopId),
+      getCommissionOwed(shopId),
     ]);
 
     return res.status(200).json({
@@ -362,6 +363,9 @@ router.get('/shops/:shopId/stats', requireAdminAuth, async (req, res, next) => {
       todayByMethod,
       settledTotal,
       unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
+      commissionAccrued: commission.accrued,
+      commissionPaid: commission.paid,
+      commissionOwed: commission.owed,
     });
   } catch (err) {
     next(err);

@@ -9,6 +9,10 @@ import {
   createSettlement,
   updateSettlement,
   deleteSettlement,
+  getShopCommissionPayments,
+  createCommissionPayment,
+  updateCommissionPayment,
+  deleteCommissionPayment,
   generateShopTempPassword,
 } from "../api";
 
@@ -19,6 +23,11 @@ const SETTLEMENT_MODES = [
   { value: "cheque", label: "Cheque" },
   { value: "other", label: "Other" },
 ];
+
+// Same fixed set as SETTLEMENT_MODES - kept as a separate name because
+// commission_payments.mode and settlements.mode are unrelated columns
+// that just happen to allow the same values today.
+const COMMISSION_MODES = SETTLEMENT_MODES;
 
 const STAR = "★";
 
@@ -183,6 +192,11 @@ export default function ShopDetail({ token, shop, onClose }) {
 
               {/* Settlements - payouts of this shop's online earnings */}
               <SettlementsSection token={token} shop={shop} stats={stats} statsError={statsError} />
+
+              {/* Commission - the reverse direction: what this shop owes
+                  PrintNow for jobs that settled straight to their own
+                  Razorpay account instead (see RazorpaySettings.jsx) */}
+              <CommissionSection token={token} shop={shop} stats={stats} statsError={statsError} />
 
               {/* Reviews */}
               <section>
@@ -592,6 +606,246 @@ function SettlementsSection({ token, shop, stats, statsError }) {
                 <button
                   onClick={() => handleDelete(s)}
                   disabled={busyId === s.id}
+                  className="text-xs text-red-600 hover:text-red-700 disabled:opacity-50"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Mirrors SettlementsSection above almost exactly, but in the opposite
+// money direction: this records the shop PAYING PrintNow, for jobs whose
+// online payment went straight to the shop's own Razorpay account (see
+// RazorpaySettings.jsx in Module 2) and so never sent PrintNow its
+// service-fee cut automatically. No fixed schedule - shop pays whenever,
+// this is just where the admin logs it once they have.
+function CommissionSection({ token, shop, stats, statsError }) {
+  const [payments, setPayments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [editingId, setEditingId] = useState(null); // null = not editing, "new" = adding
+  const [amount, setAmount] = useState("");
+  const [paidDate, setPaidDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [mode, setMode] = useState("bank_transfer");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState("");
+  const [busyId, setBusyId] = useState(null);
+
+  function load() {
+    setLoading(true);
+    getShopCommissionPayments(token, shop.shopId)
+      .then(setPayments)
+      .catch((err) => setError(err.message || "Could not load commission payments."))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, shop.shopId]);
+
+  function resetForm() {
+    setAmount("");
+    setPaidDate(new Date().toISOString().slice(0, 10));
+    setMode("bank_transfer");
+    setNote("");
+    setFormError("");
+  }
+
+  function startAdd() {
+    resetForm();
+    // Pre-fill with whatever's currently owed, same "most common action is
+    // clearing the full balance" reasoning as SettlementsSection's startAdd.
+    if (stats?.commissionOwed > 0) setAmount(String(stats.commissionOwed));
+    setEditingId("new");
+  }
+
+  function startEdit(p) {
+    setAmount(String(p.amount));
+    setPaidDate(p.paidDate.slice(0, 10));
+    setMode(p.mode);
+    setNote(p.note || "");
+    setFormError("");
+    setEditingId(p.id);
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setFormError("");
+    const amountNum = Number(amount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      setFormError("Amount must be a positive number.");
+      return;
+    }
+    if (!paidDate) {
+      setFormError("Payment date is required.");
+      return;
+    }
+    setSaving(true);
+    try {
+      if (editingId === "new") {
+        await createCommissionPayment(token, shop.shopId, { amount: amountNum, paidDate, mode, note: note.trim() || undefined });
+      } else {
+        await updateCommissionPayment(token, editingId, { amount: amountNum, paidDate, mode, note: note.trim() || undefined });
+      }
+      setEditingId(null);
+      resetForm();
+      load();
+    } catch (err) {
+      setFormError(err.message || "Could not save commission payment.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(p) {
+    if (!window.confirm(`Delete this ₹${p.amount} commission payment? This cannot be undone.`)) return;
+    setBusyId(p.id);
+    try {
+      await deleteCommissionPayment(token, p.id);
+      setPayments((rows) => rows.filter((r) => r.id !== p.id));
+    } catch (err) {
+      setError(err.message || "Could not delete commission payment.");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs font-medium uppercase tracking-wide text-collected">Commission owed</h3>
+        {editingId === null && (
+          <button
+            onClick={startAdd}
+            className="text-xs font-medium text-teal hover:text-teal/80"
+          >
+            + Record commission payment
+          </button>
+        )}
+      </div>
+
+      {!statsError && stats && (
+        <p className="text-xs text-collected mb-3">
+          {stats.commissionAccrued > 0
+            ? `₹${stats.commissionPaid} paid so far · ₹${stats.commissionOwed} still owed for jobs paid into this shop's own Razorpay account`
+            : "This shop hasn't used their own Razorpay account yet - all their online payments still go through PrintNow's account, so nothing is owed here."}
+        </p>
+      )}
+
+      {editingId !== null && (
+        <form onSubmit={handleSubmit} className="rounded-lg border border-black/10 bg-paper px-4 py-3 mb-3 space-y-2.5">
+          <div className="grid grid-cols-2 gap-2.5">
+            <div>
+              <label className="block text-xs text-collected mb-1">Amount (₹)</label>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                required
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                className="w-full rounded-lg border border-black/10 px-3 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-ink/40 focus:border-ink"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-collected mb-1">Date</label>
+              <input
+                type="date"
+                required
+                value={paidDate}
+                onChange={(e) => setPaidDate(e.target.value)}
+                className="w-full rounded-lg border border-black/10 px-3 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-ink/40 focus:border-ink"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs text-collected mb-1">Mode of payment</label>
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value)}
+              className="w-full rounded-lg border border-black/10 px-3 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-ink/40 focus:border-ink"
+            >
+              {COMMISSION_MODES.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-collected mb-1">Note (optional)</label>
+            <input
+              type="text"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="e.g. reference number, period covered"
+              className="w-full rounded-lg border border-black/10 px-3 py-1.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-ink/40 focus:border-ink"
+            />
+          </div>
+
+          {formError && <p className="text-xs text-red-600">{formError}</p>}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={saving}
+              className="bg-ink hover:bg-ink/90 disabled:opacity-60 text-white text-sm font-medium rounded-lg px-3 py-1.5 transition-colors"
+            >
+              {saving ? "Saving…" : editingId === "new" ? "Add payment" : "Save changes"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditingId(null);
+                resetForm();
+              }}
+              className="text-sm text-collected hover:text-ink px-3 py-1.5"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      {loading ? (
+        <p className="text-sm text-collected py-3 text-center">Loading…</p>
+      ) : error ? (
+        <p className="text-sm text-red-600">{error}</p>
+      ) : payments.length === 0 ? (
+        <p className="text-sm text-collected py-3 text-center border border-dashed border-black/10 rounded-lg">
+          No commission payments recorded yet.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {payments.map((p) => (
+            <div
+              key={p.id}
+              className="flex items-center justify-between rounded-lg border border-black/5 bg-paper px-3 py-2 text-sm"
+            >
+              <div>
+                <span className="font-medium text-ink">₹{p.amount.toLocaleString("en-IN")}</span>
+                <span className="text-collected">
+                  {" "}
+                  · {new Date(p.paidDate).toLocaleDateString()} ·{" "}
+                  {COMMISSION_MODES.find((m) => m.value === p.mode)?.label || p.mode}
+                  {p.note && <> · {p.note}</>}
+                </span>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <button onClick={() => startEdit(p)} className="text-xs text-collected hover:text-ink">
+                  Edit
+                </button>
+                <button
+                  onClick={() => handleDelete(p)}
+                  disabled={busyId === p.id}
                   className="text-xs text-red-600 hover:text-red-700 disabled:opacity-50"
                 >
                   Delete

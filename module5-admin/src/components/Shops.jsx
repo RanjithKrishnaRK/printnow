@@ -110,6 +110,7 @@ export default function Shops({ token }) {
                 <th className="text-left px-4 py-3 font-medium">Email</th>
                 <th className="text-left px-4 py-3 font-medium">Landmark</th>
                 <th className="text-left px-4 py-3 font-medium">Payouts</th>
+                <th className="text-right px-4 py-3 font-medium">Commission owed</th>
                 <th className="text-right px-4 py-3 font-medium">Total jobs</th>
                 <th className="text-right px-4 py-3 font-medium">Revenue</th>
                 <th className="text-left px-4 py-3 font-medium">Registered</th>
@@ -119,7 +120,7 @@ export default function Shops({ token }) {
             <tbody className="divide-y divide-black/5">
               {shops.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="text-center text-collected py-10">
+                  <td colSpan={9} className="text-center text-collected py-10">
                     No shops registered yet.
                   </td>
                 </tr>
@@ -139,6 +140,15 @@ export default function Shops({ token }) {
                     <td className="px-4 py-3 text-collected">{s.landmarkName || "—"}</td>
                     <td className="px-4 py-3">
                       <VendorStatusBadge status={s.vendorStatus} />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {s.hasOwnRazorpayAccount ? (
+                        <span className={s.commissionOwed > 0 ? "text-amber-700 font-medium" : "text-collected"}>
+                          ₹{s.commissionOwed?.toLocaleString?.("en-IN") ?? s.commissionOwed}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-collected">—</span>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-right text-ink">{s.totalJobs}</td>
                     <td className="px-4 py-3 text-right text-ink font-medium">

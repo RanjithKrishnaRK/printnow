@@ -71,6 +71,64 @@ export async function updateUploadFlags(token, flags) {
   return handle(res);
 }
 
+export async function getActiveGateway(token) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/payment-gateway`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // { activeGateway: 'razorpay' | 'cashfree' }
+}
+
+export async function setActiveGateway(token, activeGateway) {
+  const res = await fetch(`${BASE_URL}/api/admin/settings/payment-gateway`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ activeGateway }),
+  });
+  return handle(res);
+}
+
+export async function getShopCommissionPayments(token, shopId) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/commission-payments`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res); // [{ id, shopId, amount, paidDate, mode, note, createdAt }]
+}
+
+export async function createCommissionPayment(token, shopId, payment) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/commission-payments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payment),
+  });
+  return handle(res);
+}
+
+export async function updateCommissionPayment(token, id, payment) {
+  const res = await fetch(`${BASE_URL}/api/admin/commission-payments/${id}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payment),
+  });
+  return handle(res);
+}
+
+export async function deleteCommissionPayment(token, id) {
+  const res = await fetch(`${BASE_URL}/api/admin/commission-payments/${id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return handle(res);
+}
+
 export async function getStats(token) {
   const res = await fetch(`${BASE_URL}/api/admin/stats`, {
     headers: { Authorization: `Bearer ${token}` },
