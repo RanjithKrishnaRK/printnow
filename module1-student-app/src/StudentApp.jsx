@@ -68,6 +68,508 @@ async function imageFileToPdfFile(file) {
   return new File([pdfBytes], pdfName, { type: "application/pdf" });
 }
 
+// ---------------------------------------------------------------------------
+// Photo editing: crop + "N photos per sheet" layout
+// ---------------------------------------------------------------------------
+// Everything below is client-side only (canvas + pdf-lib, already a
+// dependency for imageFileToPdfFile above) - no backend changes needed,
+// since the end result of this whole pipeline is still just a normal PDF
+// File, same as imageFileToPdfFile already produces. The backend, the shop
+// dashboard, and the print agent never need to know a page came from a
+// cropped/composed photo layout instead of a single photo or a real PDF.
+
+// A4 at 72pt/inch - the shop's own printer paper size for every sheet this
+// produces. Matches what a Xerox/print shop in India actually loads,
+// unlike sizing the PDF page to the photo itself (imageFileToPdfFile's
+// approach for a single un-laid-out photo).
+const A4_WIDTH_PT = 595.28;
+const A4_HEIGHT_PT = 841.89;
+const SHEET_MARGIN_PT = 24;
+const CELL_GAP_PT = 10;
+
+// Grid choices offered in the "photos per sheet" selector - kept small and
+// fixed rather than an arbitrary rows x cols input, since the whole point
+// is a couple of one-tap presets a student can understand at a glance.
+const LAYOUT_OPTIONS = [
+  { value: 1, label: "1 per sheet", cols: 1, rows: 1 },
+  { value: 2, label: "2 per sheet", cols: 1, rows: 2 },
+  { value: 4, label: "4 per sheet", cols: 2, rows: 2 },
+  { value: 6, label: "6 per sheet", cols: 2, rows: 3 },
+  { value: 9, label: "9 per sheet", cols: 3, rows: 3 },
+];
+
+function loadImageElement(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Could not load that photo."));
+    img.src = dataUrl;
+  });
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Could not read that photo."));
+    reader.readAsDataURL(file);
+  });
+}
+
+// crop is { x, y, w, h } as fractions (0..1) of the ORIGINAL image's
+// natural size - always applied against the untouched original, not
+// against a previously-cropped result, so re-opening the crop tool and
+// adjusting the box again never compounds quality loss or drifts off the
+// photo's true bounds. Returns a new PNG data URL at the cropped
+// resolution (native pixels, no upscale/downscale).
+async function cropImageToDataUrl(originalDataUrl, crop) {
+  const img = await loadImageElement(originalDataUrl);
+  const sx = Math.round(crop.x * img.naturalWidth);
+  const sy = Math.round(crop.y * img.naturalHeight);
+  const sw = Math.max(1, Math.round(crop.w * img.naturalWidth));
+  const sh = Math.max(1, Math.round(crop.h * img.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = sw;
+  canvas.height = sh;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  return canvas.toDataURL("image/png");
+}
+
+// Builds one composed PDF (one page per sheet) from a list of already-
+// cropped images, `perSheet` images to a page in a fixed grid (see
+// LAYOUT_OPTIONS). Each image is placed "contain"-fit within its cell -
+// centered, scaled to fit without further cropping or distortion - so a
+// portrait photo next to a landscape one on the same sheet never gets
+// stretched to match. Returns a File (ready to slot into the normal
+// document pipeline) plus a thumbnail of the first sheet for the document
+// card, and the sheet count (this composed document's "page count").
+async function composeImagesToPdf(images, perSheet, baseFileName) {
+  const layout = LAYOUT_OPTIONS.find((l) => l.value === perSheet) || LAYOUT_OPTIONS[0];
+  const pdfDoc = await PDFDocument.create();
+  const cellW = (A4_WIDTH_PT - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.cols - 1)) / layout.cols;
+  const cellH = (A4_HEIGHT_PT - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.rows - 1)) / layout.rows;
+
+  let firstSheetThumbnail = null;
+
+  for (let i = 0; i < images.length; i += layout.value) {
+    const sheetImages = images.slice(i, i + layout.value);
+    const page = pdfDoc.addPage([A4_WIDTH_PT, A4_HEIGHT_PT]);
+
+    for (let s = 0; s < sheetImages.length; s++) {
+      const im = sheetImages[s];
+      const bytes = await (await fetch(im.dataUrl)).arrayBuffer();
+      // The crop step above always outputs PNG, so this can embed
+      // unconditionally - no need to branch on the original file's type.
+      const embedded = await pdfDoc.embedPng(bytes);
+
+      const col = s % layout.cols;
+      const row = Math.floor(s / layout.cols);
+      const cellX = SHEET_MARGIN_PT + col * (cellW + CELL_GAP_PT);
+      // pdf-lib's y axis is bottom-up - row 0 (top of the sheet visually)
+      // is the LAST row from the bottom, hence rows - 1 - row here.
+      const cellY = SHEET_MARGIN_PT + (layout.rows - 1 - row) * (cellH + CELL_GAP_PT);
+
+      const scale = Math.min(cellW / embedded.width, cellH / embedded.height);
+      const drawW = embedded.width * scale;
+      const drawH = embedded.height * scale;
+      const drawX = cellX + (cellW - drawW) / 2;
+      const drawY = cellY + (cellH - drawH) / 2;
+      page.drawImage(embedded, { x: drawX, y: drawY, width: drawW, height: drawH });
+    }
+
+    if (firstSheetThumbnail === null) {
+      const thumbCanvas = document.createElement("canvas");
+      const thumbScale = 320 / A4_WIDTH_PT;
+      thumbCanvas.width = 320;
+      thumbCanvas.height = A4_HEIGHT_PT * thumbScale;
+      const ctx = thumbCanvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+      for (let s = 0; s < sheetImages.length; s++) {
+        const img = await loadImageElement(sheetImages[s].dataUrl);
+        const col = s % layout.cols;
+        const row = Math.floor(s / layout.cols);
+        const cellX = (SHEET_MARGIN_PT + col * (cellW + CELL_GAP_PT)) * thumbScale;
+        const cellY = (SHEET_MARGIN_PT + row * (cellH + CELL_GAP_PT)) * thumbScale;
+        const cw = cellW * thumbScale;
+        const ch = cellH * thumbScale;
+        const scale = Math.min(cw / img.naturalWidth, ch / img.naturalHeight);
+        const dw = img.naturalWidth * scale;
+        const dh = img.naturalHeight * scale;
+        ctx.drawImage(img, cellX + (cw - dw) / 2, cellY + (ch - dh) / 2, dw, dh);
+      }
+      firstSheetThumbnail = thumbCanvas.toDataURL("image/png");
+    }
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  const sheetCount = Math.ceil(images.length / layout.value);
+  const file = new File([pdfBytes], baseFileName, { type: "application/pdf" });
+  return { file, thumbnailUrl: firstSheetThumbnail, sheetCount };
+}
+
+// Draggable-corner-dot crop tool for one photo. `crop` is the current box
+// as fractions (0..1) of the image's displayed size (same as its natural
+// size, since fractions are resolution-independent) - `onChange` fires
+// continuously while dragging so the parent always has the live box, and
+// the actual pixel crop only happens later, in cropImageToDataUrl, when
+// the student taps "Use this crop".
+//
+// Pointer handlers are attached to `window` (not just the handle/box
+// itself) once a drag starts, so a fast drag that outpaces the handle's
+// own hit area - or continues past the image's edge - doesn't drop the
+// gesture. minSize guards against shrinking the box to nothing, which
+// would make Math.max(1, ...) in cropImageToDataUrl kick in and produce a
+// confusing 1x1 pixel "crop".
+function CropBox({ crop, onChange, containerRef }) {
+  const dragRef = useRef(null); // { mode: 'move'|'nw'|'ne'|'sw'|'se', startCrop, startX, startY }
+  const minSize = 0.05;
+
+  function clamp01(v) {
+    return Math.min(1, Math.max(0, v));
+  }
+
+  function handlePointerDown(mode) {
+    return (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragRef.current = { mode, startCrop: crop, startX: e.clientX, startY: e.clientY };
+      window.addEventListener("pointermove", handlePointerMove);
+      window.addEventListener("pointerup", handlePointerUp);
+    };
+  }
+
+  function handlePointerMove(e) {
+    const drag = dragRef.current;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!drag || !rect) return;
+    const dx = (e.clientX - drag.startX) / rect.width;
+    const dy = (e.clientY - drag.startY) / rect.height;
+    const c = drag.startCrop;
+
+    let next;
+    if (drag.mode === "move") {
+      const x = clamp01(Math.min(1 - c.w, Math.max(0, c.x + dx)));
+      const y = clamp01(Math.min(1 - c.h, Math.max(0, c.y + dy)));
+      next = { ...c, x, y };
+    } else {
+      let { x, y, w, h } = c;
+      if (drag.mode === "nw" || drag.mode === "sw") {
+        const newX = clamp01(Math.min(c.x + c.w - minSize, c.x + dx));
+        w = c.x + c.w - newX;
+        x = newX;
+      }
+      if (drag.mode === "ne" || drag.mode === "se") {
+        w = Math.max(minSize, Math.min(1 - c.x, c.w + dx));
+      }
+      if (drag.mode === "nw" || drag.mode === "ne") {
+        const newY = clamp01(Math.min(c.y + c.h - minSize, c.y + dy));
+        h = c.y + c.h - newY;
+        y = newY;
+      }
+      if (drag.mode === "sw" || drag.mode === "se") {
+        h = Math.max(minSize, Math.min(1 - c.y, c.h + dy));
+      }
+      next = { x, y, w, h };
+    }
+    onChange(next);
+  }
+
+  function handlePointerUp() {
+    dragRef.current = null;
+    window.removeEventListener("pointermove", handlePointerMove);
+    window.removeEventListener("pointerup", handlePointerUp);
+  }
+
+  const handleStyle =
+    "absolute h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-[#2F6E68] shadow touch-none";
+
+  return (
+    <div
+      className="absolute border-2 border-[#2F6E68]/90 bg-[#2F6E68]/10 touch-none cursor-move"
+      style={{
+        left: `${crop.x * 100}%`,
+        top: `${crop.y * 100}%`,
+        width: `${crop.w * 100}%`,
+        height: `${crop.h * 100}%`,
+      }}
+      onPointerDown={handlePointerDown("move")}
+    >
+      <div className={handleStyle} style={{ left: 0, top: 0 }} onPointerDown={handlePointerDown("nw")} />
+      <div className={handleStyle} style={{ left: "100%", top: 0 }} onPointerDown={handlePointerDown("ne")} />
+      <div className={handleStyle} style={{ left: 0, top: "100%" }} onPointerDown={handlePointerDown("sw")} />
+      <div className={handleStyle} style={{ left: "100%", top: "100%" }} onPointerDown={handlePointerDown("se")} />
+    </div>
+  );
+}
+
+// Full-screen crop editor for one photo, opened from ImageEditorModal.
+// Always crops from `image.originalDataUrl` (never a previous crop result -
+// see cropImageToDataUrl), so re-cropping an already-cropped photo resets
+// to the full original rather than cropping-of-a-crop.
+function PhotoCropScreen({ image, onCancel, onSave }) {
+  const [crop, setCrop] = useState(image.crop || { x: 0, y: 0, w: 1, h: 1 });
+  const [saving, setSaving] = useState(false);
+  const containerRef = useRef(null);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const dataUrl = await cropImageToDataUrl(image.originalDataUrl, crop);
+      onSave({ ...image, crop, dataUrl });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex flex-col bg-black">
+      <div className="flex items-center justify-between px-4 py-3">
+        <button type="button" onClick={onCancel} className="text-sm font-medium text-white/80">
+          Cancel
+        </button>
+        <p className="text-sm font-medium text-white">Crop photo</p>
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="text-sm font-semibold text-white disabled:opacity-50"
+        >
+          {saving ? "Saving…" : "Use this crop"}
+        </button>
+      </div>
+      <div className="flex flex-1 items-center justify-center overflow-hidden px-4 pb-6">
+        <div ref={containerRef} className="relative max-h-full max-w-full">
+          <img
+            src={image.originalDataUrl}
+            alt=""
+            className="max-h-[70vh] w-auto select-none"
+            draggable={false}
+          />
+          <CropBox crop={crop} onChange={setCrop} containerRef={containerRef} />
+        </div>
+      </div>
+      <p className="px-4 pb-4 text-center text-xs text-white/60">
+        Drag the dots to resize, or drag inside the box to move it.
+      </p>
+    </div>
+  );
+}
+
+// The main photo-editing screen: staged list of photos (each croppable and
+// removable), a "photos per sheet" layout picker, and an "add more photos"
+// button - opened either from UploadStep's file picker (a fresh batch of
+// photos, session.docId === null) or from an existing document's "Edit"
+// button (re-editing photos already turned into a document,
+// session.docId === that document's id). Either way this only ever deals
+// in photos - PDFs and Word docs never enter this screen, they're added to
+// the order directly as before.
+function ImageEditorModal({ session, onCancel, onApply }) {
+  const [images, setImages] = useState(session.images);
+  const [perSheet, setPerSheet] = useState(session.perSheet || 4);
+  const [croppingId, setCroppingId] = useState(null);
+  const [applying, setApplying] = useState(false);
+  const [error, setError] = useState(null);
+  const addMoreInputRef = useRef(null);
+
+  async function handleAddMoreFiles(fileList) {
+    const files = Array.from(fileList || []);
+    for (const file of files) {
+      if (file.type !== "image/jpeg" && file.type !== "image/png") continue; // this screen is photos-only
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(`${file.name} is too large - please choose a photo under 50MB.`);
+        continue;
+      }
+      try {
+        const dataUrl = await fileToDataUrl(file);
+        setImages((prev) => [
+          ...prev,
+          {
+            id: makeDocId(),
+            fileName: file.name,
+            originalDataUrl: dataUrl,
+            dataUrl,
+            crop: { x: 0, y: 0, w: 1, h: 1 },
+          },
+        ]);
+      } catch (err) {
+        setError(err.message || `Could not read ${file.name}.`);
+      }
+    }
+    if (addMoreInputRef.current) addMoreInputRef.current.value = "";
+  }
+
+  function removeImage(id) {
+    setImages((prev) => prev.filter((im) => im.id !== id));
+  }
+
+  function moveImage(id, direction) {
+    setImages((prev) => {
+      const i = prev.findIndex((im) => im.id === id);
+      const j = i + direction;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  }
+
+  async function handleApply() {
+    if (images.length === 0) {
+      setError("Add at least one photo first.");
+      return;
+    }
+    setError(null);
+    setApplying(true);
+    try {
+      const baseFileName =
+        images.length === 1 ? images[0].fileName.replace(/\.[^.]+$/, "") + ".pdf" : `photos_${images.length}.pdf`;
+      const { file, thumbnailUrl, sheetCount } = await composeImagesToPdf(images, perSheet, baseFileName);
+      onApply({ file, thumbnailUrl, sheetCount, images, perSheet });
+    } catch (err) {
+      setError(err.message || "Could not create the print layout. Please try again.");
+      setApplying(false);
+    }
+  }
+
+  const croppingImage = croppingId ? images.find((im) => im.id === croppingId) : null;
+  if (croppingImage) {
+    return (
+      <PhotoCropScreen
+        image={croppingImage}
+        onCancel={() => setCroppingId(null)}
+        onSave={(updated) => {
+          setImages((prev) => prev.map((im) => (im.id === updated.id ? updated : im)));
+          setCroppingId(null);
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] flex flex-col bg-black/60 backdrop-blur-sm">
+      <div className="mt-auto flex max-h-[92vh] flex-col rounded-t-2xl bg-stone-50">
+        <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
+          <button type="button" onClick={onCancel} className="text-sm font-medium text-stone-500">
+            Cancel
+          </button>
+          <p className="text-sm font-semibold text-stone-900">Edit photos</p>
+          <button
+            type="button"
+            onClick={handleApply}
+            disabled={applying || images.length === 0}
+            className="text-sm font-semibold text-[#2F6E68] disabled:opacity-40"
+          >
+            {applying ? "Working…" : "Done"}
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-4">
+          {error && (
+            <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              {error}
+            </div>
+          )}
+
+          <div className="mb-4">
+            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-stone-500">
+              Photos per sheet
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {LAYOUT_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setPerSheet(opt.value)}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                    perSheet === opt.value
+                      ? "border-[#2F6E68] bg-[#2F6E68] text-white"
+                      : "border-stone-300 bg-white text-stone-700"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[11px] text-stone-500">
+              {images.length > 0
+                ? `${images.length} photo${images.length > 1 ? "s" : ""} → ${Math.ceil(
+                    images.length / perSheet
+                  )} printed sheet${Math.ceil(images.length / perSheet) > 1 ? "s" : ""}`
+                : "Add photos below to get started."}
+            </p>
+          </div>
+
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-stone-500">
+            Photos ({images.length})
+          </p>
+          <div className="grid grid-cols-3 gap-2.5">
+            {images.map((im, i) => (
+              <div key={im.id} className="relative overflow-hidden rounded-lg border border-stone-300 bg-white">
+                <img src={im.dataUrl} alt="" className="aspect-square w-full object-cover" />
+                <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-black/60 px-1.5 py-1">
+                  <button
+                    type="button"
+                    onClick={() => setCroppingId(im.id)}
+                    className="rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                  >
+                    Crop
+                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => moveImage(im.id, -1)}
+                      disabled={i === 0}
+                      className="rounded px-1 text-[10px] font-medium text-white disabled:opacity-30"
+                      aria-label="Move earlier"
+                    >
+                      ←
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => moveImage(im.id, 1)}
+                      disabled={i === images.length - 1}
+                      className="rounded px-1 text-[10px] font-medium text-white disabled:opacity-30"
+                      aria-label="Move later"
+                    >
+                      →
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeImage(im.id)}
+                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/60 text-[11px] font-bold text-white"
+                  aria-label="Remove photo"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() => addMoreInputRef.current?.click()}
+              className="flex aspect-square items-center justify-center rounded-lg border-2 border-dashed border-stone-300 text-2xl text-stone-400"
+              aria-label="Add more photos"
+            >
+              +
+            </button>
+          </div>
+          <input
+            ref={addMoreInputRef}
+            type="file"
+            accept="image/jpeg,image/png"
+            multiple
+            className="hidden"
+            onChange={(e) => handleAddMoreFiles(e.target.files)}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Runs the same docx-conversion / image-to-PDF / page-detection pipeline
 // UploadStep always ran for its single file, but as a standalone function so
 // it can be called once per document when a student adds several files at
@@ -1239,6 +1741,13 @@ function makeDefaultDocument() {
     pageSelection: "",
     thumbnailUrl: null, // small first-page preview image (data URL) for PDFs
     previewUrl: null, // object URL of the actual file, for the full preview modal
+    // Set only for documents built from the photo editor (ImageEditorModal) -
+    // the staged photos (with their crops) and the chosen "per sheet" layout,
+    // kept around so the document's "Edit photos" button can reopen the
+    // editor with everything exactly as it was left. null for anything
+    // that was uploaded as a real PDF or Word doc.
+    sourceImages: null,
+    layoutPerSheet: null,
   };
 }
 
@@ -1277,7 +1786,7 @@ function deriveDocument(doc, rates) {
 // its single file; now rendered once per document. Also shows a thumbnail
 // of the first page (tap to open a full preview) so a student can confirm
 // "yes, that's the right file" before paying, not just read a filename.
-function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRemove }) {
+function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, onEdit, showRemove }) {
   const { pagesNum, printPagesNum, selectionError, colorPageCount, rangeError, estimate } = deriveDocument(
     doc,
     shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null
@@ -1334,15 +1843,26 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, showRe
             )}
           </div>
         </div>
-        {showRemove && (
-          <button
-            type="button"
-            onClick={onRemove}
-            className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-stone-500 hover:bg-stone-100 hover:text-red-700"
-          >
-            Remove
-          </button>
-        )}
+        <div className="flex shrink-0 items-center gap-1">
+          {onEdit && (
+            <button
+              type="button"
+              onClick={onEdit}
+              className="rounded-md px-2 py-1 text-xs font-medium text-[#2F6E68] hover:bg-[#2F6E68]/10"
+            >
+              Edit photos
+            </button>
+          )}
+          {showRemove && (
+            <button
+              type="button"
+              onClick={onRemove}
+              className="rounded-md px-2 py-1 text-xs font-medium text-stone-500 hover:bg-stone-100 hover:text-red-700"
+            >
+              Remove
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -1593,6 +2113,11 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
     imageConversionEnabled: true,
   });
   const fileInputRef = useRef(null);
+  // null = closed. { docId: null | existing doc's id, images: [...], perSheet }
+  // docId null means "building a new document from freshly-picked photos";
+  // a real id means "re-editing an existing document's photos" (opened via
+  // that document's Edit button - see DocumentSettingsCard).
+  const [imageEditorSession, setImageEditorSession] = useState(null);
 
   // Admin-editable (see admin panel's Settings tab) - controls whether this
   // screen offers .docx / photo uploads. Fetched once on load; falls back
@@ -1701,47 +2226,155 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   // and sequential also means documents appear in the card list in the
   // same order the student picked them, one by one, rather than in
   // whatever order finished processing first.
+  //
+  // Photos (JPEG/PNG) don't get added directly the way PDFs and Word docs
+  // do - they open the photo editor (ImageEditorModal) first, so the
+  // student can crop and choose a "photos per sheet" layout before a
+  // document ever gets created from them. PDFs/Word docs are unaffected -
+  // this whole branch below only exists for images.
   async function handleFilesChosen(fileList) {
     const files = Array.from(fileList || []);
     if (files.length === 0) return;
-    setAddingFile(true);
-    try {
-      for (const chosenFile of files) {
-        try {
-          const { file, detectedPages, thumbnailUrl } = await processChosenFile(chosenFile, uploadFlags);
-          const newDoc = {
-            ...makeDefaultDocument(),
-            file,
-            fileName: file.name,
-            detectedPages,
-            pages: detectedPages ? String(detectedPages) : "",
-            thumbnailUrl,
-            // Object URL of the actual (post-conversion) PDF - used for the
-            // "view full document" preview modal. Kept alongside the file
-            // itself for the whole document's lifetime in this order; see
-            // the cleanup effect below that revokes these on unmount.
-            previewUrl: URL.createObjectURL(file),
-          };
-          setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
-        } catch (err) {
-          // One bad file (wrong type currently disabled, too large,
-          // corrupt, etc.) shouldn't stop the rest of a multi-file
-          // selection from being added - it becomes its own dismissible
-          // card instead (see failedFiles below), and the rest continue.
+
+    const imageFiles = files.filter((f) => f.type === "image/jpeg" || f.type === "image/png");
+    const otherFiles = files.filter((f) => f.type !== "image/jpeg" && f.type !== "image/png");
+
+    if (imageFiles.length > 0) {
+      if (!uploadFlags?.imageConversionEnabled) {
+        setFailedFiles((prev) => [
+          ...imageFiles.map((f) => ({
+            id: makeDocId(),
+            fileName: f.name,
+            error: "Photo upload is currently unavailable. Please upload a PDF instead.",
+          })),
+          ...prev,
+        ]);
+      } else {
+        const oversized = imageFiles.filter((f) => f.size > MAX_UPLOAD_BYTES);
+        const usable = imageFiles.filter((f) => f.size <= MAX_UPLOAD_BYTES);
+        if (oversized.length > 0) {
           setFailedFiles((prev) => [
-            ...prev,
-            {
+            ...oversized.map((f) => ({
               id: makeDocId(),
-              fileName: chosenFile.name,
-              error: err.message || "Could not process that file.",
-            },
+              fileName: f.name,
+              error: `That file is ${(f.size / (1024 * 1024)).toFixed(1)}MB - please choose a photo under 50MB.`,
+            })),
+            ...prev,
           ]);
         }
+        if (usable.length > 0) {
+          const staged = await Promise.all(
+            usable.map(async (f) => {
+              const dataUrl = await fileToDataUrl(f);
+              return {
+                id: makeDocId(),
+                fileName: f.name,
+                originalDataUrl: dataUrl,
+                dataUrl,
+                crop: { x: 0, y: 0, w: 1, h: 1 },
+              };
+            })
+          );
+          // Extends an already-open session (e.g. the student tapped "+"
+          // inside the editor and picked more via this same input) rather
+          // than starting a second one - opens fresh otherwise.
+          setImageEditorSession((prev) =>
+            prev
+              ? { ...prev, images: [...prev.images, ...staged] }
+              : { docId: null, images: staged, perSheet: 4 }
+          );
+        }
       }
-    } finally {
-      setAddingFile(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
+
+    if (otherFiles.length > 0) {
+      setAddingFile(true);
+      try {
+        for (const chosenFile of otherFiles) {
+          try {
+            const { file, detectedPages, thumbnailUrl } = await processChosenFile(chosenFile, uploadFlags);
+            const newDoc = {
+              ...makeDefaultDocument(),
+              file,
+              fileName: file.name,
+              detectedPages,
+              pages: detectedPages ? String(detectedPages) : "",
+              thumbnailUrl,
+              // Object URL of the actual (post-conversion) PDF - used for the
+              // "view full document" preview modal. Kept alongside the file
+              // itself for the whole document's lifetime in this order; see
+              // the cleanup effect below that revokes these on unmount.
+              previewUrl: URL.createObjectURL(file),
+            };
+            setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
+          } catch (err) {
+            // One bad file (wrong type currently disabled, too large,
+            // corrupt, etc.) shouldn't stop the rest of a multi-file
+            // selection from being added - it becomes its own dismissible
+            // card instead (see failedFiles below), and the rest continue.
+            setFailedFiles((prev) => [
+              ...prev,
+              {
+                id: makeDocId(),
+                fileName: chosenFile.name,
+                error: err.message || "Could not process that file.",
+              },
+            ]);
+          }
+        }
+      } finally {
+        setAddingFile(false);
+      }
+    }
+
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  // Builds/updates a document from the photo editor's output. session.docId
+  // null means this is a brand-new document (appended to the order);
+  // otherwise it's replacing an existing document's file/thumbnail/preview
+  // in place (via patchDoc) while leaving that document's pages/copies/
+  // sides/color settings untouched - re-editing photos shouldn't reset
+  // print settings the student already chose, only the pages number, which
+  // legitimately may have changed if the sheet count changed.
+  function handleImageEditorApply({ file, thumbnailUrl, sheetCount, images, perSheet }) {
+    const previewUrl = URL.createObjectURL(file);
+    if (imageEditorSession.docId) {
+      const oldDoc = documents.find((d) => d.id === imageEditorSession.docId);
+      if (oldDoc?.previewUrl) URL.revokeObjectURL(oldDoc.previewUrl);
+      patchDoc(imageEditorSession.docId, {
+        file,
+        fileName: file.name,
+        detectedPages: sheetCount,
+        pages: String(sheetCount),
+        thumbnailUrl,
+        previewUrl,
+        sourceImages: images,
+        layoutPerSheet: perSheet,
+      });
+    } else {
+      const newDoc = {
+        ...makeDefaultDocument(),
+        file,
+        fileName: file.name,
+        detectedPages: sheetCount,
+        pages: String(sheetCount),
+        thumbnailUrl,
+        previewUrl,
+        sourceImages: images,
+        layoutPerSheet: perSheet,
+      };
+      setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
+    }
+    setImageEditorSession(null);
+  }
+
+  function openImageEditorFor(doc) {
+    setImageEditorSession({
+      docId: doc.id,
+      images: doc.sourceImages,
+      perSheet: doc.layoutPerSheet || 4,
+    });
   }
 
   function removeFailedFile(id) {
@@ -1904,6 +2537,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
               shopInfo={shopInfo}
               onChange={(fields) => patchDoc(doc.id, fields)}
               onRemove={() => removeDoc(doc.id)}
+              onEdit={doc.sourceImages ? () => openImageEditorFor(doc) : null}
               showRemove
             />
           ))}
@@ -2036,6 +2670,14 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
       >
         {submitting ? "Uploading\u2026" : "Review order"}
       </button>
+
+      {imageEditorSession && (
+        <ImageEditorModal
+          session={imageEditorSession}
+          onCancel={() => setImageEditorSession(null)}
+          onApply={handleImageEditorApply}
+        />
+      )}
     </div>
   );
 }
