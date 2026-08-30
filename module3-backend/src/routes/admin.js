@@ -11,7 +11,7 @@ const { randomUUID } = require('crypto');
 const { pool } = require('../db');
 const { hashPassword, comparePassword, signAdminToken, requireAdminAuth } = require('../auth');
 const { UPLOAD_DIR } = require('../config');
-const { getPaymentFees, updatePaymentFees, getUploadFlags, updateUploadFlags } = require('../settings');
+const { getPaymentFees, updatePaymentFees, getUploadFlags, updateUploadFlags, getActiveGateway, setActiveGateway, VALID_GATEWAYS } = require('../settings');
 const { loginRateLimiter } = require('../rateLimit');
 const {
   CONFIRMED_STATUS_SQL,
@@ -21,11 +21,17 @@ const {
   updateSettlement,
   deleteSettlement,
   getSettledTotal,
+  getCommissionOwed,
+  listCommissionPayments,
+  createCommissionPayment,
+  updateCommissionPayment,
+  deleteCommissionPayment,
 } = require('../earnings');
 
 const router = express.Router();
 
 const VALID_SETTLEMENT_MODES = ['bank_transfer', 'upi', 'cash', 'cheque', 'other'];
+const VALID_COMMISSION_MODES = VALID_SETTLEMENT_MODES;
 
 // POST /api/admin/login
 // body: { email, password } -> { token }
@@ -189,6 +195,38 @@ router.patch('/settings/upload-flags', requireAdminAuth, async (req, res, next) 
   }
 });
 
+// GET /api/admin/settings/payment-gateway
+// Auth required. -> { activeGateway: 'razorpay' | 'cashfree' }
+router.get('/settings/payment-gateway', requireAdminAuth, async (req, res, next) => {
+  try {
+    const activeGateway = await getActiveGateway();
+    return res.status(200).json({ activeGateway });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/settings/payment-gateway
+// Auth required. body: { activeGateway: 'razorpay' | 'cashfree' } -> { activeGateway }
+// Controls which gateway the student app's checkout actually offers (see
+// routes/settings.js's public GET /api/settings/active-gateway). Both
+// gateways' own create-order/verify routes keep working either way - this
+// is purely "what does the checkout screen show right now", so it's meant
+// to be flipped the moment the Cashfree merchant account finishes
+// activating, with zero code changes.
+router.patch('/settings/payment-gateway', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { activeGateway } = req.body || {};
+    if (!VALID_GATEWAYS.includes(activeGateway)) {
+      return res.status(400).json({ error: `activeGateway must be one of: ${VALID_GATEWAYS.join(', ')}` });
+    }
+    const updated = await setActiveGateway(activeGateway);
+    return res.status(200).json({ activeGateway: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/admin/shops
 // Auth required. All shops platform-wide, with landmark name and a job
 // count, for the admin's shop list view. Revenue only counts jobs the shop
@@ -204,6 +242,7 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
         s.created_at AS "createdAt",
         l.name AS "landmarkName",
         s.vendor_status AS "vendorStatus",
+        (s.razorpay_key_id IS NOT NULL) AS "hasOwnRazorpayAccount",
         COUNT(pj.id)::int AS "totalJobs",
         COALESCE(SUM(CASE WHEN pj.status NOT IN ('uploaded', 'payment_pending') THEN pj.amount_due ELSE 0 END), 0)::int AS "totalRevenue"
       FROM shops s
@@ -212,7 +251,16 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
       GROUP BY s.id, l.name
       ORDER BY "totalRevenue" DESC
     `);
-    return res.status(200).json(rows);
+    // commissionOwed needs its own per-shop query (own-account jobs' fees
+    // minus what's already been paid in - see earnings.js), so it's
+    // attached after the main list rather than folded into the SQL above.
+    const withCommission = await Promise.all(
+      rows.map(async (shop) => {
+        const { owed } = await getCommissionOwed(shop.shopId);
+        return { ...shop, commissionOwed: owed };
+      })
+    );
+    return res.status(200).json(withCommission);
   } catch (err) {
     next(err);
   }
@@ -441,6 +489,98 @@ router.delete('/settlements/:id', requireAdminAuth, async (req, res, next) => {
     const deleted = await deleteSettlement(req.params.id);
     if (!deleted) {
       return res.status(404).json({ error: 'Settlement not found' });
+    }
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/admin/shops/:shopId/commission-payments
+// Auth required. Full commission-payment history for a shop - the reverse
+// of /settlements above: what the shop has paid the PLATFORM for jobs
+// that settled straight to their own Razorpay account.
+router.get('/shops/:shopId/commission-payments', requireAdminAuth, async (req, res, next) => {
+  try {
+    const payments = await listCommissionPayments(req.params.shopId);
+    return res.status(200).json(payments);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/shops/:shopId/commission-payments
+// Auth required. body: { amount, paidDate, mode, note? } -> the created row
+// Records the shop settling up their service-fee dues, in whatever amount
+// and whenever they actually pay it - not an enforced cap against
+// commissionOwed, same "ledger, not a blocker" reasoning as /settlements.
+router.post('/shops/:shopId/commission-payments', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { amount, paidDate, mode, note } = req.body || {};
+
+    const { rows: shopRows } = await pool.query('SELECT id FROM shops WHERE id = $1', [shopId]);
+    if (shopRows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!paidDate || Number.isNaN(Date.parse(paidDate))) {
+      return res.status(400).json({ error: 'paidDate must be a valid date (YYYY-MM-DD)' });
+    }
+    if (!VALID_COMMISSION_MODES.includes(mode)) {
+      return res.status(400).json({ error: `mode must be one of: ${VALID_COMMISSION_MODES.join(', ')}` });
+    }
+
+    const payment = await createCommissionPayment({ shopId, amount, paidDate, mode, note });
+    return res.status(201).json(payment);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/commission-payments/:id
+// Auth required. body: any subset of { amount, paidDate, mode, note } -> the updated row
+router.patch('/commission-payments/:id', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows: existingRows } = await pool.query('SELECT * FROM commission_payments WHERE id = $1', [id]);
+    const existing = existingRows[0];
+    if (!existing) {
+      return res.status(404).json({ error: 'Commission payment not found' });
+    }
+
+    const amount = req.body?.amount ?? existing.amount;
+    const paidDate = req.body?.paidDate ?? existing.paid_date;
+    const mode = req.body?.mode ?? existing.mode;
+    const note = req.body?.note !== undefined ? req.body.note : existing.note;
+
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!paidDate || Number.isNaN(Date.parse(paidDate))) {
+      return res.status(400).json({ error: 'paidDate must be a valid date (YYYY-MM-DD)' });
+    }
+    if (!VALID_COMMISSION_MODES.includes(mode)) {
+      return res.status(400).json({ error: `mode must be one of: ${VALID_COMMISSION_MODES.join(', ')}` });
+    }
+
+    const updated = await updateCommissionPayment(id, { amount, paidDate, mode, note });
+    return res.status(200).json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/admin/commission-payments/:id
+// Auth required. Removes a commission-payment record entirely - used to
+// correct a mistaken entry (wrong shop, wrong amount, duplicate).
+router.delete('/commission-payments/:id', requireAdminAuth, async (req, res, next) => {
+  try {
+    const deleted = await deleteCommissionPayment(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({ error: 'Commission payment not found' });
     }
     return res.status(200).json({ ok: true });
   } catch (err) {

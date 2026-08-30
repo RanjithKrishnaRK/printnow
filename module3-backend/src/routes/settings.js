@@ -5,9 +5,22 @@
 // knows whether docx/image-to-PDF conversion are currently available
 // before offering them as options.
 const express = require('express');
-const { getPaymentFees, getUploadFlags } = require('../settings');
+const { getPaymentFees, getUploadFlags, getActiveGateway } = require('../settings');
 
 const router = express.Router();
+
+// GET /api/settings/active-gateway -> { activeGateway: 'razorpay' | 'cashfree' }
+// Which online-payment flow the checkout screen should actually run right
+// now (see admin panel's Settings tab) - both gateways' own routes keep
+// working regardless of this value, it only decides which one gets shown.
+router.get('/active-gateway', async (req, res, next) => {
+  try {
+    const activeGateway = await getActiveGateway();
+    return res.status(200).json({ activeGateway });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/settings/payment-fees ->
 // { serviceFeePercent, serviceFeeEnabled, serviceFeeTier1Flat, serviceFeeTier2Flat,
