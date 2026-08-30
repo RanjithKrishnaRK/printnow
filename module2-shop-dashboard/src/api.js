@@ -213,6 +213,14 @@ async function realGetSettlements(shopId, token) {
   return res.json(); // [{ id, amount, settledDate, mode, note, createdAt }]
 }
 
+async function realGetCommissionPayments(shopId, token) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/commission-payments`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Could not load commission payment history.");
+  return res.json(); // [{ id, amount, paidDate, mode, note, createdAt }]
+}
+
 async function realUpdateSettings(shopId, token, patch) {
   const res = await fetch(`${BASE_URL}/api/shops/${shopId}/settings`, {
     method: "PATCH",
@@ -323,7 +331,16 @@ const mockSignedUpShops = []; // { name, email, password, shopId, token }
 // Mirrors the shape returned by GET/PATCH /api/shops/:shopId/settings.
 // priceBw/priceColor default to the same starter rates the real backend
 // backfills new shops with; maxPagesPerHour null = no cap (default).
-let mockSettings = { name: "Campus Xerox", autoPrintEnabled: false, priceBw: 2, priceColor: 10, maxPagesPerHour: null, upiId: null };
+let mockSettings = {
+  name: "Campus Xerox",
+  autoPrintEnabled: false,
+  priceBw: 2,
+  priceColor: 10,
+  maxPagesPerHour: null,
+  upiId: null,
+  razorpayKeyId: null,
+  razorpaySecretConfigured: false,
+};
 
 async function mockLogin(email, password) {
   await wait(MOCK_LATENCY_MS);
@@ -486,6 +503,11 @@ async function mockGetEarnings(token) {
   }
   const totalByMethod = toMethodTotals(paidJobs);
   const settledTotal = mockSettlements.reduce((sum, s) => sum + s.amount, 0);
+  const commissionPaid = mockCommissionPayments.reduce((sum, p) => sum + p.amount, 0);
+  // Mock mode has no real shop-owned Razorpay account routing (see
+  // routes/jobs.js), so there's nothing accrued to owe yet - the demo
+  // just shows the shape of the numbers, always at 0.
+  const commissionAccrued = 0;
   return {
     totalEarnings: paidJobs.reduce((sum, j) => sum + (j.amountDue || 0), 0),
     totalJobs: paidJobs.length,
@@ -496,6 +518,9 @@ async function mockGetEarnings(token) {
     todayByMethod: toMethodTotals(todayJobs),
     settledTotal,
     unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
+    commissionAccrued,
+    commissionPaid,
+    commissionOwed: Math.max(0, commissionAccrued - commissionPaid),
   };
 }
 
@@ -534,7 +559,8 @@ async function mockGetSettlements(token) {
 async function mockUpdateSettings(token, patch) {
   await wait(150);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
-  const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId } = patch || {};
+  const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, razorpaySecret } =
+    patch || {};
 
   if (autoPrintEnabled !== undefined) {
     if (typeof autoPrintEnabled !== "boolean") throw new Error("autoPrintEnabled must be true or false");
@@ -558,7 +584,30 @@ async function mockUpdateSettings(token, patch) {
   if (upiId !== undefined) {
     mockSettings.upiId = upiId;
   }
+  if (razorpayKeyId !== undefined) {
+    if (razorpayKeyId === null) {
+      mockSettings.razorpayKeyId = null;
+      mockSettings.razorpaySecretConfigured = false;
+    } else {
+      if (typeof razorpayKeyId !== "string" || razorpayKeyId.trim().length < 8) {
+        throw new Error("razorpayKeyId does not look like a valid Razorpay key ID");
+      }
+      if (typeof razorpaySecret !== "string" || razorpaySecret.trim().length < 8) {
+        throw new Error("razorpaySecret is required (and must be valid) whenever razorpayKeyId is set");
+      }
+      mockSettings.razorpayKeyId = razorpayKeyId.trim();
+      mockSettings.razorpaySecretConfigured = true;
+    }
+  }
   return { ...mockSettings };
+}
+
+let mockCommissionPayments = [];
+
+async function mockGetCommissionPayments(token) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  return [...mockCommissionPayments].sort((a, b) => (a.paidDate < b.paidDate ? 1 : -1));
 }
 
 // -----------------------------
@@ -628,6 +677,10 @@ export function getEarningsHistory(shopId, token, groupBy) {
 
 export function getSettlements(shopId, token) {
   return USE_MOCK ? mockGetSettlements(token) : realGetSettlements(shopId, token);
+}
+
+export function getCommissionPayments(shopId, token) {
+  return USE_MOCK ? mockGetCommissionPayments(token) : realGetCommissionPayments(shopId, token);
 }
 
 export function updateSettings(shopId, token, patch) {

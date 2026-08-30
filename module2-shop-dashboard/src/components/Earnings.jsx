@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getEarnings, getEarningsHistory, getSettlements } from "../api";
+import { getEarnings, getEarningsHistory, getSettlements, getCommissionPayments } from "../api";
 
 const MODE_LABELS = {
   bank_transfer: "Bank transfer",
@@ -42,6 +42,8 @@ export default function Earnings({ shopId, token, onBack }) {
   const [historyError, setHistoryError] = useState("");
   const [settlements, setSettlements] = useState([]);
   const [settlementsError, setSettlementsError] = useState("");
+  const [commissionPayments, setCommissionPayments] = useState([]);
+  const [commissionError, setCommissionError] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -49,6 +51,7 @@ export default function Earnings({ shopId, token, onBack }) {
     Promise.all([
       getEarnings(shopId, token).then(setSummary).catch((e) => setSummaryError(e.message || "Could not load earnings.")),
       getSettlements(shopId, token).then(setSettlements).catch((e) => setSettlementsError(e.message || "Could not load settlement history.")),
+      getCommissionPayments(shopId, token).then(setCommissionPayments).catch((e) => setCommissionError(e.message || "Could not load payment history.")),
     ]).finally(() => setLoading(false));
   }, [shopId, token]);
 
@@ -163,6 +166,47 @@ export default function Earnings({ shopId, token, onBack }) {
                 </div>
               )}
             </section>
+
+            {/* Commission owed - only relevant once a shop's own Razorpay account
+                has actually processed a payment (see RazorpaySettings.jsx / earnings.js) */}
+            {summary && summary.commissionAccrued > 0 && (
+              <section>
+                <h2 className="text-xs font-medium uppercase tracking-wide text-collected mb-2">
+                  Service charge you owe
+                </h2>
+                <p className="text-xs text-collected mb-3">
+                  Payments through your own Razorpay account go straight to you, PrintNow's fee
+                  included - so that fee is a running tab instead. Pay it back whenever suits you;
+                  there's no fixed schedule.
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
+                  <MoneyCard label="Owed to PrintNow" value={summary.commissionOwed} highlight={summary.commissionOwed > 0} />
+                  <MoneyCard label="Total accrued" value={summary.commissionAccrued} />
+                  <MoneyCard label="Already paid" value={summary.commissionPaid} />
+                </div>
+
+                {commissionError ? (
+                  <p className="text-sm text-red-600">{commissionError}</p>
+                ) : commissionPayments.length > 0 ? (
+                  <div className="space-y-2">
+                    {commissionPayments.map((p) => (
+                      <div
+                        key={p.id}
+                        className="rounded-lg border border-black/5 bg-card px-4 py-3 flex items-center justify-between gap-3"
+                      >
+                        <div>
+                          <p className="text-ink font-medium">₹{p.amount.toLocaleString("en-IN")}</p>
+                          <p className="text-xs text-collected">
+                            {new Date(p.paidDate).toLocaleDateString()} · {MODE_LABELS[p.mode] || p.mode}
+                            {p.note && <> · {p.note}</>}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            )}
 
             {/* Settlement history - read-only here, admin-managed */}
             <section>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getSettings, updateSettings, changePassword } from "../api";
 import PayoutSettings from "./PayoutSettings";
+import RazorpaySettings from "./RazorpaySettings";
 
 // Shown two ways: (1) mandatory first screen right after signup, via
 // `firstTime`, so a shop can't start receiving orders priced at nothing;
@@ -258,6 +259,7 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
         ) : (
           <div className="space-y-6">
             {formCard}
+            <RazorpaySettings shopId={shopId} token={token} />
             <PayoutSettings shopId={shopId} token={token} />
             <ChangePasswordCard shopId={shopId} token={token} startOpen={mustChangePassword} />
           </div>
