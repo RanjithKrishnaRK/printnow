@@ -134,10 +134,39 @@ async function updateUploadFlags({ docxConversionEnabled, imageConversionEnabled
   return getUploadFlags();
 }
 
+const VALID_GATEWAYS = ['razorpay', 'cashfree'];
+
+// Which gateway the student app actually offers right now. Both routes
+// (jobs.js/batches.js .../razorpay/* and .../cashfree/*) keep working
+// regardless of this value - it's purely "what does the checkout screen
+// show" - so switching it back and forth (e.g. once the Cashfree merchant
+// account finishes activating) is a single admin-panel toggle, not a
+// redeploy.
+async function getActiveGateway() {
+  const { rows } = await pool.query(`SELECT value FROM settings WHERE key = 'active_payment_gateway'`);
+  const value = rows[0]?.value;
+  return VALID_GATEWAYS.includes(value) ? value : 'razorpay';
+}
+
+async function setActiveGateway(gateway) {
+  if (!VALID_GATEWAYS.includes(gateway)) {
+    throw new Error(`gateway must be one of: ${VALID_GATEWAYS.join(', ')}`);
+  }
+  await pool.query(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('active_payment_gateway', $1, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+    [gateway]
+  );
+  return gateway;
+}
+
 module.exports = {
   getPaymentFees,
   updatePaymentFees,
   computeFeeBreakdown,
   getUploadFlags,
   updateUploadFlags,
+  VALID_GATEWAYS,
+  getActiveGateway,
+  setActiveGateway,
 };

@@ -18,7 +18,11 @@ const router = express.Router();
 router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
   try {
     const { batchId } = req.params;
-    const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);
+    const { rows } = await pool.query(
+      `SELECT b.*, s.razorpay_key_id AS shop_razorpay_key_id, s.razorpay_key_secret AS shop_razorpay_key_secret
+       FROM batches b JOIN shops s ON s.id = b.shop_id WHERE b.id = $1`,
+      [batchId]
+    );
     const batch = rows[0];
     if (!batch) {
       return res.status(404).json({ error: 'Batch not found' });
@@ -33,7 +37,13 @@ router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
     const baseAmount = batch.amount_due;
     const { serviceFee, gatewayFee, totalAmount } = computeFeeBreakdown(baseAmount, fees);
 
-    const razorpay = getClient();
+    // See jobs.js's razorpay/create-order for the full reasoning - same
+    // shop-owned-account preference, mirrored here for batches.
+    const usingShopAccount = Boolean(batch.shop_razorpay_key_id && batch.shop_razorpay_key_secret);
+    const razorpay = getClient(
+      usingShopAccount ? { keyId: batch.shop_razorpay_key_id, keySecret: batch.shop_razorpay_key_secret } : {}
+    );
+    const accountKeyId = usingShopAccount ? batch.shop_razorpay_key_id : RAZORPAY_KEY_ID;
     const order = await razorpay.orders.create({
       amount: totalAmount * 100,
       currency: 'INR',
@@ -43,16 +53,17 @@ router.post('/:batchId/razorpay/create-order', async (req, res, next) => {
 
     await pool.query(
       `UPDATE batches
-       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
-       WHERE id = $4`,
-      [order.id, serviceFee, gatewayFee, batchId]
+       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3,
+           razorpay_account_key_id = $4, updated_at = NOW()
+       WHERE id = $5`,
+      [order.id, serviceFee, gatewayFee, accountKeyId, batchId]
     );
 
     return res.status(200).json({
       orderId: order.id,
       amount: order.amount,
       currency: order.currency,
-      keyId: RAZORPAY_KEY_ID,
+      keyId: accountKeyId,
       batchId,
       baseAmount,
       serviceFee,
@@ -80,19 +91,28 @@ router.post('/:batchId/razorpay/verify', async (req, res, next) => {
       });
     }
 
+    const { rows } = await pool.query(
+      `SELECT b.*, s.razorpay_key_id AS shop_razorpay_key_id, s.razorpay_key_secret AS shop_razorpay_key_secret
+       FROM batches b JOIN shops s ON s.id = b.shop_id WHERE b.id = $1`,
+      [batchId]
+    );
+    const batch = rows[0];
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    const usingShopAccount =
+      batch.razorpay_account_key_id &&
+      batch.razorpay_account_key_id === batch.shop_razorpay_key_id &&
+      Boolean(batch.shop_razorpay_key_secret);
     const valid = verifyPaymentSignature({
       orderId: razorpayOrderId,
       paymentId: razorpayPaymentId,
       signature: razorpaySignature,
+      keySecret: usingShopAccount ? batch.shop_razorpay_key_secret : undefined,
     });
     if (!valid) {
       return res.status(400).json({ error: 'Payment could not be verified' });
-    }
-
-    const { rows } = await pool.query('SELECT * FROM batches WHERE id = $1', [batchId]);
-    const batch = rows[0];
-    if (!batch) {
-      return res.status(404).json({ error: 'Batch not found' });
     }
 
     if (batch.status !== 'uploaded') {

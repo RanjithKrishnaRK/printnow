@@ -13,7 +13,14 @@ const { calculateAmountDue, parseColorPages, parsePageRange } = require('../pric
 const { PRICING } = require('../config');
 const { resolveStudentName, StudentNameRequiredError } = require('../studentName');
 const { loginRateLimiter } = require('../rateLimit');
-const { CONFIRMED_STATUS_SQL, getShopMethodTotals, listSettlements, getSettledTotal } = require('../earnings');
+const {
+  CONFIRMED_STATUS_SQL,
+  getShopMethodTotals,
+  listSettlements,
+  getSettledTotal,
+  getCommissionOwed,
+  listCommissionPayments,
+} = require('../earnings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
 const { getRealPageCount, extractPdfPages, deleteUploadedFile } = require('../pdfPages');
 const { createVendor } = require('../cashfree');
@@ -526,13 +533,20 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
     const { rows } = await pool.query(
       `SELECT name, auto_print_enabled AS "autoPrintEnabled",
               price_bw AS "priceBw", price_color AS "priceColor",
-              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"
+              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
+              razorpay_key_id AS "razorpayKeyId",
+              (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured"
        FROM shops WHERE id = $1`,
       [shopId]
     );
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Shop not found' });
     }
+    // razorpay_key_secret itself is never sent back to the browser once
+    // saved - same "confirm it's there without re-displaying it" rule as
+    // the bank account number on /vendor-status. razorpayKeyId is fine to
+    // return in full: Razorpay's own Checkout widget needs it client-side
+    // anyway, so it was never secret to begin with.
     return res.status(200).json(rows[0]);
   } catch (err) {
     next(err);
@@ -555,7 +569,8 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
 router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId } = req.body || {};
+    const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, razorpaySecret } =
+      req.body || {};
 
     const sets = [];
     const values = [];
@@ -608,9 +623,43 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       }
     }
 
+    // razorpayKeyId/razorpaySecret: the shop's own Razorpay account, so
+    // their online payments (including the platform's service/gateway
+    // fees baked into the total - see routes/jobs.js) land directly with
+    // them instead of the platform's pooled account. Set null on
+    // razorpayKeyId to clear BOTH fields at once - a key_id with no
+    // matching secret (or vice versa) is just a broken config that would
+    // fail every checkout attempt with a confusing error, so it's not a
+    // state this route allows getting into. Setting a new pair always
+    // requires both together in the same request, for the same reason.
+    if (razorpayKeyId !== undefined) {
+      if (razorpayKeyId === null) {
+        sets.push(`razorpay_key_id = $${paramIndex++}`);
+        values.push(null);
+        sets.push(`razorpay_key_secret = $${paramIndex++}`);
+        values.push(null);
+      } else {
+        if (typeof razorpayKeyId !== 'string' || razorpayKeyId.trim().length < 8) {
+          return res.status(400).json({ error: 'razorpayKeyId does not look like a valid Razorpay key ID' });
+        }
+        if (typeof razorpaySecret !== 'string' || razorpaySecret.trim().length < 8) {
+          return res
+            .status(400)
+            .json({ error: 'razorpaySecret is required (and must be valid) whenever razorpayKeyId is set' });
+        }
+        sets.push(`razorpay_key_id = $${paramIndex++}`);
+        values.push(razorpayKeyId.trim());
+        sets.push(`razorpay_key_secret = $${paramIndex++}`);
+        values.push(razorpaySecret.trim());
+      }
+    } else if (razorpaySecret !== undefined) {
+      return res.status(400).json({ error: 'razorpaySecret must be set together with razorpayKeyId' });
+    }
+
     if (sets.length === 0) {
       return res.status(400).json({
-        error: 'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId',
+        error:
+          'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId',
       });
     }
 
@@ -619,7 +668,9 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       `UPDATE shops SET ${sets.join(', ')} WHERE id = $${paramIndex}
        RETURNING auto_print_enabled AS "autoPrintEnabled",
                  price_bw AS "priceBw", price_color AS "priceColor",
-                 max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"`,
+                 max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
+                 razorpay_key_id AS "razorpayKeyId",
+                 (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured"`,
       values
     );
     if (rows.length === 0) {
@@ -822,7 +873,7 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
   try {
     const { shopId } = req.params;
 
-    const [totalRes, todayRes, statusRes, totalByMethod, todayByMethod, settledTotal] = await Promise.all([
+    const [totalRes, todayRes, statusRes, totalByMethod, todayByMethod, settledTotal, commission] = await Promise.all([
       pool.query(
         `SELECT COALESCE(SUM(amount_due), 0)::int AS "totalEarnings",
                 COUNT(*)::int AS "totalJobs"
@@ -843,6 +894,7 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
       getShopMethodTotals(shopId),
       getShopMethodTotals(shopId, { today: true }),
       getSettledTotal(shopId),
+      getCommissionOwed(shopId),
     ]);
 
     return res.status(200).json({
@@ -859,6 +911,13 @@ router.get('/:shopId/earnings', requireShopAuth, requireOwnShop, async (req, res
       // this is "what's still owed to me" at a glance.
       settledTotal,
       unsettledOnline: Math.max(0, totalByMethod.online - settledTotal),
+      // The reverse direction: jobs paid straight into the shop's OWN
+      // Razorpay account never sent the platform its service/gateway fee
+      // cut, so this is what the shop owes the platform instead - paid
+      // whenever, not on a fixed schedule (see earnings.js).
+      commissionAccrued: commission.accrued,
+      commissionPaid: commission.paid,
+      commissionOwed: commission.owed,
     });
   } catch (err) {
     next(err);
@@ -928,6 +987,21 @@ router.get('/:shopId/settlements', requireShopAuth, requireOwnShop, async (req, 
   try {
     const settlements = await listSettlements(req.params.shopId);
     return res.status(200).json(settlements);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/shops/:shopId/commission-payments
+// Shop-owner-only, read-only - the admin panel is the only place these get
+// created/edited/deleted (see routes/admin.js). The reverse of
+// /settlements above: this is what the shop owner has paid the PLATFORM
+// for jobs that settled straight to their own Razorpay account - lets
+// them see their own payment history without having to ask.
+router.get('/:shopId/commission-payments', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const payments = await listCommissionPayments(req.params.shopId);
+    return res.status(200).json(payments);
   } catch (err) {
     next(err);
   }

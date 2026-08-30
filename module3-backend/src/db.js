@@ -534,6 +534,94 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE reviews ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
   `);
+
+  // Migration: dual payment gateway + shop-owned Razorpay accounts.
+  //
+  // Cashfree isn't actually usable yet (the merchant account is still
+  // pending activation), so the platform needs to keep running on Razorpay
+  // in the meantime, and switch over to Cashfree later with one admin
+  // toggle instead of a code change. 'active_payment_gateway' is that
+  // toggle - the only settings key here that isn't a fee - and both
+  // checkout routes (POST .../razorpay/create-order and .../cashfree/
+  // create-order) keep working regardless of which one is "active"; the
+  // setting only controls which one the student app actually offers, via
+  // GET /api/settings/active-gateway.
+  //
+  // Separately: instead of every shop's online payment landing in this
+  // platform's own Razorpay account first (the original design - see the
+  // 'settlements' table above, which pays a shop OUT of that pooled
+  // money), a shop can now register their own Razorpay key_id/key_secret.
+  // When they have, their Razorpay orders are created directly against
+  // their account, so the money - print cost AND the service/gateway fees
+  // both - lands with them immediately, never touching this platform's
+  // balance at all. That's the whole point (shop asked for payments to
+  // "go to their account only"), but it also means the platform no longer
+  // automatically collects its service fee for these jobs - see the
+  // 'commission_payments' table below for how that's tracked instead.
+  //
+  // razorpay_key_secret is stored as plaintext, same trust level as every
+  // other credential already in this table (cashfree_client_secret-style
+  // fields don't exist because Cashfree uses one platform-wide account,
+  // but bank_account_number/pan above are the same kind of sensitive
+  // value already living here unencrypted) - real secrets-at-rest
+  // encryption is a genuine gap, flagged here rather than silently
+  // skipped, worth addressing before this handles real shop volume.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS razorpay_key_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS razorpay_key_secret TEXT;
+  `);
+  await pool.query(`
+    INSERT INTO settings (key, value, updated_at) VALUES
+      ('active_payment_gateway', 'razorpay', NOW())
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
+  // print_jobs/batches.razorpay_account_key_id: which key_id actually
+  // created this specific order - the shop's own (if they'd configured
+  // one at that moment) or the platform's global RAZORPAY_KEY_ID. Denormalized
+  // (not re-derived from the shop's current settings) for two reasons:
+  // (1) verify must HMAC-check the signature with the SAME secret that
+  // created the order, and a shop could in principle change/clear their
+  // keys between create-order and verify; (2) commission accounting later
+  // needs to know, permanently, whether this particular job's money went
+  // to the shop directly or into the platform's own account, even if the
+  // shop's key setup changes afterward.
+  await pool.query(`
+    ALTER TABLE print_jobs ADD COLUMN IF NOT EXISTS razorpay_account_key_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD COLUMN IF NOT EXISTS razorpay_account_key_id TEXT;
+  `);
+
+  // commission_payments: the reverse of 'settlements'. Settlements are the
+  // platform paying a shop money it already collected on their behalf;
+  // commission_payments are a shop paying the PLATFORM its service-fee cut
+  // for jobs that settled straight to the shop's own Razorpay account
+  // (their own keys), where the platform never touched the money at all.
+  // "Owed" isn't stored anywhere - it's computed on read as SUM(service_fee
+  // + gateway_fee) over that shop's own-account jobs, minus SUM(amount)
+  // here (see earnings.js getCommissionOwed) - same "ledger, not a
+  // balance column" approach as settlements, for the same reason: it's
+  // always derivable and can't drift out of sync with the underlying jobs.
+  // No fixed cadence - the shop pays "weekly or whenever" per the
+  // original ask, and the admin just records each payment as it comes in.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS commission_payments (
+      id         TEXT PRIMARY KEY,
+      shop_id    TEXT NOT NULL REFERENCES shops(id),
+      amount     INTEGER NOT NULL,
+      paid_date  DATE NOT NULL,
+      mode       TEXT NOT NULL CHECK (mode IN ('bank_transfer','upi','cash','cheque','other')),
+      note       TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS commission_payments_shop_id_idx ON commission_payments (shop_id);
+  `);
 }
 
 module.exports = { pool, migrate };

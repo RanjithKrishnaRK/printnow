@@ -85,6 +85,89 @@ async function deleteSettlement(id) {
   return rowCount > 0;
 }
 
+// Commission owed - the reverse of settlements. A job only counts here if
+// its money went straight to the SHOP's own Razorpay account (their own
+// keys), not the platform's - see db.js's razorpay_account_key_id comment.
+// For those jobs the platform never touched the money at all, so its
+// service_fee + gateway_fee cut (normally captured automatically, either
+// because it stayed in the platform's own pooled Razorpay balance, or via
+// Cashfree's Easy Split remainder) has to be tracked as a running due
+// instead. Cash and shop-owned-Cashfree-vendor jobs never appear here -
+// only 'razorpay' jobs where razorpay_account_key_id is set AND matches
+// that shop's OWN configured key (not the platform's).
+async function getShopCommissionAccrued(shopId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(pj.service_fee + pj.gateway_fee), 0)::int AS total
+     FROM print_jobs pj
+     JOIN shops s ON s.id = pj.shop_id
+     WHERE pj.shop_id = $1 AND ${CONFIRMED_STATUS_SQL.replace(/status/g, 'pj.status')}
+       AND pj.payment_method = 'razorpay'
+       AND pj.razorpay_account_key_id IS NOT NULL
+       AND pj.razorpay_account_key_id = s.razorpay_key_id`,
+    [shopId]
+  );
+  return rows[0].total;
+}
+
+async function listCommissionPayments(shopId) {
+  const { rows } = await pool.query(
+    `SELECT id, shop_id AS "shopId", amount, paid_date AS "paidDate", mode, note,
+            created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM commission_payments WHERE shop_id = $1 ORDER BY paid_date DESC, created_at DESC`,
+    [shopId]
+  );
+  return rows;
+}
+
+async function getCommissionPaidTotal(shopId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0)::int AS total FROM commission_payments WHERE shop_id = $1`,
+    [shopId]
+  );
+  return rows[0].total;
+}
+
+// Owed = accrued (this shop's own-account jobs' fees) minus whatever's
+// already been paid in - never negative (a shop that's paid ahead, or an
+// admin correcting an over-recorded payment, shouldn't show as "we owe
+// them"; that's a separate, deliberately out-of-scope reconciliation).
+async function getCommissionOwed(shopId) {
+  const [accrued, paid] = await Promise.all([
+    getShopCommissionAccrued(shopId),
+    getCommissionPaidTotal(shopId),
+  ]);
+  return { accrued, paid, owed: Math.max(0, accrued - paid) };
+}
+
+async function createCommissionPayment({ shopId, amount, paidDate, mode, note }) {
+  const id = randomUUID();
+  const { rows } = await pool.query(
+    `INSERT INTO commission_payments (id, shop_id, amount, paid_date, mode, note, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+     RETURNING id, shop_id AS "shopId", amount, paid_date AS "paidDate", mode, note,
+               created_at AS "createdAt", updated_at AS "updatedAt"`,
+    [id, shopId, amount, paidDate, mode, note || null]
+  );
+  return rows[0];
+}
+
+async function updateCommissionPayment(id, { amount, paidDate, mode, note }) {
+  const { rows } = await pool.query(
+    `UPDATE commission_payments
+     SET amount = $1, paid_date = $2, mode = $3, note = $4, updated_at = NOW()
+     WHERE id = $5
+     RETURNING id, shop_id AS "shopId", amount, paid_date AS "paidDate", mode, note,
+               created_at AS "createdAt", updated_at AS "updatedAt"`,
+    [amount, paidDate, mode, note || null, id]
+  );
+  return rows[0] || null;
+}
+
+async function deleteCommissionPayment(id) {
+  const { rowCount } = await pool.query('DELETE FROM commission_payments WHERE id = $1', [id]);
+  return rowCount > 0;
+}
+
 module.exports = {
   toCashOnlineTotals,
   CONFIRMED_STATUS_SQL,
@@ -94,4 +177,11 @@ module.exports = {
   createSettlement,
   updateSettlement,
   deleteSettlement,
+  getShopCommissionAccrued,
+  listCommissionPayments,
+  getCommissionPaidTotal,
+  getCommissionOwed,
+  createCommissionPayment,
+  updateCommissionPayment,
+  deleteCommissionPayment,
 };

@@ -25,7 +25,11 @@ const SHOP_SETTABLE_STATUSES = ['printing', 'ready', 'collected'];
 router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
+    const { rows } = await pool.query(
+      `SELECT pj.*, s.razorpay_key_id AS shop_razorpay_key_id, s.razorpay_key_secret AS shop_razorpay_key_secret
+       FROM print_jobs pj JOIN shops s ON s.id = pj.shop_id WHERE pj.id = $1`,
+      [jobId]
+    );
     const job = rows[0];
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
@@ -40,7 +44,17 @@ router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
     const baseAmount = job.amount_due;
     const { serviceFee, gatewayFee, totalAmount } = computeFeeBreakdown(baseAmount, fees);
 
-    const razorpay = getClient();
+    // Use the shop's own Razorpay account if they've configured one - the
+    // whole order (print cost + fees) then lands directly with them,
+    // instead of the platform's pooled account. accountKeyId is stamped
+    // onto the job below so verify (and later, commission accounting)
+    // know exactly which account was actually used for THIS payment, even
+    // if the shop changes their keys afterward.
+    const usingShopAccount = Boolean(job.shop_razorpay_key_id && job.shop_razorpay_key_secret);
+    const razorpay = getClient(
+      usingShopAccount ? { keyId: job.shop_razorpay_key_id, keySecret: job.shop_razorpay_key_secret } : {}
+    );
+    const accountKeyId = usingShopAccount ? job.shop_razorpay_key_id : RAZORPAY_KEY_ID;
     const order = await razorpay.orders.create({
       amount: totalAmount * 100,
       currency: 'INR',
@@ -50,16 +64,17 @@ router.post('/:jobId/razorpay/create-order', async (req, res, next) => {
 
     await pool.query(
       `UPDATE print_jobs
-       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3, updated_at = NOW()
-       WHERE id = $4`,
-      [order.id, serviceFee, gatewayFee, jobId]
+       SET razorpay_order_id = $1, service_fee = $2, gateway_fee = $3,
+           razorpay_account_key_id = $4, updated_at = NOW()
+       WHERE id = $5`,
+      [order.id, serviceFee, gatewayFee, accountKeyId, jobId]
     );
 
     return res.status(200).json({
       orderId: order.id,
       amount: order.amount,
       currency: order.currency,
-      keyId: RAZORPAY_KEY_ID,
+      keyId: accountKeyId,
       jobId,
       baseAmount,
       serviceFee,
@@ -89,19 +104,33 @@ router.post('/:jobId/razorpay/verify', async (req, res, next) => {
       });
     }
 
+    const { rows } = await pool.query(
+      `SELECT pj.*, s.razorpay_key_id AS shop_razorpay_key_id, s.razorpay_key_secret AS shop_razorpay_key_secret
+       FROM print_jobs pj JOIN shops s ON s.id = pj.shop_id WHERE pj.id = $1`,
+      [jobId]
+    );
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Verify with whichever account's secret actually created this order -
+    // the shop's own, if that's what razorpay_account_key_id (stamped at
+    // create-order) says was used AND still matches their current key
+    // (guards against a shop clearing/rotating keys mid-payment); the
+    // platform's own secret otherwise.
+    const usingShopAccount =
+      job.razorpay_account_key_id &&
+      job.razorpay_account_key_id === job.shop_razorpay_key_id &&
+      Boolean(job.shop_razorpay_key_secret);
     const valid = verifyPaymentSignature({
       orderId: razorpayOrderId,
       paymentId: razorpayPaymentId,
       signature: razorpaySignature,
+      keySecret: usingShopAccount ? job.shop_razorpay_key_secret : undefined,
     });
     if (!valid) {
       return res.status(400).json({ error: 'Payment could not be verified' });
-    }
-
-    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
-    const job = rows[0];
-    if (!job) {
-      return res.status(404).json({ error: 'Job not found' });
     }
 
     // Idempotent: a retried/duplicate verify call for a job already queued
