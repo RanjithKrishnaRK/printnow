@@ -208,6 +208,44 @@ function loadRazorpayScript() {
   return razorpayScriptPromise;
 }
 
+// Opens Razorpay Checkout's popup and resolves once the student finishes
+// with it - used by both ReviewPaymentStep (first payment attempt) and
+// StatusStep (retrying after a failed/abandoned one), which is why this
+// lives at module scope instead of inside either component. Razorpay
+// Checkout is callback-based (the `handler` option), so this wraps it in a
+// Promise to match the async/await style everything else here uses.
+// Resolves `null` (not a rejection) if the student just closes the popup -
+// callers treat that the same as Cashfree's "modal dismissed" case: back
+// to a normal, retryable state, no alarming error banner.
+function openRazorpayCheckout(order) {
+  return new Promise((resolve, reject) => {
+    const rzp = new window.Razorpay({
+      key: order.keyId,
+      amount: order.amount,
+      currency: order.currency,
+      name: "PrintNow",
+      description: "Print job payment",
+      order_id: order.orderId,
+      handler(response) {
+        resolve({
+          razorpayOrderId: response.razorpay_order_id,
+          razorpayPaymentId: response.razorpay_payment_id,
+          razorpaySignature: response.razorpay_signature,
+        });
+      },
+      modal: {
+        ondismiss() {
+          resolve(null);
+        },
+      },
+    });
+    rzp.on("payment.failed", (response) => {
+      reject(new Error(response?.error?.description || "Payment failed"));
+    });
+    rzp.open();
+  });
+}
+
 // Same lazy-load reasoning as Razorpay's loader above. window.Cashfree is a
 // factory function (not a constructor you check for existence the same
 // way), so this checks the script tag itself rather than a global object.
@@ -549,6 +587,13 @@ const mockApi = {
     await delay(150);
     return { docxConversionEnabled: true, imageConversionEnabled: true };
   },
+  // Mock mode has no admin panel to flip this - defaults to razorpay,
+  // matching the platform's real default while the Cashfree merchant
+  // account is still pending activation.
+  async getActiveGateway() {
+    await delay(100);
+    return { activeGateway: "razorpay" };
+  },
   async getJob(jobId) {
     await delay(350);
     const job = mockDb.get(jobId);
@@ -870,6 +915,19 @@ const realApi = {
       throw new Error(body.error || "Could not load upload settings");
     }
     return res.json(); // { docxConversionEnabled, imageConversionEnabled }
+  },
+  // Public, no auth - admin-editable (see admin panel's Settings tab).
+  // Which gateway the checkout screen should actually run right now -
+  // read once alongside fees, before the "Pay online" button is even
+  // rendered, so handlePayOnline/handleRetryOnline know which flow to
+  // start without an extra round trip mid-payment.
+  async getActiveGateway() {
+    const res = await fetch(`${API_BASE_URL}/api/settings/active-gateway`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || "Could not load payment gateway settings");
+    }
+    return res.json(); // { activeGateway: "razorpay" | "cashfree" }
   },
   async getJob(jobId) {
     const res = await fetch(`${API_BASE_URL}/api/jobs/${jobId}`);
@@ -2014,6 +2072,11 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
     gatewayFeeTier1Flat: 1,
     gatewayFeeTier2Flat: 1.5,
   });
+  // Defaults to razorpay (not cashfree) if this read fails - matches the
+  // platform's actual default while Cashfree's merchant account is
+  // pending, and Razorpay is the flow every shop can already use without
+  // any extra setup, so it's the safer thing to fall back to.
+  const [activeGateway, setActiveGateway] = useState("razorpay");
   const documents = order?.documents || [];
 
   // Fee settings are public and admin-editable (see admin panel's Settings
@@ -2034,6 +2097,25 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
         // this silently defaulting to "no fee" was hard to tell apart from
         // "fees are genuinely off" without this.
         if (!cancelled) console.error('Could not load payment fee settings:', e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Which gateway "Pay online" should actually run - admin-controlled (see
+  // admin panel's Settings tab). Same silent-fallback reasoning as fees
+  // above: a settings-read hiccup shouldn't block checkout, it just means
+  // this student gets whatever the default above says instead.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getActiveGateway()
+      .then((g) => {
+        if (!cancelled) setActiveGateway(g.activeGateway);
+      })
+      .catch((e) => {
+        if (!cancelled) console.error('Could not load active payment gateway:', e);
       });
     return () => {
       cancelled = true;
@@ -2100,7 +2182,7 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
   // confirmation happens on the "status" screen after this, not here -
   // see StatusStep's cashfreeOrderIdToVerify handling for the redirect
   // case, and the .then() below for the modal-completes-in-place case.
-  async function handlePayOnline() {
+  async function handlePayOnlineCashfree() {
     setError(null);
     setSubmitting(true);
     try {
@@ -2140,6 +2222,47 @@ function ReviewPaymentStep({ kind, orderId, amountDue, order, shopId, isNearShop
       setError(e.message || "Could not start online payment. Please try again.");
       setSubmitting(false);
     }
+  }
+
+  // Online payment via Razorpay Checkout's popup - the live gateway while
+  // Cashfree's merchant account is pending activation (see admin panel's
+  // Settings tab for the toggle). createRazorpayOrder returns the shop's
+  // own key_id if they've connected their own Razorpay account (see Module
+  // 2's RazorpaySettings.jsx), or the platform's otherwise - either way
+  // this code doesn't need to know which, it just opens Checkout with
+  // whatever keyId comes back (see openRazorpayCheckout, module scope).
+  async function handlePayOnlineRazorpay() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await loadRazorpayScript();
+      const order = await api.createRazorpayOrder(kind, orderId);
+      const result = await openRazorpayCheckout(order);
+
+      if (!result) {
+        // Student dismissed the popup - see openRazorpayCheckout's ondismiss.
+        setSubmitting(false);
+        return;
+      }
+
+      try {
+        await api.verifyRazorpayPayment(kind, orderId, result);
+        onSubmitted();
+      } catch (e) {
+        setError(
+          e.message ||
+            "Payment went through but we couldn't verify it. Please show the shop your payment confirmation."
+        );
+        setSubmitting(false);
+      }
+    } catch (e) {
+      setError(e.message || "Could not start online payment. Please try again.");
+      setSubmitting(false);
+    }
+  }
+
+  function handlePayOnline() {
+    return activeGateway === "cashfree" ? handlePayOnlineCashfree() : handlePayOnlineRazorpay();
   }
 
   const orderSummaryCard = (
@@ -2289,6 +2412,26 @@ function StatusStep({ kind, orderId, shopId, cashfreeOrderIdToVerify, onBack, on
   const [confirmingPayment, setConfirmingPayment] = useState(!!cashfreeOrderIdToVerify);
   const isBatch = kind === "batch";
 
+  // Same reasoning as ReviewPaymentStep's identical effect - which gateway
+  // a retry should use is admin-controlled and can change between the
+  // original attempt and a retry, so this is read fresh here rather than
+  // passed down from wherever the student came from.
+  const [activeGateway, setActiveGateway] = useState("razorpay");
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getActiveGateway()
+      .then((g) => {
+        if (!cancelled) setActiveGateway(g.activeGateway);
+      })
+      .catch((e) => {
+        if (!cancelled) console.error('Could not load active payment gateway:', e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Only reached when Cashfree's checkout redirected the whole page back
   // here (see the App component's initialCashfreeOrderId) instead of
   // completing inside ReviewPaymentStep's in-page modal - runs once, before
@@ -2317,7 +2460,7 @@ function StatusStep({ kind, orderId, shopId, cashfreeOrderIdToVerify, onBack, on
   // that didn't complete are all cases where that state was never
   // populated. job.amountDue (from the status fetch this component
   // already does) is all that's actually needed to open checkout again.
-  async function handleRetryOnline() {
+  async function handleRetryOnlineCashfree() {
     setError(null);
     setRetrying(true);
     try {
@@ -2341,6 +2484,27 @@ function StatusStep({ kind, orderId, shopId, cashfreeOrderIdToVerify, onBack, on
     } finally {
       setRetrying(false);
     }
+  }
+
+  async function handleRetryOnlineRazorpay() {
+    setError(null);
+    setRetrying(true);
+    try {
+      await loadRazorpayScript();
+      const order = await api.createRazorpayOrder(kind, orderId);
+      const result = await openRazorpayCheckout(order);
+      if (!result) return; // student dismissed the popup - see openRazorpayCheckout
+      await api.verifyRazorpayPayment(kind, orderId, result);
+      await fetchStatus();
+    } catch (e) {
+      setError(e.message || "Could not start online payment. Please try again.");
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  function handleRetryOnline() {
+    return activeGateway === "cashfree" ? handleRetryOnlineCashfree() : handleRetryOnlineRazorpay();
   }
 
   // Optional review, offered once the order is past payment review (queued
