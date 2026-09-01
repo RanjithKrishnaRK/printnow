@@ -159,9 +159,16 @@ async function composeImagesToPdf(images, perSheet, baseFileName) {
     for (let s = 0; s < sheetImages.length; s++) {
       const im = sheetImages[s];
       const bytes = await (await fetch(im.dataUrl)).arrayBuffer();
-      // The crop step above always outputs PNG, so this can embed
-      // unconditionally - no need to branch on the original file's type.
-      const embedded = await pdfDoc.embedPng(bytes);
+      // Only a CROPPED image's dataUrl is guaranteed PNG (cropImageToDataUrl
+      // always re-encodes to PNG) - an image the student never cropped
+      // still carries its original file's data URL, JPEG or PNG depending
+      // on what they uploaded. Branch on the actual mime type in the data
+      // URL itself rather than assuming - embedPng() on JPEG bytes (or vice
+      // versa) throws, which is exactly the bug that made this fail for
+      // any sheet containing an uncropped JPEG.
+      const embedded = im.dataUrl.startsWith("data:image/png")
+        ? await pdfDoc.embedPng(bytes)
+        : await pdfDoc.embedJpg(bytes);
 
       const col = s % layout.cols;
       const row = Math.floor(s / layout.cols);
