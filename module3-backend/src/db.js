@@ -622,6 +622,60 @@ async function migrate() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS commission_payments_shop_id_idx ON commission_payments (shop_id);
   `);
+
+  // Migration: shop-owner mobile app - push notifications + auto-print
+  // paper-removal confirmation.
+  //
+  // shop_push_tokens: one row per device the shop owner's app has
+  // registered push for (a shop can have more than one device/install).
+  // UNIQUE on token (not on (shop_id, token)) - a token belongs to exactly
+  // one device, so if that device gets logged into a different shop
+  // account, the upsert in POST /api/shops/:shopId/push-tokens reassigns
+  // the existing row's shop_id rather than leaving a stale duplicate
+  // pointed at the old shop.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_push_tokens (
+      id         TEXT PRIMARY KEY,
+      shop_id    TEXT NOT NULL REFERENCES shops(id),
+      token      TEXT NOT NULL UNIQUE,
+      platform   TEXT NOT NULL CHECK (platform IN ('ios','android')),
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS shop_push_tokens_shop_id_idx ON shop_push_tokens (shop_id);
+  `);
+
+  // 'printed_pending_removal': sits between 'printing' and 'ready',
+  // reachable ONLY when the print agent (module6, auto-print) finishes the
+  // physical print - see routes/jobs.js's PATCH .../status (which the
+  // agent calls to enter this status) and its new
+  // POST .../confirm-removed (the only way OUT of it, back to 'ready') for
+  // the actual state-machine logic. A manually-run shop (auto-print off)
+  // is unaffected - printing -> ready directly still works exactly as
+  // before. batches.status gets the same allowed value for schema
+  // consistency, though nothing currently sets a batch row to it directly
+  // - the print agent and confirm-removed both operate on individual
+  // print_jobs rows (see module6-print-agent's getQueuedJobs), same as
+  // every other status transition already does; batches.status has never
+  // rolled up from its jobs' statuses in this codebase (it's set once, to
+  // 'queued', at payment time, and nothing updates it after) - not a gap
+  // introduced or fixed here, just not made worse.
+  await pool.query(`
+    ALTER TABLE print_jobs DROP CONSTRAINT IF EXISTS print_jobs_status_check;
+  `);
+  await pool.query(`
+    ALTER TABLE print_jobs ADD CONSTRAINT print_jobs_status_check
+      CHECK (status IN ('uploaded','payment_pending','queued','printing','printed_pending_removal','ready','collected'));
+  `);
+  await pool.query(`
+    ALTER TABLE batches DROP CONSTRAINT IF EXISTS batches_status_check;
+  `);
+  await pool.query(`
+    ALTER TABLE batches ADD CONSTRAINT batches_status_check
+      CHECK (status IN ('uploaded','payment_pending','queued','printing','printed_pending_removal','ready','collected'));
+  `);
 }
 
 module.exports = { pool, migrate };

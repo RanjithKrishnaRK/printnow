@@ -11,10 +11,11 @@ const { getClient, verifyPaymentSignature } = require('../razorpay');
 const { createOrder: createCashfreeOrder, getOrder: getCashfreeOrder, createOrderSplit } = require('../cashfree');
 const { getPaymentFees, computeFeeBreakdown } = require('../settings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
+const { sendPushToShop } = require('../push');
 
 const router = express.Router();
 
-const SHOP_SETTABLE_STATUSES = ['printing', 'ready', 'collected'];
+const SHOP_SETTABLE_STATUSES = ['printing', 'printed_pending_removal', 'ready', 'collected'];
 
 // POST /api/jobs/:jobId/razorpay/create-order
 // Public. -> { orderId, amount, currency, keyId, jobId }
@@ -158,6 +159,17 @@ router.post('/:jobId/razorpay/verify', async (req, res, next) => {
       [tokenNumber, razorpayOrderId, razorpayPaymentId, jobId]
     );
 
+    // Fire-and-forget: a push failure shouldn't fail the payment
+    // verification the student is waiting on, so this isn't awaited into
+    // the response - it's logged and dropped on error instead. Same
+    // pattern at every other "job reaches queued" site below and in
+    // batches.js, and again where a job reaches printed_pending_removal.
+    sendPushToShop(job.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — ${job.pages} page${job.pages === 1 ? '' : 's'}`,
+      data: { jobId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${job.shop_id}:`, err.message));
+
     return res.status(200).json({ jobId, status: 'queued', tokenNumber });
   } catch (err) {
     next(err);
@@ -295,6 +307,12 @@ router.post('/:jobId/cashfree/verify', async (req, res, next) => {
       [tokenNumber, jobId]
     );
 
+    sendPushToShop(job.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — ${job.pages} page${job.pages === 1 ? '' : 's'}`,
+      data: { jobId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${job.shop_id}:`, err.message));
+
     return res.status(200).json({ jobId, status: 'queued', tokenNumber });
   } catch (err) {
     next(err);
@@ -379,6 +397,16 @@ router.post('/:jobId/confirm-payment', requireShopAuth, async (req, res, next) =
       `UPDATE print_jobs SET status = 'queued', token_number = $1, updated_at = NOW() WHERE id = $2`,
       [tokenNumber, jobId]
     );
+
+    // Less critical here than the gateway-verify sites above (the shop
+    // owner is the one who just tapped "confirm", so they already know) -
+    // sent anyway for consistency, and because a batch document's siblings
+    // might be seen by a different device/person than whoever tapped confirm.
+    sendPushToShop(job.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — ${job.pages} page${job.pages === 1 ? '' : 's'}`,
+      data: { jobId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${job.shop_id}:`, err.message));
 
     return res.status(200).json({ jobId, status: 'queued', tokenNumber });
   } catch (err) {
@@ -481,7 +509,18 @@ router.patch('/:jobId/status', requireShopAuth, async (req, res, next) => {
 
     const allowedTransitions = {
       queued: ['printing'],
-      printing: ['ready'],
+      // A manually-run shop (auto-print off, someone tapped "printing" then
+      // will tap "ready" themselves) can still go straight to 'ready'. The
+      // print agent, on an auto-print job, sends 'printed_pending_removal'
+      // instead - see module6-print-agent's markPrinting-equivalent call
+      // after a successful physical print. Either way, this same endpoint
+      // handles the queued -> printing -> (either) transition; only the
+      // printed_pending_removal -> ready step is deliberately NOT listed
+      // here (see POST /:jobId/confirm-removed below) - a human confirming
+      // "I've actually taken the paper off the tray" is a distinct action
+      // from the print agent reporting "the printer finished", not just
+      // another status value to PATCH.
+      printing: ['ready', 'printed_pending_removal'],
       ready: ['collected'],
     };
 
@@ -540,6 +579,17 @@ router.patch('/:jobId/status', requireShopAuth, async (req, res, next) => {
       [newStatus, jobId]
     );
 
+    if (newStatus === 'printed_pending_removal') {
+      // Fire-and-forget from the response's perspective (see the pattern
+      // note on the queued-transition sites above) - a push failure
+      // shouldn't fail the status update the print agent is waiting on.
+      sendPushToShop(job.shop_id, {
+        title: 'Printed — remove from tray',
+        body: `Token #${job.token_number || jobId} is ready to hand over`,
+        data: { jobId, type: 'printed_pending_removal' },
+      }).catch((err) => console.error(`[push] Could not notify shop ${job.shop_id}:`, err.message));
+    }
+
     if (newStatus === 'ready') {
       notifyStudent(
         job.student_phone,
@@ -566,6 +616,50 @@ router.patch('/:jobId/status', requireShopAuth, async (req, res, next) => {
     }
 
     return res.status(200).json({ jobId, status: newStatus });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/jobs/:jobId/confirm-removed
+// Shop-owner-only (JWT required). -> the updated job row
+// The other half of the printed_pending_removal state (see PATCH
+// .../status above and db.js's migration comment) - a human confirming
+// "I've actually taken this off the printer tray", not just another
+// status value the generic status endpoint accepts. Deliberately its own
+// endpoint rather than folded into PATCH .../status's allowedTransitions,
+// so the mobile app's push-notification action button has one obvious,
+// unambiguous call to make, and so this transition can never be triggered
+// by anything other than that explicit confirmation.
+router.post('/:jobId/confirm-removed', requireShopAuth, async (req, res, next) => {
+  try {
+    const { jobId } = req.params;
+    const { rows } = await pool.query('SELECT * FROM print_jobs WHERE id = $1', [jobId]);
+    const job = rows[0];
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (job.shop_id !== req.shopId) {
+      return res.status(403).json({ error: 'This job does not belong to your shop' });
+    }
+    if (job.status !== 'printed_pending_removal') {
+      return res.status(409).json({
+        error: `Cannot confirm removal for a job in status "${job.status}" (expected "printed_pending_removal")`,
+      });
+    }
+
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE print_jobs SET status = 'ready', updated_at = NOW() WHERE id = $1
+       RETURNING id AS "jobId", status, token_number AS "tokenNumber"`,
+      [jobId]
+    );
+
+    notifyStudent(
+      job.student_phone,
+      `Your print job (token ${job.token_number}) is ready for pickup!`
+    );
+
+    return res.status(200).json(updatedRows[0]);
   } catch (err) {
     next(err);
   }

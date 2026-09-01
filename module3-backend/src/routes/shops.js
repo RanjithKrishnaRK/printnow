@@ -791,6 +791,63 @@ router.post('/:shopId/vendor', requireShopAuth, requireOwnShop, async (req, res,
 // POST /api/shops/:shopId/change-password
 // Shop-owner-only (JWT required, must match :shopId).
 // body: { currentPassword?, newPassword } -> { ok: true }
+// POST /api/shops/:shopId/push-tokens
+// Shop-owner-only. body: { token, platform: "ios" | "android" } -> the row
+// Registers (or re-registers) this device for push notifications - new job
+// queued, or auto-print finished and waiting for the paper to be taken off
+// the tray (see push.js and PATCH .../status / POST .../confirm-removed
+// below). Upserts on `token`, not on (shopId, token): a token identifies
+// one physical device/install, so if that device logs into a different
+// shop account later, this reassigns the existing row to the new shop
+// rather than leaving a stale row still pointed at the old one.
+router.post('/:shopId/push-tokens', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { token, platform } = req.body || {};
+
+    if (typeof token !== 'string' || token.trim().length === 0) {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    if (platform !== 'ios' && platform !== 'android') {
+      return res.status(400).json({ error: "platform must be 'ios' or 'android'" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO shop_push_tokens (id, shop_id, token, platform, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       ON CONFLICT (token) DO UPDATE
+         SET shop_id = $2, platform = $4, updated_at = NOW()
+       RETURNING id, shop_id AS "shopId", token, platform, created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [randomUUID(), shopId, token.trim(), platform]
+    );
+
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/shops/:shopId/push-tokens/:token
+// Shop-owner-only. Unregisters one device - call this on logout so a
+// signed-out device stops receiving this shop's push notifications.
+// Scoped to :shopId (via requireOwnShop) so a shop can only delete its own
+// tokens, even though `token` alone is already globally unique.
+router.delete('/:shopId/push-tokens/:token', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId, token } = req.params;
+    const { rowCount } = await pool.query(
+      'DELETE FROM shop_push_tokens WHERE shop_id = $1 AND token = $2',
+      [shopId, token]
+    );
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Push token not found for this shop' });
+    }
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // currentPassword is required UNLESS this session started by logging in
 // with an admin-issued temporary password (req.viaTempPassword, set by
 // requireShopAuth from the token - see auth.js signShopToken) - someone

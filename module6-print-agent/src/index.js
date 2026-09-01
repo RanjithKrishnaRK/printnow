@@ -254,6 +254,34 @@ async function markPrinting(jobId) {
   }
 }
 
+// Called once the physical print has actually finished successfully.
+// 'printed_pending_removal' - not 'ready' - because auto-print means
+// nobody's necessarily standing at the printer watching it happen; the
+// shop owner's phone gets a push notification (see routes/jobs.js's PATCH
+// .../status handler and push.js) asking them to confirm they've taken
+// the printout off the tray before this job shows as ready for pickup. A
+// failure here is logged but deliberately doesn't throw - the physical
+// print already succeeded and the job already reached the printer, so
+// leaving it stuck on "printing" over a network hiccup updating status
+// would be worse than a shop owner just not getting the reminder push for
+// this one job (they'll still see it sitting in "printing" on the
+// dashboard and can move it along manually).
+async function markPrintedPendingRemoval(jobId) {
+  const res = await authedFetch(`${API_BASE_URL}/api/jobs/${jobId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'printed_pending_removal' }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    log(
+      `⚠ Job ${jobId} printed successfully but could not be marked "printed_pending_removal" ` +
+        `(${body.error || res.status}) - the shop owner won't get a paper-removal push for this ` +
+        `job, but it printed fine and still shows "printing" on the dashboard.`
+    );
+  }
+}
+
 // Handles one job end to end: download -> claim a printing slot -> print.
 // The slot is claimed (marked "printing" server-side) BEFORE the physical
 // print now, specifically so the hourly page-cap check in routes/jobs.js
@@ -278,7 +306,8 @@ async function processJob(job) {
     } else {
       await printFile(localPath, job);
     }
-    log(`Done: job ${job.jobId}`);
+    log(`Done: job ${job.jobId} - notifying the shop app to remove it from the tray...`);
+    await markPrintedPendingRemoval(job.jobId);
   } catch (err) {
     if (err.hourlyCapReached) {
       // Routine, not a fault: job stays "queued" and will be retried

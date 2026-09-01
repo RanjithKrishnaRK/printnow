@@ -98,4 +98,15 @@ module.exports = {
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean),
+
+  // Firebase Cloud Messaging - push notifications to the shop-owner mobile
+  // app (new job queued, auto-print finished and waiting for the paper to
+  // be removed). The whole JSON service-account key file (Firebase console
+  // -> Project settings -> Service accounts -> Generate new private key),
+  // as a single-line string, in an env var - never committed to the repo.
+  // No fallback, same reasoning as the Razorpay keys above: push.js checks
+  // this at call time and no-ops (logs, doesn't throw) rather than crash
+  // any request that happens to trigger a notification, in an environment
+  // where this hasn't been set up yet.
+  FCM_SERVICE_ACCOUNT_JSON: process.env.FCM_SERVICE_ACCOUNT_JSON || null,
 };

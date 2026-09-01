@@ -8,6 +8,7 @@ const { getClient, verifyPaymentSignature } = require('../razorpay');
 const { createOrder: createCashfreeOrder, getOrder: getCashfreeOrder, createOrderSplit } = require('../cashfree');
 const { getPaymentFees, computeFeeBreakdown } = require('../settings');
 const { isValidUploadedFileUrl } = require('../uploadUrl');
+const { sendPushToShop } = require('../push');
 
 const router = express.Router();
 
@@ -142,6 +143,12 @@ router.post('/:batchId/razorpay/verify', async (req, res, next) => {
       [tokenNumber, batchId]
     );
 
+    sendPushToShop(batch.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — multi-document order`,
+      data: { batchId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${batch.shop_id}:`, err.message));
+
     return res.status(200).json({ batchId, status: 'queued', tokenNumber });
   } catch (err) {
     next(err);
@@ -272,6 +279,12 @@ router.post('/:batchId/cashfree/verify', async (req, res, next) => {
       [tokenNumber, batchId]
     );
 
+    sendPushToShop(batch.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — multi-document order`,
+      data: { batchId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${batch.shop_id}:`, err.message));
+
     return res.status(200).json({ batchId, status: 'queued', tokenNumber });
   } catch (err) {
     next(err);
@@ -363,6 +376,12 @@ router.post('/:batchId/confirm-payment', requireShopAuth, async (req, res, next)
       `UPDATE print_jobs SET status = 'queued', token_number = $1, updated_at = NOW() WHERE batch_id = $2`,
       [tokenNumber, batchId]
     );
+
+    sendPushToShop(batch.shop_id, {
+      title: 'New print job',
+      body: `Token #${tokenNumber} — multi-document order`,
+      data: { batchId, type: 'new_job' },
+    }).catch((err) => console.error(`[push] Could not notify shop ${batch.shop_id}:`, err.message));
 
     return res.status(200).json({ batchId, status: 'queued', tokenNumber });
   } catch (err) {
