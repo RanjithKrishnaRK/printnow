@@ -144,17 +144,19 @@ async function cropImageToDataUrl(originalDataUrl, crop) {
 // stretched to match. Returns a File (ready to slot into the normal
 // document pipeline) plus a thumbnail of the first sheet for the document
 // card, and the sheet count (this composed document's "page count").
-async function composeImagesToPdf(images, perSheet, baseFileName) {
+async function composeImagesToPdf(images, perSheet, baseFileName, orientation = "portrait") {
   const layout = LAYOUT_OPTIONS.find((l) => l.value === perSheet) || LAYOUT_OPTIONS[0];
+  const sheetW = orientation === "landscape" ? A4_HEIGHT_PT : A4_WIDTH_PT;
+  const sheetH = orientation === "landscape" ? A4_WIDTH_PT : A4_HEIGHT_PT;
   const pdfDoc = await PDFDocument.create();
-  const cellW = (A4_WIDTH_PT - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.cols - 1)) / layout.cols;
-  const cellH = (A4_HEIGHT_PT - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.rows - 1)) / layout.rows;
+  const cellW = (sheetW - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.cols - 1)) / layout.cols;
+  const cellH = (sheetH - SHEET_MARGIN_PT * 2 - CELL_GAP_PT * (layout.rows - 1)) / layout.rows;
 
   let firstSheetThumbnail = null;
 
   for (let i = 0; i < images.length; i += layout.value) {
     const sheetImages = images.slice(i, i + layout.value);
-    const page = pdfDoc.addPage([A4_WIDTH_PT, A4_HEIGHT_PT]);
+    const page = pdfDoc.addPage([sheetW, sheetH]);
 
     for (let s = 0; s < sheetImages.length; s++) {
       const im = sheetImages[s];
@@ -187,9 +189,9 @@ async function composeImagesToPdf(images, perSheet, baseFileName) {
 
     if (firstSheetThumbnail === null) {
       const thumbCanvas = document.createElement("canvas");
-      const thumbScale = 320 / A4_WIDTH_PT;
+      const thumbScale = 320 / sheetW;
       thumbCanvas.width = 320;
-      thumbCanvas.height = A4_HEIGHT_PT * thumbScale;
+      thumbCanvas.height = sheetH * thumbScale;
       const ctx = thumbCanvas.getContext("2d");
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
@@ -290,11 +292,11 @@ function CropBox({ crop, onChange, containerRef }) {
   }
 
   const handleStyle =
-    "absolute h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-[#2F6E68] shadow touch-none";
+    "absolute h-7 w-7 -translate-x-1/2 -translate-y-1/2 rounded-full border-[3px] border-white bg-[#2F6E68] shadow-lg touch-none";
 
   return (
     <div
-      className="absolute border-2 border-[#2F6E68]/90 bg-[#2F6E68]/10 touch-none cursor-move"
+      className="absolute border-2 border-[#2F6E68] shadow-[0_0_0_9999px_rgba(0,0,0,0.55)] touch-none cursor-move"
       style={{
         left: `${crop.x * 100}%`,
         top: `${crop.y * 100}%`,
@@ -332,16 +334,16 @@ function PhotoCropScreen({ image, onCancel, onSave }) {
 
   return (
     <div className="fixed inset-0 z-[70] flex flex-col bg-black">
-      <div className="flex items-center justify-between px-4 py-3">
-        <button type="button" onClick={onCancel} className="text-sm font-medium text-white/80">
+      <div className="flex items-center justify-between px-4 py-3.5">
+        <button type="button" onClick={onCancel} className="text-base font-medium text-white/90">
           Cancel
         </button>
-        <p className="text-sm font-medium text-white">Crop photo</p>
+        <p className="text-base font-semibold text-white">Crop photo</p>
         <button
           type="button"
           onClick={handleSave}
           disabled={saving}
-          className="text-sm font-semibold text-white disabled:opacity-50"
+          className="text-base font-semibold text-[#7FD6C9] disabled:opacity-50"
         >
           {saving ? "Saving…" : "Use this crop"}
         </button>
@@ -357,7 +359,7 @@ function PhotoCropScreen({ image, onCancel, onSave }) {
           <CropBox crop={crop} onChange={setCrop} containerRef={containerRef} />
         </div>
       </div>
-      <p className="px-4 pb-4 text-center text-xs text-white/60">
+      <p className="px-4 pb-5 text-center text-sm font-medium text-white/80">
         Drag the dots to resize, or drag inside the box to move it.
       </p>
     </div>
@@ -375,6 +377,13 @@ function PhotoCropScreen({ image, onCancel, onSave }) {
 function ImageEditorModal({ session, onCancel, onApply }) {
   const [images, setImages] = useState(session.images);
   const [perSheet, setPerSheet] = useState(session.perSheet || 4);
+  // "portrait" | "landscape" - which way the printed sheet itself is
+  // oriented (an A4 page turned sideways or not), independent of perSheet's
+  // grid shape - a 4-per-sheet grid looks meaningfully different (and
+  // suits different photos - e.g. a set of wide landscape photos) laid out
+  // on a landscape sheet vs a portrait one, so this is its own choice
+  // rather than baked into the LAYOUT_OPTIONS presets.
+  const [orientation, setOrientation] = useState(session.orientation || "portrait");
   const [croppingId, setCroppingId] = useState(null);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState(null);
@@ -432,8 +441,8 @@ function ImageEditorModal({ session, onCancel, onApply }) {
     try {
       const baseFileName =
         images.length === 1 ? images[0].fileName.replace(/\.[^.]+$/, "") + ".pdf" : `photos_${images.length}.pdf`;
-      const { file, thumbnailUrl, sheetCount } = await composeImagesToPdf(images, perSheet, baseFileName);
-      onApply({ file, thumbnailUrl, sheetCount, images, perSheet });
+      const { file, thumbnailUrl, sheetCount } = await composeImagesToPdf(images, perSheet, baseFileName, orientation);
+      onApply({ file, thumbnailUrl, sheetCount, images, perSheet, orientation });
     } catch (err) {
       setError(err.message || "Could not create the print layout. Please try again.");
       setApplying(false);
@@ -457,16 +466,16 @@ function ImageEditorModal({ session, onCancel, onApply }) {
   return (
     <div className="fixed inset-0 z-[70] flex flex-col bg-black/60 backdrop-blur-sm">
       <div className="mt-auto flex max-h-[92vh] flex-col rounded-t-2xl bg-stone-50">
-        <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
-          <button type="button" onClick={onCancel} className="text-sm font-medium text-stone-500">
+        <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3.5">
+          <button type="button" onClick={onCancel} className="text-base font-medium text-stone-600">
             Cancel
           </button>
-          <p className="text-sm font-semibold text-stone-900">Edit photos</p>
+          <p className="text-base font-semibold text-stone-900">Edit photos</p>
           <button
             type="button"
             onClick={handleApply}
             disabled={applying || images.length === 0}
-            className="text-sm font-semibold text-[#2F6E68] disabled:opacity-40"
+            className="text-base font-semibold text-[#2F6E68] disabled:opacity-40"
           >
             {applying ? "Working…" : "Done"}
           </button>
@@ -474,13 +483,38 @@ function ImageEditorModal({ session, onCancel, onApply }) {
 
         <div className="flex-1 overflow-y-auto px-4 py-4">
           {error && (
-            <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
               {error}
             </div>
           )}
 
           <div className="mb-4">
-            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-stone-500">
+            <p className="mb-1.5 text-sm font-semibold uppercase tracking-wide text-stone-500">
+              Sheet orientation
+            </p>
+            <div className="flex gap-2">
+              {[
+                { value: "portrait", label: "Portrait" },
+                { value: "landscape", label: "Landscape" },
+              ].map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setOrientation(opt.value)}
+                  className={`flex-1 rounded-lg border px-3 py-2 text-sm font-medium ${
+                    orientation === opt.value
+                      ? "border-[#2F6E68] bg-[#2F6E68] text-white"
+                      : "border-stone-300 bg-white text-stone-700"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <p className="mb-1.5 text-sm font-semibold uppercase tracking-wide text-stone-500">
               Photos per sheet
             </p>
             <div className="flex flex-wrap gap-2">
@@ -489,7 +523,7 @@ function ImageEditorModal({ session, onCancel, onApply }) {
                   key={opt.value}
                   type="button"
                   onClick={() => setPerSheet(opt.value)}
-                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                  className={`rounded-lg border px-3 py-2 text-sm font-medium ${
                     perSheet === opt.value
                       ? "border-[#2F6E68] bg-[#2F6E68] text-white"
                       : "border-stone-300 bg-white text-stone-700"
@@ -499,7 +533,7 @@ function ImageEditorModal({ session, onCancel, onApply }) {
                 </button>
               ))}
             </div>
-            <p className="mt-1.5 text-[11px] text-stone-500">
+            <p className="mt-1.5 text-xs font-medium text-stone-500">
               {images.length > 0
                 ? `${images.length} photo${images.length > 1 ? "s" : ""} → ${Math.ceil(
                     images.length / perSheet
@@ -508,27 +542,27 @@ function ImageEditorModal({ session, onCancel, onApply }) {
             </p>
           </div>
 
-          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-stone-500">
+          <p className="mb-1.5 text-sm font-semibold uppercase tracking-wide text-stone-500">
             Photos ({images.length})
           </p>
           <div className="grid grid-cols-3 gap-2.5">
             {images.map((im, i) => (
               <div key={im.id} className="relative overflow-hidden rounded-lg border border-stone-300 bg-white">
                 <img src={im.dataUrl} alt="" className="aspect-square w-full object-cover" />
-                <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-black/60 px-1.5 py-1">
+                <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-black/75 px-1.5 py-1.5">
                   <button
                     type="button"
                     onClick={() => setCroppingId(im.id)}
-                    className="rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+                    className="rounded px-1.5 py-1 text-xs font-semibold text-white"
                   >
                     Crop
                   </button>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-0.5">
                     <button
                       type="button"
                       onClick={() => moveImage(im.id, -1)}
                       disabled={i === 0}
-                      className="rounded px-1 text-[10px] font-medium text-white disabled:opacity-30"
+                      className="flex h-6 w-6 items-center justify-center rounded text-sm font-bold text-white disabled:opacity-30"
                       aria-label="Move earlier"
                     >
                       ←
@@ -537,7 +571,7 @@ function ImageEditorModal({ session, onCancel, onApply }) {
                       type="button"
                       onClick={() => moveImage(im.id, 1)}
                       disabled={i === images.length - 1}
-                      className="rounded px-1 text-[10px] font-medium text-white disabled:opacity-30"
+                      className="flex h-6 w-6 items-center justify-center rounded text-sm font-bold text-white disabled:opacity-30"
                       aria-label="Move later"
                     >
                       →
@@ -547,7 +581,7 @@ function ImageEditorModal({ session, onCancel, onApply }) {
                 <button
                   type="button"
                   onClick={() => removeImage(im.id)}
-                  className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/60 text-[11px] font-bold text-white"
+                  className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full bg-black/75 text-sm font-bold text-white"
                   aria-label="Remove photo"
                 >
                   ×
@@ -1269,7 +1303,7 @@ const realApi = {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || "Could not load this shop's pricing");
     }
-    return res.json(); // { shopId, name, priceBw, priceColor, maxPagesPerHour }
+    return res.json(); // { shopId, name, priceBw, priceColor, maxPagesPerHour, upiId, address, latitude, longitude }
   },
   // Module 3 (src/routes/uploads.js) expects multipart/form-data with a
   // "file" field, not a pre-signed URL flow - this sends the PDF directly.
@@ -1749,12 +1783,13 @@ function makeDefaultDocument() {
     thumbnailUrl: null, // small first-page preview image (data URL) for PDFs
     previewUrl: null, // object URL of the actual file, for the full preview modal
     // Set only for documents built from the photo editor (ImageEditorModal) -
-    // the staged photos (with their crops) and the chosen "per sheet" layout,
-    // kept around so the document's "Edit photos" button can reopen the
-    // editor with everything exactly as it was left. null for anything
-    // that was uploaded as a real PDF or Word doc.
+    // the staged photos (with their crops), chosen "per sheet" layout, and
+    // sheet orientation, kept around so the document's "Edit photos" button
+    // can reopen the editor with everything exactly as it was left. null
+    // for anything that was uploaded as a real PDF or Word doc.
     sourceImages: null,
     layoutPerSheet: null,
+    layoutOrientation: null,
   };
 }
 
@@ -2344,7 +2379,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   // sides/color settings untouched - re-editing photos shouldn't reset
   // print settings the student already chose, only the pages number, which
   // legitimately may have changed if the sheet count changed.
-  function handleImageEditorApply({ file, thumbnailUrl, sheetCount, images, perSheet }) {
+  function handleImageEditorApply({ file, thumbnailUrl, sheetCount, images, perSheet, orientation }) {
     const previewUrl = URL.createObjectURL(file);
     if (imageEditorSession.docId) {
       const oldDoc = documents.find((d) => d.id === imageEditorSession.docId);
@@ -2358,6 +2393,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
         previewUrl,
         sourceImages: images,
         layoutPerSheet: perSheet,
+        layoutOrientation: orientation,
       });
     } else {
       const newDoc = {
@@ -2370,6 +2406,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
         previewUrl,
         sourceImages: images,
         layoutPerSheet: perSheet,
+        layoutOrientation: orientation,
       };
       setOrder((prev) => ({ ...prev, documents: [...prev.documents, newDoc] }));
     }
@@ -2381,6 +2418,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
       docId: doc.id,
       images: doc.sourceImages,
       perSheet: doc.layoutPerSheet || 4,
+      orientation: doc.layoutOrientation || "portrait",
     });
   }
 
@@ -2530,6 +2568,27 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
               This shop prints up to {shopInfo.maxPagesPerHour} pages/hour. If it's busy, your
               order still queues automatically — no need to re-submit.
             </p>
+          )}
+          {/* address/latitude/longitude are all optional (see routes/shops.js
+              GET .../public) - only shown once the shop owner has actually
+              set a location in their own Settings. A directions link only
+              appears once real coordinates exist; the address text alone
+              (no coordinates) still shows on its own since it's useful even
+              without a tappable link. */}
+          {(shopInfo.address || (shopInfo.latitude && shopInfo.longitude)) && (
+            <div className="mt-2 flex items-start justify-between gap-2 border-t border-stone-200 pt-2">
+              {shopInfo.address && <p className="text-stone-600">{shopInfo.address}</p>}
+              {shopInfo.latitude && shopInfo.longitude && (
+                <a
+                  href={`https://www.google.com/maps/search/?api=1&query=${shopInfo.latitude},${shopInfo.longitude}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="shrink-0 font-medium text-[#2F6E68] underline"
+                >
+                  Directions
+                </a>
+              )}
+            </div>
           )}
         </div>
       )}
