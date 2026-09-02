@@ -19,6 +19,10 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
   const [hourlyLimitEnabled, setHourlyLimitEnabled] = useState(false);
   const [maxPagesPerHour, setMaxPagesPerHour] = useState("");
   const [upiId, setUpiId] = useState("");
+  const [address, setAddress] = useState("");
+  const [coords, setCoords] = useState(null); // { latitude, longitude } | null
+  const [locating, setLocating] = useState(false);
+  const [locationError, setLocationError] = useState("");
 
   useEffect(() => {
     getSettings(shopId, token)
@@ -26,6 +30,10 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
         setPriceBw(String(s.priceBw ?? ""));
         setPriceColor(String(s.priceColor ?? ""));
         setUpiId(s.upiId ?? "");
+        setAddress(s.address ?? "");
+        if (s.latitude != null && s.longitude != null) {
+          setCoords({ latitude: s.latitude, longitude: s.longitude });
+        }
         if (s.maxPagesPerHour) {
           setHourlyLimitEnabled(true);
           setMaxPagesPerHour(String(s.maxPagesPerHour));
@@ -34,6 +42,35 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
       .catch((err) => setError(err.message || "Could not load your current settings."))
       .finally(() => setLoading(false));
   }, [shopId, token]);
+
+  // Browser Geolocation, not a maps picker - simplest thing that actually
+  // works without any external maps API key. Only captures coordinates on
+  // an explicit tap (never automatically), and only stages them in local
+  // state - nothing is saved until "Save changes" is submitted, same as
+  // every other field on this form.
+  function handleUseMyLocation() {
+    setLocationError("");
+    if (!navigator.geolocation) {
+      setLocationError("Your browser doesn't support location - you can still enter an address by hand below.");
+      return;
+    }
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setCoords({ latitude: position.coords.latitude, longitude: position.coords.longitude });
+        setLocating(false);
+      },
+      (err) => {
+        setLocationError(
+          err.code === err.PERMISSION_DENIED
+            ? "Location permission was denied - you can still enter an address by hand below."
+            : "Could not get your location. Try again, or enter an address by hand below."
+        );
+        setLocating(false);
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -66,6 +103,9 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
         priceColor: color,
         maxPagesPerHour: cap,
         upiId: trimmedUpi || null,
+        address: address.trim() || null,
+        latitude: coords ? coords.latitude : null,
+        longitude: coords ? coords.longitude : null,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
@@ -142,6 +182,44 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
           placeholder="e.g. shopname@okhdfcbank"
           className="w-full max-w-xs rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
         />
+      </div>
+
+      <div className="mb-2 border-t border-black/5 pt-4">
+        <p className="mb-1 text-xs font-medium uppercase tracking-wide text-collected">
+          Shop location
+        </p>
+        <p className="mb-3 text-xs text-collected">
+          Shown to students once they've picked your shop, with a "Directions" link if you set
+          your location below. Entirely optional.
+        </p>
+        <label htmlFor="address" className="block text-sm font-medium text-ink mb-1">
+          Address
+        </label>
+        <input
+          id="address"
+          type="text"
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          placeholder="e.g. Near Gate 2, opposite the library"
+          className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+        />
+
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={handleUseMyLocation}
+            disabled={locating}
+            className="text-sm font-medium text-teal hover:text-teal-dark disabled:opacity-60"
+          >
+            {locating ? "Getting your location…" : coords ? "Update my current location" : "Use my current location"}
+          </button>
+          {coords && (
+            <span className="text-xs text-collected">
+              📍 Location set ({coords.latitude.toFixed(4)}, {coords.longitude.toFixed(4)})
+            </span>
+          )}
+        </div>
+        {locationError && <p className="mt-1.5 text-xs text-red-600">{locationError}</p>}
       </div>
 
       <div className="mb-2 border-t border-black/5 pt-4">

@@ -186,7 +186,7 @@ async function realGetSettings(shopId, token) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) throw new Error("Could not load settings.");
-  return res.json(); // { name, autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId }
+  return res.json(); // { name, autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, razorpaySecretConfigured, address, latitude, longitude }
 }
 
 async function realGetEarnings(shopId, token) {
@@ -340,6 +340,9 @@ let mockSettings = {
   upiId: null,
   razorpayKeyId: null,
   razorpaySecretConfigured: false,
+  address: null,
+  latitude: null,
+  longitude: null,
 };
 
 async function mockLogin(email, password) {
@@ -559,8 +562,18 @@ async function mockGetSettlements(token) {
 async function mockUpdateSettings(token, patch) {
   await wait(150);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
-  const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, razorpaySecret } =
-    patch || {};
+  const {
+    autoPrintEnabled,
+    priceBw,
+    priceColor,
+    maxPagesPerHour,
+    upiId,
+    razorpayKeyId,
+    razorpaySecret,
+    address,
+    latitude,
+    longitude,
+  } = patch || {};
 
   if (autoPrintEnabled !== undefined) {
     if (typeof autoPrintEnabled !== "boolean") throw new Error("autoPrintEnabled must be true or false");
@@ -598,6 +611,13 @@ async function mockUpdateSettings(token, patch) {
       mockSettings.razorpayKeyId = razorpayKeyId.trim();
       mockSettings.razorpaySecretConfigured = true;
     }
+  }
+  if (address !== undefined) {
+    mockSettings.address = address;
+  }
+  if (latitude !== undefined || longitude !== undefined) {
+    mockSettings.latitude = latitude ?? null;
+    mockSettings.longitude = longitude ?? null;
   }
   return { ...mockSettings };
 }
