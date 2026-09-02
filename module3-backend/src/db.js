@@ -676,6 +676,40 @@ async function migrate() {
     ALTER TABLE batches ADD CONSTRAINT batches_status_check
       CHECK (status IN ('uploaded','payment_pending','queued','printing','printed_pending_removal','ready','collected'));
   `);
+
+  // Migration: admin shop enable/disable + shop-owner-entered location.
+  //
+  // is_active: defaults TRUE - a new shop signup still goes live
+  // immediately (unchanged behavior), but admin now has an on/off switch
+  // for it afterward (routes/admin.js PATCH .../active). Inactive shops
+  // are filtered out of the public browse list (GET /api/shops -
+  // students picking a shop under a landmark) and blocked from accepting
+  // new orders (routes/shops.js's job/batch creation routes) - existing
+  // in-flight jobs for a shop that gets disabled mid-queue are left alone,
+  // since disabling isn't meant to strand a student who already paid.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+  `);
+
+  // address: free text ("Near Gate 2, opposite the library") - simplest
+  // thing that's actually useful to a student on foot, no map/geocoding
+  // dependency required. latitude/longitude are optional on top of that -
+  // populated only if the shop owner taps "use my current location"
+  // (browser Geolocation API) in Module 2's Settings - enables a
+  // "Get directions" link (opens Google/Apple Maps) on the student side
+  // instead of just showing coordinates. Both nullable: a shop that hasn't
+  // set a location yet just doesn't show a location section to students,
+  // same "hide the field, don't show a broken empty one" pattern as
+  // upiId/maxPagesPerHour already being nullable.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS address TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+  `);
 }
 
 module.exports = { pool, migrate };

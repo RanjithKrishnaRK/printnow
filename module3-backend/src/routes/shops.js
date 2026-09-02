@@ -47,7 +47,7 @@ router.get('/', async (req, res, next) => {
               COUNT(r.id)::int AS "reviewCount"
        FROM shops s
        LEFT JOIN reviews r ON r.shop_id = s.id AND r.visible = TRUE
-       WHERE s.landmark_id = $1
+       WHERE s.landmark_id = $1 AND s.is_active = TRUE
        GROUP BY s.id
        ORDER BY s.name ASC`,
       [landmarkId]
@@ -147,13 +147,20 @@ router.post('/:shopId/jobs', async (req, res, next) => {
     let { pages, fileUrl } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
-      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
+      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive" FROM shops WHERE id = $1',
       [shopId]
     );
     if (shopRows.length === 0) {
       return res.status(404).json({ error: 'Shop not found' });
     }
     const shop = shopRows[0];
+    // A disabled shop (see routes/admin.js's PATCH .../active) shouldn't
+    // accept new orders even from someone who already has its direct
+    // link/QR code - existing queued/in-progress jobs are untouched, this
+    // only blocks new ones.
+    if (!shop.isActive) {
+      return res.status(403).json({ error: 'This shop is not currently accepting orders' });
+    }
 
     if (!fileUrl || typeof fileUrl !== 'string') {
       return res.status(400).json({ error: 'fileUrl is required' });
@@ -283,13 +290,16 @@ router.post('/:shopId/batches', async (req, res, next) => {
     const { studentPhone, studentName, documents } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
-      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor" FROM shops WHERE id = $1',
+      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive" FROM shops WHERE id = $1',
       [shopId]
     );
     if (shopRows.length === 0) {
       return res.status(404).json({ error: 'Shop not found' });
     }
     const shop = shopRows[0];
+    if (!shop.isActive) {
+      return res.status(403).json({ error: 'This shop is not currently accepting orders' });
+    }
 
     if (!studentPhone || typeof studentPhone !== 'string') {
       return res.status(400).json({ error: 'studentPhone is required' });
@@ -535,7 +545,8 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
               price_bw AS "priceBw", price_color AS "priceColor",
               max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
               razorpay_key_id AS "razorpayKeyId",
-              (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured"
+              (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured",
+              address, latitude, longitude, is_active AS "isActive"
        FROM shops WHERE id = $1`,
       [shopId]
     );
@@ -569,8 +580,18 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
 router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId } = req.params;
-    const { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, razorpaySecret } =
-      req.body || {};
+    const {
+      autoPrintEnabled,
+      priceBw,
+      priceColor,
+      maxPagesPerHour,
+      upiId,
+      razorpayKeyId,
+      razorpaySecret,
+      address,
+      latitude,
+      longitude,
+    } = req.body || {};
 
     const sets = [];
     const values = [];
@@ -656,10 +677,46 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       return res.status(400).json({ error: 'razorpaySecret must be set together with razorpayKeyId' });
     }
 
+    // address: free text, shown to students on the shop's public info
+    // screen (see GET /:shopId/public) - "Near Gate 2, opposite the
+    // library", not a structured/geocoded field. null clears it.
+    if (address !== undefined) {
+      if (address !== null && (typeof address !== 'string' || address.trim().length > 500)) {
+        return res.status(400).json({ error: 'address must be a string under 500 characters, or null to clear it' });
+      }
+      sets.push(`address = $${paramIndex++}`);
+      values.push(address === null ? null : address.trim());
+    }
+
+    // latitude/longitude: optional, set together (or cleared together via
+    // both null) - a lone coordinate is meaningless. Powers a "Get
+    // directions" link on the student side rather than an embedded map,
+    // so there's no external maps API key dependency here at all.
+    if (latitude !== undefined || longitude !== undefined) {
+      if (latitude === null && longitude === null) {
+        sets.push(`latitude = $${paramIndex++}`);
+        values.push(null);
+        sets.push(`longitude = $${paramIndex++}`);
+        values.push(null);
+      } else {
+        const validLat = typeof latitude === 'number' && latitude >= -90 && latitude <= 90;
+        const validLng = typeof longitude === 'number' && longitude >= -180 && longitude <= 180;
+        if (!validLat || !validLng) {
+          return res.status(400).json({
+            error: 'latitude and longitude must both be provided as valid numbers (or both null to clear)',
+          });
+        }
+        sets.push(`latitude = $${paramIndex++}`);
+        values.push(latitude);
+        sets.push(`longitude = $${paramIndex++}`);
+        values.push(longitude);
+      }
+    }
+
     if (sets.length === 0) {
       return res.status(400).json({
         error:
-          'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId',
+          'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, address, latitude, longitude',
       });
     }
 
@@ -670,7 +727,8 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
                  price_bw AS "priceBw", price_color AS "priceColor",
                  max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
                  razorpay_key_id AS "razorpayKeyId",
-                 (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured"`,
+                 (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured",
+                 address, latitude, longitude`,
       values
     );
     if (rows.length === 0) {
@@ -894,19 +952,28 @@ router.post('/:shopId/change-password', requireShopAuth, requireOwnShop, async (
 // GET /api/shops/:shopId/public
 // Public - no auth. Powers Module 1: once a student has picked a shop, this
 // is what shows them that shop's per-page pricing, hourly print capacity,
-// and UPI ID (to build the "pay at this shop's usual UPI ID" deep link)
-// before they commit to uploading. Deliberately excludes anything
-// account-related (email, autoPrintEnabled, etc). upiId may be null if the
-// shop hasn't set one yet - the student app falls back to cash-only in that
-// case.
+// UPI ID, and location (address/directions) before they commit to
+// uploading. Deliberately excludes anything account-related (email,
+// autoPrintEnabled, etc). upiId/address/latitude/longitude may all be null
+// if the shop hasn't set them yet - the student app handles each being
+// absent (cash-only, no location section shown, respectively).
+//
+// A disabled shop (isActive false - see routes/admin.js's PATCH
+// .../active) 404s here exactly like a shop that doesn't exist, rather
+// than returning its info with an isActive:false flag - a direct link/QR
+// code pointing at a disabled shop should fail the same way an invalid
+// one would, not quietly still work with a warning a student might not
+// notice. (This route is also public/unauthenticated, so a 404 leaks less
+// than a distinguishable "disabled" response would.)
 router.get('/:shopId/public', async (req, res, next) => {
   try {
     const { shopId } = req.params;
     const { rows } = await pool.query(
       `SELECT id AS "shopId", name,
               price_bw AS "priceBw", price_color AS "priceColor",
-              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId"
-       FROM shops WHERE id = $1`,
+              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
+              address, latitude, longitude
+       FROM shops WHERE id = $1 AND is_active = TRUE`,
       [shopId]
     );
     if (rows.length === 0) {

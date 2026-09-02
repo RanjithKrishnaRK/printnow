@@ -242,6 +242,7 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
         s.created_at AS "createdAt",
         l.name AS "landmarkName",
         s.vendor_status AS "vendorStatus",
+        s.is_active AS "isActive",
         (s.razorpay_key_id IS NOT NULL) AS "hasOwnRazorpayAccount",
         COUNT(pj.id)::int AS "totalJobs",
         COALESCE(SUM(CASE WHEN pj.status NOT IN ('uploaded', 'payment_pending') THEN pj.amount_due ELSE 0 END), 0)::int AS "totalRevenue"
@@ -261,6 +262,37 @@ router.get('/shops', requireAdminAuth, async (req, res, next) => {
       })
     );
     return res.status(200).json(withCommission);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/admin/shops/:shopId/active
+// Auth required. body: { isActive: boolean } -> { shopId, isActive }
+// A disabled shop disappears from the student-facing browse list (GET
+// /api/shops?landmarkId=...) and its public info page 404s (see
+// routes/shops.js GET .../public) - a direct link/QR to it stops working
+// exactly like an invalid one, rather than showing a "disabled" message
+// that leaks more than a plain 404 would. New orders are also rejected at
+// the source (routes/shops.js's job/batch creation routes). Deliberately
+// does NOT touch any of that shop's existing jobs - a student who already
+// paid and is waiting on a queued job isn't stranded by an admin
+// disabling the shop afterward.
+router.patch('/shops/:shopId/active', requireAdminAuth, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const { isActive } = req.body || {};
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ error: 'isActive must be true or false' });
+    }
+    const { rows } = await pool.query(
+      'UPDATE shops SET is_active = $1 WHERE id = $2 RETURNING id AS "shopId", is_active AS "isActive"',
+      [isActive, shopId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Shop not found' });
+    }
+    return res.status(200).json(rows[0]);
   } catch (err) {
     next(err);
   }
