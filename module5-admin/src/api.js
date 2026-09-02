@@ -151,6 +151,18 @@ export async function deleteShop(token, shopId) {
   return handle(res); // { ok: true, shopId }
 }
 
+export async function setShopActive(token, shopId, isActive) {
+  const res = await fetch(`${BASE_URL}/api/admin/shops/${shopId}/active`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ isActive }),
+  });
+  return handle(res); // { shopId, isActive }
+}
+
 export async function getLandmarks(token) {
   const res = await fetch(`${BASE_URL}/api/admin/landmarks`, {
     headers: { Authorization: `Bearer ${token}` },

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { getShops, deleteShop } from "../api";
+import { getShops, deleteShop, setShopActive } from "../api";
 import ShopDetail from "./ShopDetail";
 
 const POLL_MS = 15000;
@@ -40,6 +40,7 @@ export default function Shops({ token }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState(null);
+  const [togglingId, setTogglingId] = useState(null);
   const [detailShop, setDetailShop] = useState(null);
 
   const loadShops = useCallback(async () => {
@@ -82,6 +83,31 @@ export default function Shops({ token }) {
     }
   }
 
+  // Disabling: the shop disappears from the student-facing browse list and
+  // its direct link/QR stops working immediately, but nothing about its
+  // existing queue/history changes - a student mid-order isn't stranded.
+  // Re-enabling puts it straight back, no re-approval step.
+  async function handleToggleActive(shop) {
+    const nextActive = !shop.isActive;
+    if (nextActive === false) {
+      const confirmed = window.confirm(
+        `Disable "${shop.name}"? It will disappear from the student app and stop accepting new orders until re-enabled. Existing queued jobs are unaffected.`
+      );
+      if (!confirmed) return;
+    }
+    setTogglingId(shop.shopId);
+    const prevShops = shops;
+    setShops((prev) => prev.map((s) => (s.shopId === shop.shopId ? { ...s, isActive: nextActive } : s)));
+    try {
+      await setShopActive(token, shop.shopId, nextActive);
+    } catch (err) {
+      setError(err.message || "Could not update shop status.");
+      setShops(prevShops);
+    } finally {
+      setTogglingId(null);
+    }
+  }
+
   if (loading) return <div className="text-collected py-12 text-center">Loading shops…</div>;
 
   return (
@@ -107,6 +133,7 @@ export default function Shops({ token }) {
             <thead className="bg-paper text-collected text-xs uppercase tracking-wide">
               <tr>
                 <th className="text-left px-4 py-3 font-medium">Shop</th>
+                <th className="text-left px-4 py-3 font-medium">Status</th>
                 <th className="text-left px-4 py-3 font-medium">Email</th>
                 <th className="text-left px-4 py-3 font-medium">Landmark</th>
                 <th className="text-left px-4 py-3 font-medium">Payouts</th>
@@ -120,7 +147,7 @@ export default function Shops({ token }) {
             <tbody className="divide-y divide-black/5">
               {shops.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="text-center text-collected py-10">
+                  <td colSpan={10} className="text-center text-collected py-10">
                     No shops registered yet.
                   </td>
                 </tr>
@@ -134,6 +161,21 @@ export default function Shops({ token }) {
                         title="View earnings, payment breakdown, and reviews"
                       >
                         {s.name}
+                      </button>
+                    </td>
+                    <td className="px-4 py-3">
+                      <button
+                        onClick={() => handleToggleActive(s)}
+                        disabled={togglingId === s.shopId}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium disabled:opacity-50 ${
+                          s.isActive
+                            ? "border-ready/20 bg-ready/10 text-ready"
+                            : "border-black/10 bg-black/5 text-collected"
+                        }`}
+                        title={s.isActive ? "Click to disable" : "Click to re-enable"}
+                      >
+                        <span className={`h-1.5 w-1.5 rounded-full ${s.isActive ? "bg-ready" : "bg-collected"}`} />
+                        {togglingId === s.shopId ? "…" : s.isActive ? "Live" : "Disabled"}
                       </button>
                     </td>
                     <td className="px-4 py-3 text-collected">{s.email}</td>
