@@ -51,6 +51,7 @@ export default function Dashboard({
   onLogout,
   onOpenSettings,
   onOpenEarnings,
+  onOpenProfile,
   mustChangePassword = false,
 }) {
   const [activeTab, setActiveTab] = useState("queued");
@@ -338,6 +339,12 @@ export default function Dashboard({
             className="text-sm text-white/70 hover:text-white transition-colors"
           >
             ⚙️ Settings
+          </button>
+          <button
+            onClick={onOpenProfile}
+            className="text-sm text-white/70 hover:text-white transition-colors"
+          >
+            👤 Profile
           </button>
           <button
             onClick={() => setShowQr(true)}

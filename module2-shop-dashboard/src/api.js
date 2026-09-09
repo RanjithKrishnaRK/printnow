@@ -333,9 +333,17 @@ const mockSignedUpShops = []; // { name, email, password, shopId, token }
 // backfills new shops with; maxPagesPerHour null = no cap (default).
 let mockSettings = {
   name: "Campus Xerox",
+  email: "owner@campusxerox.example",
+  createdAt: "2025-01-14T09:00:00.000Z",
+  landmarkName: "Sample University",
   autoPrintEnabled: false,
   priceBw: 2,
   priceColor: 10,
+  // Raw, nullable - null means "no custom double-sided rate set". Resolved
+  // to the single-sided price (mirroring routes/shops.js's COALESCE)
+  // wherever mockSettings is returned to a caller - see resolveMockSettings.
+  priceBwDoubleRaw: null,
+  priceColorDoubleRaw: null,
   maxPagesPerHour: null,
   upiId: null,
   razorpayKeyId: null,
@@ -344,6 +352,15 @@ let mockSettings = {
   latitude: null,
   longitude: null,
 };
+
+function resolveMockSettings() {
+  const { priceBwDoubleRaw, priceColorDoubleRaw, ...rest } = mockSettings;
+  return {
+    ...rest,
+    priceBwDouble: priceBwDoubleRaw ?? mockSettings.priceBw,
+    priceColorDouble: priceColorDoubleRaw ?? mockSettings.priceColor,
+  };
+}
 
 async function mockLogin(email, password) {
   await wait(MOCK_LATENCY_MS);
@@ -480,7 +497,7 @@ async function mockRejectPayment(kind, id, token, reason) {
 async function mockGetSettings(token) {
   await wait(150);
   if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
-  return { ...mockSettings };
+  return resolveMockSettings();
 }
 
 // Only the seeded demo shop (MOCK_SHOP) has sample jobs/earnings - a
@@ -566,6 +583,8 @@ async function mockUpdateSettings(token, patch) {
     autoPrintEnabled,
     priceBw,
     priceColor,
+    priceBwDouble,
+    priceColorDouble,
     maxPagesPerHour,
     upiId,
     razorpayKeyId,
@@ -587,6 +606,18 @@ async function mockUpdateSettings(token, patch) {
     if (!Number.isInteger(priceColor) || priceColor < 1)
       throw new Error("priceColor must be a positive integer");
     mockSettings.priceColor = priceColor;
+  }
+  if (priceBwDouble !== undefined) {
+    if (priceBwDouble !== null && (!Number.isInteger(priceBwDouble) || priceBwDouble < 1)) {
+      throw new Error("priceBwDouble must be a positive integer, or null to clear it");
+    }
+    mockSettings.priceBwDoubleRaw = priceBwDouble;
+  }
+  if (priceColorDouble !== undefined) {
+    if (priceColorDouble !== null && (!Number.isInteger(priceColorDouble) || priceColorDouble < 1)) {
+      throw new Error("priceColorDouble must be a positive integer, or null to clear it");
+    }
+    mockSettings.priceColorDoubleRaw = priceColorDouble;
   }
   if (maxPagesPerHour !== undefined) {
     if (maxPagesPerHour !== null && (!Number.isInteger(maxPagesPerHour) || maxPagesPerHour < 1)) {
@@ -619,7 +650,7 @@ async function mockUpdateSettings(token, patch) {
     mockSettings.latitude = latitude ?? null;
     mockSettings.longitude = longitude ?? null;
   }
-  return { ...mockSettings };
+  return resolveMockSettings();
 }
 
 let mockCommissionPayments = [];

@@ -16,6 +16,9 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
 
   const [priceBw, setPriceBw] = useState("");
   const [priceColor, setPriceColor] = useState("");
+  const [doubleSidedEnabled, setDoubleSidedEnabled] = useState(false);
+  const [priceBwDouble, setPriceBwDouble] = useState("");
+  const [priceColorDouble, setPriceColorDouble] = useState("");
   const [hourlyLimitEnabled, setHourlyLimitEnabled] = useState(false);
   const [maxPagesPerHour, setMaxPagesPerHour] = useState("");
   const [upiId, setUpiId] = useState("");
@@ -29,6 +32,21 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
       .then((s) => {
         setPriceBw(String(s.priceBw ?? ""));
         setPriceColor(String(s.priceColor ?? ""));
+        // priceBwDouble/priceColorDouble come back from the API already
+        // resolved to the single-sided price when the shop hasn't set a
+        // custom one (see routes/shops.js's COALESCE) - so "customized" is
+        // detected by comparing against the single-sided price, not by
+        // whether the field merely has a value. Once either side counts as
+        // customized, both double-sided fields are pre-filled with their
+        // resolved values (even the uncustomized one) so the form doesn't
+        // show a blank required field the shop never asked to fill in.
+        const bwCustomized = s.priceBwDouble != null && s.priceBwDouble !== s.priceBw;
+        const colorCustomized = s.priceColorDouble != null && s.priceColorDouble !== s.priceColor;
+        if (bwCustomized || colorCustomized) {
+          setDoubleSidedEnabled(true);
+          setPriceBwDouble(String(s.priceBwDouble));
+          setPriceColorDouble(String(s.priceColorDouble));
+        }
         setUpiId(s.upiId ?? "");
         setAddress(s.address ?? "");
         if (s.latitude != null && s.longitude != null) {
@@ -84,6 +102,18 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
     if (!Number.isInteger(color) || color < 1) {
       return setError("Color price must be a whole number of at least ₹1.");
     }
+    let bwDouble = null;
+    let colorDouble = null;
+    if (doubleSidedEnabled) {
+      bwDouble = parseInt(priceBwDouble, 10);
+      colorDouble = parseInt(priceColorDouble, 10);
+      if (!Number.isInteger(bwDouble) || bwDouble < 1) {
+        return setError("Double-sided B&W price must be a whole number of at least ₹1.");
+      }
+      if (!Number.isInteger(colorDouble) || colorDouble < 1) {
+        return setError("Double-sided color price must be a whole number of at least ₹1.");
+      }
+    }
     let cap = null;
     if (hourlyLimitEnabled) {
       cap = parseInt(maxPagesPerHour, 10);
@@ -101,6 +131,8 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
       await updateSettings(shopId, token, {
         priceBw: bw,
         priceColor: color,
+        priceBwDouble: bwDouble,
+        priceColorDouble: colorDouble,
         maxPagesPerHour: cap,
         upiId: trimmedUpi || null,
         address: address.trim() || null,
@@ -160,6 +192,61 @@ export default function Settings({ shopId, token, firstTime = false, mustChangeP
             className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
           />
         </div>
+      </div>
+
+      <div className="mb-2 border-t border-black/5 pt-4">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-xs font-medium uppercase tracking-wide text-collected">
+            Double-sided pricing
+          </p>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={doubleSidedEnabled}
+              onChange={(e) => setDoubleSidedEnabled(e.target.checked)}
+              className="h-4 w-4 rounded border-black/20 text-teal focus:ring-teal"
+            />
+            <span className="text-sm text-ink">Set a different rate</span>
+          </label>
+        </div>
+        <p className="mb-3 text-xs text-collected">
+          Many shops charge less per page for double-sided since it uses half the paper. Leave
+          this off and double-sided jobs are billed at your regular per-page rate above.
+        </p>
+        {doubleSidedEnabled && (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="priceBwDouble" className="block text-sm font-medium text-ink mb-1">
+                B&amp;W, double-sided (₹/page)
+              </label>
+              <input
+                id="priceBwDouble"
+                type="number"
+                min="1"
+                step="1"
+                required
+                value={priceBwDouble}
+                onChange={(e) => setPriceBwDouble(e.target.value)}
+                className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+              />
+            </div>
+            <div>
+              <label htmlFor="priceColorDouble" className="block text-sm font-medium text-ink mb-1">
+                Color, double-sided (₹/page)
+              </label>
+              <input
+                id="priceColorDouble"
+                type="number"
+                min="1"
+                step="1"
+                required
+                value={priceColorDouble}
+                onChange={(e) => setPriceColorDouble(e.target.value)}
+                className="w-full rounded-lg border border-black/10 px-3 py-2.5 text-ink focus:outline-none focus:ring-2 focus:ring-teal focus:border-teal"
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="mb-2 border-t border-black/5 pt-4">
