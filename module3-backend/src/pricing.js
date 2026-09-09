@@ -43,20 +43,36 @@ function parseColorPages(input, maxPages) {
  * page at the bw rate. colorMode is already validated by the route; when
  * colorMode is "mixed", colorPages must already be a validated page string.
  *
- * `rates` is the shop's own { bw, color } per-page pricing (see
- * shops.price_bw / shops.price_color, editable anytime from the shop's
- * Settings page). Falls back to the platform-wide PRICING constant only if
- * a caller doesn't pass rates at all, so older call sites keep working.
+ * `rates` is the shop's own per-page pricing (see shops.price_bw /
+ * price_color / price_bw_double / price_color_double, editable anytime
+ * from the shop's Settings page): { bw, color, bwDouble, colorDouble }.
+ * bwDouble/colorDouble are optional - callers resolve "shop hasn't set a
+ * double-sided rate" down to the single-sided rate via COALESCE in SQL
+ * before calling this (see routes/shops.js), so by the time `rates`
+ * reaches here it always has real numbers for whichever sides value was
+ * requested. Falls back to the platform-wide PRICING constant only if a
+ * caller doesn't pass rates at all, so older call sites keep working -
+ * PRICING has no double-sided variant, so `sides` is ignored in that
+ * fallback path (single-sided rate used regardless).
+ *
+ * `sides` defaults to "single" so every existing caller that doesn't pass
+ * it (there were none before double-sided pricing existed) keeps billing
+ * exactly as before.
  */
-function calculateAmountDue({ pages, copies, colorMode, colorPages, rates }) {
+function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides = 'single' }) {
   const effectiveRates = rates || PRICING;
+  const double = sides === 'double';
+  const bwRate = double && effectiveRates.bwDouble != null ? effectiveRates.bwDouble : effectiveRates.bw;
+  const colorRate =
+    double && effectiveRates.colorDouble != null ? effectiveRates.colorDouble : effectiveRates.color;
+
   if (colorMode === 'mixed') {
     const { pageSet } = parseColorPages(colorPages, pages);
     const colorPageCount = pageSet.size;
     const bwPageCount = Math.max(0, pages - colorPageCount);
-    return (colorPageCount * effectiveRates.color + bwPageCount * effectiveRates.bw) * copies;
+    return (colorPageCount * colorRate + bwPageCount * bwRate) * copies;
   }
-  const rate = effectiveRates[colorMode];
+  const rate = colorMode === 'color' ? colorRate : bwRate;
   return rate * pages * copies;
 }
 

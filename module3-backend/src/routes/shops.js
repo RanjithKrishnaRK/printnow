@@ -147,7 +147,10 @@ router.post('/:shopId/jobs', async (req, res, next) => {
     let { pages, fileUrl } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
-      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive" FROM shops WHERE id = $1',
+      `SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive",
+              COALESCE(price_bw_double, price_bw) AS "priceBwDouble",
+              COALESCE(price_color_double, price_color) AS "priceColorDouble"
+       FROM shops WHERE id = $1`,
       [shopId]
     );
     if (shopRows.length === 0) {
@@ -242,7 +245,13 @@ router.post('/:shopId/jobs', async (req, res, next) => {
       copies,
       colorMode,
       colorPages: colorPagesValue,
-      rates: { bw: shop.priceBw, color: shop.priceColor },
+      sides: sidesValue,
+      rates: {
+        bw: shop.priceBw,
+        color: shop.priceColor,
+        bwDouble: shop.priceBwDouble,
+        colorDouble: shop.priceColorDouble,
+      },
     });
 
     let resolvedName;
@@ -290,7 +299,10 @@ router.post('/:shopId/batches', async (req, res, next) => {
     const { studentPhone, studentName, documents } = req.body || {};
 
     const { rows: shopRows } = await pool.query(
-      'SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive" FROM shops WHERE id = $1',
+      `SELECT id, price_bw AS "priceBw", price_color AS "priceColor", is_active AS "isActive",
+              COALESCE(price_bw_double, price_bw) AS "priceBwDouble",
+              COALESCE(price_color_double, price_color) AS "priceColorDouble"
+       FROM shops WHERE id = $1`,
       [shopId]
     );
     if (shopRows.length === 0) {
@@ -382,7 +394,13 @@ router.post('/:shopId/batches', async (req, res, next) => {
         copies,
         colorMode,
         colorPages: colorPagesValue,
-        rates: { bw: shop.priceBw, color: shop.priceColor },
+        sides: sidesValue,
+        rates: {
+          bw: shop.priceBw,
+          color: shop.priceColor,
+          bwDouble: shop.priceBwDouble,
+          colorDouble: shop.priceColorDouble,
+        },
       });
 
       prepared.push({
@@ -541,13 +559,17 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
   try {
     const { shopId } = req.params;
     const { rows } = await pool.query(
-      `SELECT name, auto_print_enabled AS "autoPrintEnabled",
-              price_bw AS "priceBw", price_color AS "priceColor",
-              max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
-              razorpay_key_id AS "razorpayKeyId",
-              (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured",
-              address, latitude, longitude, is_active AS "isActive"
-       FROM shops WHERE id = $1`,
+      `SELECT s.name, s.email, s.created_at AS "createdAt", l.name AS "landmarkName",
+              s.auto_print_enabled AS "autoPrintEnabled",
+              s.price_bw AS "priceBw", s.price_color AS "priceColor",
+              s.price_bw_double AS "priceBwDouble", s.price_color_double AS "priceColorDouble",
+              s.max_pages_per_hour AS "maxPagesPerHour", s.upi_id AS "upiId",
+              s.razorpay_key_id AS "razorpayKeyId",
+              (s.razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured",
+              s.address, s.latitude, s.longitude, s.is_active AS "isActive"
+       FROM shops s
+       LEFT JOIN landmarks l ON l.id = s.landmark_id
+       WHERE s.id = $1`,
       [shopId]
     );
     if (rows.length === 0) {
@@ -558,6 +580,12 @@ router.get('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, res
     // the bank account number on /vendor-status. razorpayKeyId is fine to
     // return in full: Razorpay's own Checkout widget needs it client-side
     // anyway, so it was never secret to begin with.
+    //
+    // email/createdAt/landmarkName are read-only account facts (this route
+    // has no PATCH handling for any of them) - included here rather than a
+    // separate endpoint so the dashboard's Profile tab (Module 2) can reuse
+    // this same call instead of a second round trip, since Settings
+    // already fetches this on load.
     return res.status(200).json(rows[0]);
   } catch (err) {
     next(err);
@@ -584,6 +612,8 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       autoPrintEnabled,
       priceBw,
       priceColor,
+      priceBwDouble,
+      priceColorDouble,
       maxPagesPerHour,
       upiId,
       razorpayKeyId,
@@ -619,6 +649,33 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       }
       sets.push(`price_color = $${paramIndex++}`);
       values.push(priceColor);
+    }
+
+    // priceBwDouble/priceColorDouble: the shop's own double-sided rate,
+    // separate from single-sided - many shops charge less per page for
+    // double-sided since it uses half the paper. null clears it back to
+    // "no custom double-sided rate" (a double-sided job is then billed at
+    // the ordinary single-sided rate - see pricing.js/routes/shops.js's
+    // COALESCE at order-creation time), not "free" - there's no scenario
+    // where double-sided should cost nothing.
+    if (priceBwDouble !== undefined) {
+      if (priceBwDouble !== null && (!Number.isInteger(priceBwDouble) || priceBwDouble < 1)) {
+        return res
+          .status(400)
+          .json({ error: 'priceBwDouble must be a positive integer (INR per page), or null to clear it' });
+      }
+      sets.push(`price_bw_double = $${paramIndex++}`);
+      values.push(priceBwDouble);
+    }
+
+    if (priceColorDouble !== undefined) {
+      if (priceColorDouble !== null && (!Number.isInteger(priceColorDouble) || priceColorDouble < 1)) {
+        return res
+          .status(400)
+          .json({ error: 'priceColorDouble must be a positive integer (INR per page), or null to clear it' });
+      }
+      sets.push(`price_color_double = $${paramIndex++}`);
+      values.push(priceColorDouble);
     }
 
     if (maxPagesPerHour !== undefined) {
@@ -716,7 +773,7 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
     if (sets.length === 0) {
       return res.status(400).json({
         error:
-          'Provide at least one of: autoPrintEnabled, priceBw, priceColor, maxPagesPerHour, upiId, razorpayKeyId, address, latitude, longitude',
+          'Provide at least one of: autoPrintEnabled, priceBw, priceColor, priceBwDouble, priceColorDouble, maxPagesPerHour, upiId, razorpayKeyId, address, latitude, longitude',
       });
     }
 
@@ -725,6 +782,7 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
       `UPDATE shops SET ${sets.join(', ')} WHERE id = $${paramIndex}
        RETURNING auto_print_enabled AS "autoPrintEnabled",
                  price_bw AS "priceBw", price_color AS "priceColor",
+                 price_bw_double AS "priceBwDouble", price_color_double AS "priceColorDouble",
                  max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
                  razorpay_key_id AS "razorpayKeyId",
                  (razorpay_key_secret IS NOT NULL) AS "razorpaySecretConfigured",
@@ -971,6 +1029,8 @@ router.get('/:shopId/public', async (req, res, next) => {
     const { rows } = await pool.query(
       `SELECT id AS "shopId", name,
               price_bw AS "priceBw", price_color AS "priceColor",
+              COALESCE(price_bw_double, price_bw) AS "priceBwDouble",
+              COALESCE(price_color_double, price_color) AS "priceColorDouble",
               max_pages_per_hour AS "maxPagesPerHour", upi_id AS "upiId",
               address, latitude, longitude
        FROM shops WHERE id = $1 AND is_active = TRUE`,

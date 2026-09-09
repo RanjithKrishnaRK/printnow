@@ -710,6 +710,26 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE shops ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
   `);
+
+  // Migration: double-sided pricing, per color mode, customizable per shop.
+  //
+  // 'sides' has been collected on every job since the sides feature shipped
+  // (print_jobs.sides / batches.sides - see routes/shops.js) but pricing.js
+  // never actually looked at it - a double-sided job cost exactly the same
+  // as single-sided, per page. price_bw_double/price_color_double are
+  // nullable and default to nothing: a shop that hasn't set a double-sided
+  // rate is charged the SAME per-page rate as single-sided for a double
+  // job (resolved via COALESCE at the routes/shops.js call sites, not
+  // here) - so existing shops see zero pricing change until they
+  // deliberately set a different double-sided rate. Nullable rather than
+  // "default to half of single" because there's no universally correct
+  // double-sided discount to assume on a shop's behalf.
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS price_bw_double INTEGER;
+  `);
+  await pool.query(`
+    ALTER TABLE shops ADD COLUMN IF NOT EXISTS price_color_double INTEGER;
+  `);
 }
 
 module.exports = { pool, migrate };
