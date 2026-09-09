@@ -860,21 +860,54 @@ function parsePageRange(input, maxPages) {
   return { pages, error: null };
 }
 
-// Mirrors module3-backend/src/pricing.js's calculateAmountDue exactly (same
-// bw/color x single/double resolution) so this preview can never show a
+// Mirrors module3-backend/src/pricing.js's calculateAmountDue exactly -
+// same bw/color x single/double resolution AND the same per-SHEET billing
+// for double-sided (two pages share one physical sheet, so a 6-page
+// double-sided document costs 3x the double rate, not 6x; an odd page
+// count leaves one unpaired final page, billed single-sided at the
+// ordinary single-sided rate) - so this preview can never show a
 // different total than what the server actually charges at order-creation
-// time - see routes/shops.js's own COALESCE for the "no custom double-sided
-// rate set" fallback, mirrored here via `?? r.bw`/`?? r.color`.
-function computeEstimate({ pages, copies, colorMode, colorPageCount, rates, sides }) {
+// time. `colorPageSet` (not just a count) is required for the mixed +
+// double-sided case, which needs to know WHICH pages are color to pair
+// them into sheets correctly - see deriveDocument's call site.
+function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides }) {
   const r = rates || RATE_PER_PAGE;
   const double = sides === "double";
-  const bwRate = double && r.bwDouble != null ? r.bwDouble : r.bw;
-  const colorRate = double && r.colorDouble != null ? r.colorDouble : r.color;
+  const bwSingle = r.bw;
+  const colorSingle = r.color;
+  const bwDouble = r.bwDouble != null ? r.bwDouble : r.bw;
+  const colorDouble = r.colorDouble != null ? r.colorDouble : r.color;
+
   if (colorMode === "mixed") {
-    const bwPages = Math.max(0, pages - colorPageCount);
-    return (colorPageCount * colorRate + bwPages * bwRate) * copies;
+    const set = colorPageSet || new Set();
+    if (!double) {
+      const colorPageCount = set.size;
+      const bwPages = Math.max(0, pages - colorPageCount);
+      return (colorPageCount * colorSingle + bwPages * bwSingle) * copies;
+    }
+    const fullSheets = Math.floor(pages / 2);
+    let total = 0;
+    for (let sheet = 0; sheet < fullSheets; sheet++) {
+      const firstPage = sheet * 2 + 1;
+      const secondPage = sheet * 2 + 2;
+      const sheetIsColor = set.has(firstPage) || set.has(secondPage);
+      total += sheetIsColor ? colorDouble : bwDouble;
+    }
+    if (pages % 2 === 1) {
+      total += set.has(pages) ? colorSingle : bwSingle;
+    }
+    return total * copies;
   }
-  return pages * copies * (colorMode === "color" ? colorRate : bwRate);
+
+  if (!double) {
+    return pages * copies * (colorMode === "color" ? colorSingle : bwSingle);
+  }
+
+  const doubleRate = colorMode === "color" ? colorDouble : bwDouble;
+  const singleRate = colorMode === "color" ? colorSingle : bwSingle;
+  const fullSheets = Math.floor(pages / 2);
+  const hasOddPage = pages % 2 === 1;
+  return (fullSheets * doubleRate + (hasOddPage ? singleRate : 0)) * copies;
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,7 +1885,7 @@ function deriveDocument(doc, rates) {
           pages: printPagesNum,
           copies: doc.copies,
           colorMode: doc.colorMode,
-          colorPageCount,
+          colorPageSet: rangeResult ? rangeResult.pages : null,
           rates,
           sides: doc.sides,
         })

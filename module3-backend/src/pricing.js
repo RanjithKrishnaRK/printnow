@@ -38,10 +38,24 @@ function parseColorPages(input, maxPages) {
 }
 
 /**
- * Flat per-page rate x pages x copies for "bw"/"color". For "mixed", the
- * pages listed in colorPages are billed at the color rate and every other
- * page at the bw rate. colorMode is already validated by the route; when
- * colorMode is "mixed", colorPages must already be a validated page string.
+ * Flat per-page rate x pages x copies for single-sided "bw"/"color". For
+ * "mixed", the pages listed in colorPages are billed at the color rate and
+ * every other page at the bw rate. colorMode is already validated by the
+ * route; when colorMode is "mixed", colorPages must already be a validated
+ * page string.
+ *
+ * Double-sided ("sides: 'double'") bills per SHEET of paper, not per page -
+ * two pages share one physical sheet (front/back), so a 6-page double-sided
+ * document only uses 3 sheets and should cost 3 x the double rate, not 6x.
+ * An odd page count leaves one final page that can't be paired with
+ * anything - it's printed (and billed) single-sided, at the ordinary
+ * single-sided rate, since that sheet only actually uses one side.
+ * For "mixed" + double-sided, pages pair up sequentially into sheets
+ * (1&2, 3&4, ...); a sheet counts as a color sheet if EITHER side on it is
+ * a color page - there's no half-color-sheet rate on the machines these
+ * shops use, so any color content makes the whole sheet a color sheet. A
+ * leftover final page (odd total) is billed single-sided at its own page's
+ * actual color rate.
  *
  * `rates` is the shop's own per-page pricing (see shops.price_bw /
  * price_color / price_bw_double / price_color_double, editable anytime
@@ -50,10 +64,13 @@ function parseColorPages(input, maxPages) {
  * double-sided rate" down to the single-sided rate via COALESCE in SQL
  * before calling this (see routes/shops.js), so by the time `rates`
  * reaches here it always has real numbers for whichever sides value was
- * requested. Falls back to the platform-wide PRICING constant only if a
- * caller doesn't pass rates at all, so older call sites keep working -
- * PRICING has no double-sided variant, so `sides` is ignored in that
- * fallback path (single-sided rate used regardless).
+ * requested; the `!= null` fallback below only matters for a caller that
+ * skips `rates` entirely (see the PRICING fallback note).
+ *
+ * Falls back to the platform-wide PRICING constant only if a caller
+ * doesn't pass rates at all, so older call sites keep working - PRICING
+ * has no double-sided variant, so `sides` is ignored in that fallback path
+ * (single-sided rate used regardless).
  *
  * `sides` defaults to "single" so every existing caller that doesn't pass
  * it (there were none before double-sided pricing existed) keeps billing
@@ -62,18 +79,43 @@ function parseColorPages(input, maxPages) {
 function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides = 'single' }) {
   const effectiveRates = rates || PRICING;
   const double = sides === 'double';
-  const bwRate = double && effectiveRates.bwDouble != null ? effectiveRates.bwDouble : effectiveRates.bw;
-  const colorRate =
-    double && effectiveRates.colorDouble != null ? effectiveRates.colorDouble : effectiveRates.color;
+  const bwSingle = effectiveRates.bw;
+  const colorSingle = effectiveRates.color;
+  const bwDouble = effectiveRates.bwDouble != null ? effectiveRates.bwDouble : effectiveRates.bw;
+  const colorDouble = effectiveRates.colorDouble != null ? effectiveRates.colorDouble : effectiveRates.color;
 
   if (colorMode === 'mixed') {
-    const { pageSet } = parseColorPages(colorPages, pages);
-    const colorPageCount = pageSet.size;
-    const bwPageCount = Math.max(0, pages - colorPageCount);
-    return (colorPageCount * colorRate + bwPageCount * bwRate) * copies;
+    const { pageSet } = parseColorPages(colorPages, pages); // 1-indexed color page numbers
+
+    if (!double) {
+      const colorPageCount = pageSet.size;
+      const bwPageCount = Math.max(0, pages - colorPageCount);
+      return (colorPageCount * colorSingle + bwPageCount * bwSingle) * copies;
+    }
+
+    const fullSheets = Math.floor(pages / 2);
+    let total = 0;
+    for (let sheet = 0; sheet < fullSheets; sheet++) {
+      const firstPage = sheet * 2 + 1;
+      const secondPage = sheet * 2 + 2;
+      const sheetIsColor = pageSet.has(firstPage) || pageSet.has(secondPage);
+      total += sheetIsColor ? colorDouble : bwDouble;
+    }
+    if (pages % 2 === 1) {
+      total += pageSet.has(pages) ? colorSingle : bwSingle;
+    }
+    return total * copies;
   }
-  const rate = colorMode === 'color' ? colorRate : bwRate;
-  return rate * pages * copies;
+
+  if (!double) {
+    return (colorMode === 'color' ? colorSingle : bwSingle) * pages * copies;
+  }
+
+  const doubleRate = colorMode === 'color' ? colorDouble : bwDouble;
+  const singleRate = colorMode === 'color' ? colorSingle : bwSingle;
+  const fullSheets = Math.floor(pages / 2);
+  const hasOddPage = pages % 2 === 1;
+  return (fullSheets * doubleRate + (hasOddPage ? singleRate : 0)) * copies;
 }
 
 module.exports = { calculateAmountDue, parseColorPages };
