@@ -860,13 +860,21 @@ function parsePageRange(input, maxPages) {
   return { pages, error: null };
 }
 
-function computeEstimate({ pages, copies, colorMode, colorPageCount, rates }) {
+// Mirrors module3-backend/src/pricing.js's calculateAmountDue exactly (same
+// bw/color x single/double resolution) so this preview can never show a
+// different total than what the server actually charges at order-creation
+// time - see routes/shops.js's own COALESCE for the "no custom double-sided
+// rate set" fallback, mirrored here via `?? r.bw`/`?? r.color`.
+function computeEstimate({ pages, copies, colorMode, colorPageCount, rates, sides }) {
   const r = rates || RATE_PER_PAGE;
+  const double = sides === "double";
+  const bwRate = double && r.bwDouble != null ? r.bwDouble : r.bw;
+  const colorRate = double && r.colorDouble != null ? r.colorDouble : r.color;
   if (colorMode === "mixed") {
     const bwPages = Math.max(0, pages - colorPageCount);
-    return (colorPageCount * r.color + bwPages * r.bw) * copies;
+    return (colorPageCount * colorRate + bwPages * bwRate) * copies;
   }
-  return pages * copies * r[colorMode];
+  return pages * copies * (colorMode === "color" ? colorRate : bwRate);
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +914,10 @@ const MOCK_SHOP_PUBLIC_INFO = {
     name: "Sharma Xerox & Print Center",
     priceBw: 2,
     priceColor: 10,
+    // A genuinely different double-sided rate, to demo the feature - real
+    // shops set this in their own Settings; here it's just seeded data.
+    priceBwDouble: 3,
+    priceColorDouble: 18,
     maxPagesPerHour: 500,
     upiId: "sharmaxerox@okhdfcbank",
   },
@@ -914,6 +926,10 @@ const MOCK_SHOP_PUBLIC_INFO = {
     name: "Campus Copy Point",
     priceBw: 3,
     priceColor: 12,
+    // No custom double-sided rate - resolves to the single-sided price,
+    // same as the real API's COALESCE behavior when a shop hasn't set one.
+    priceBwDouble: 3,
+    priceColorDouble: 12,
     maxPagesPerHour: null,
     upiId: null,
   },
@@ -936,6 +952,8 @@ const mockApi = {
         name: "This shop",
         priceBw: RATE_PER_PAGE.bw,
         priceColor: RATE_PER_PAGE.color,
+        priceBwDouble: RATE_PER_PAGE.bw,
+        priceColorDouble: RATE_PER_PAGE.color,
         maxPagesPerHour: null,
       }
     );
@@ -1793,6 +1811,19 @@ function makeDefaultDocument() {
   };
 }
 
+// Builds the { bw, color, bwDouble, colorDouble } rates object computeEstimate
+// expects, from a shop's /public info - shared by DocumentSettingsCard and
+// UploadStep's total-estimate so both always agree on the same shape.
+function ratesFromShopInfo(shopInfo) {
+  if (!shopInfo) return null;
+  return {
+    bw: shopInfo.priceBw,
+    color: shopInfo.priceColor,
+    bwDouble: shopInfo.priceBwDouble,
+    colorDouble: shopInfo.priceColorDouble,
+  };
+}
+
 // Derives pagesNum/colorPageCount/rangeError/estimate for one document -
 // shared between DocumentSettingsCard (per-doc display) and UploadStep
 // (total estimate, submit validation).
@@ -1817,7 +1848,14 @@ function deriveDocument(doc, rates) {
   const rangeError = doc.colorMode === "mixed" && doc.colorPages.trim() ? rangeResult?.error : null;
   const estimate =
     printPagesNum > 0
-      ? computeEstimate({ pages: printPagesNum, copies: doc.copies, colorMode: doc.colorMode, colorPageCount, rates })
+      ? computeEstimate({
+          pages: printPagesNum,
+          copies: doc.copies,
+          colorMode: doc.colorMode,
+          colorPageCount,
+          rates,
+          sides: doc.sides,
+        })
       : 0;
   return { pagesNum: totalPages, printPagesNum, selectionError, colorPageCount, rangeError, estimate };
 }
@@ -1831,7 +1869,7 @@ function deriveDocument(doc, rates) {
 function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, onEdit, showRemove }) {
   const { pagesNum, printPagesNum, selectionError, colorPageCount, rangeError, estimate } = deriveDocument(
     doc,
-    shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null
+    ratesFromShopInfo(shopInfo)
   );
   const [previewOpen, setPreviewOpen] = useState(false);
   const [selectingPages, setSelectingPages] = useState(!!doc.pageSelection.trim());
@@ -2426,7 +2464,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
     setFailedFiles((prev) => prev.filter((f) => f.id !== id));
   }
 
-  const rates = shopInfo ? { bw: shopInfo.priceBw, color: shopInfo.priceColor } : null;
+  const rates = ratesFromShopInfo(shopInfo);
   const derivedDocs = documents.map((d) => deriveDocument(d, rates));
   const totalEstimate = derivedDocs.reduce((sum, d) => sum + d.estimate, 0);
 
@@ -2563,6 +2601,15 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
             <span className="font-medium text-stone-800">₹{shopInfo.priceBw}/page</span> black &amp;
             white · <span className="font-medium text-stone-800">₹{shopInfo.priceColor}/page</span> color
           </p>
+          {/* Only shown when double-sided actually costs something
+              different - a shop that hasn't customized it resolves to the
+              same numbers as above (see routes/shops.js's COALESCE), so
+              repeating identical prices here would just be noise. */}
+          {(shopInfo.priceBwDouble !== shopInfo.priceBw || shopInfo.priceColorDouble !== shopInfo.priceColor) && (
+            <p className="mt-0.5 text-stone-500">
+              Double-sided: ₹{shopInfo.priceBwDouble}/page b&amp;w · ₹{shopInfo.priceColorDouble}/page color
+            </p>
+          )}
           {shopInfo.maxPagesPerHour && (
             <p className="mt-1 text-stone-500">
               This shop prints up to {shopInfo.maxPagesPerHour} pages/hour. If it's busy, your
