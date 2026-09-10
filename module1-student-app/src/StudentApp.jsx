@@ -3338,10 +3338,48 @@ function StatusStep({ kind, orderId, shopId, cashfreeOrderIdToVerify, onBack, on
     }
   }, [orderId, isBatch]);
 
+  // Same fix as Module 2's shop dashboard, and for the same reason: pause
+  // polling whenever this tab isn't actually visible (backgrounded,
+  // another tab focused, screen locked) rather than hitting the shared
+  // Neon database every 4 seconds regardless. A student is less likely
+  // than a shop owner to leave this open for hours, but the interval here
+  // is even more aggressive (4s vs the dashboard's 15s), so the same
+  // "never lets the database go idle" risk applies per open tab. Fetches
+  // once immediately on returning to the tab, then resumes the interval.
   useEffect(() => {
+    let interval = null;
+
+    function startPolling() {
+      if (interval) return;
+      interval = setInterval(fetchStatus, 4000);
+    }
+
+    function stopPolling() {
+      if (interval) {
+        clearInterval(interval);
+        interval = null;
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        fetchStatus();
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    }
+
     fetchStatus();
-    const interval = setInterval(fetchStatus, 4000);
-    return () => clearInterval(interval);
+    if (document.visibilityState === "visible") {
+      startPolling();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopPolling();
+    };
   }, [fetchStatus]);
 
   async function handleShare() {

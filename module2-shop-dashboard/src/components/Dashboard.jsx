@@ -126,14 +126,57 @@ export default function Dashboard({
     }
   }, [shopId, token]);
 
+  // Polling pauses whenever this tab isn't actually visible - backgrounded,
+  // minimized, another tab focused, or (on mobile) the screen locked. A
+  // shop owner commonly leaves this dashboard open all day; unconditional
+  // 15-second polling the whole time keeps the shared Neon database compute
+  // continuously "awake" (it only scales to zero after 5 minutes with NO
+  // query activity), which can burn through the free tier's monthly
+  // compute-hour allowance in days rather than the whole month, entirely
+  // from a browser tab sitting untouched in the background. Pausing while
+  // hidden lets the database actually go idle during that time instead.
+  // On returning to the tab, this fetches once immediately (rather than
+  // waiting up to POLL_MS for the first refreshed data) and then resumes
+  // the normal interval.
   useEffect(() => {
+    let interval = null;
+
+    function startPolling() {
+      if (interval) return; // already running
+      interval = setInterval(() => {
+        loadJobs();
+        loadEarnings();
+      }, POLL_MS);
+    }
+
+    function stopPolling() {
+      if (interval) {
+        clearInterval(interval);
+        interval = null;
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        loadJobs();
+        loadEarnings();
+        startPolling();
+      } else {
+        stopPolling();
+      }
+    }
+
     loadJobs();
     loadEarnings();
-    const interval = setInterval(() => {
-      loadJobs();
-      loadEarnings();
-    }, POLL_MS);
-    return () => clearInterval(interval);
+    if (document.visibilityState === "visible") {
+      startPolling();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      stopPolling();
+    };
   }, [loadJobs, loadEarnings]);
 
   useEffect(() => {
