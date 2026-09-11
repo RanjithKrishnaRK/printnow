@@ -730,6 +730,35 @@ async function migrate() {
   await pool.query(`
     ALTER TABLE shops ADD COLUMN IF NOT EXISTS price_color_double INTEGER;
   `);
+
+  // Migration: volume/range pricing - customizable per-shop pricing tiers
+  // based on TOTAL printable pages across a document's copies (pages x
+  // copies), single-sided only (see pricing.js's calculateAmountDue for
+  // the full reasoning). A shop with no rows in this table just keeps
+  // billing every job at their normal flat per-page rate, exactly as
+  // before this feature existed - ranges are entirely opt-in.
+  //
+  // min_pages/max_pages are inclusive; overlapping ranges for the same
+  // shop are rejected at the API layer (routes/priceRanges.js), not
+  // enforced here at the DB level, since Postgres range-overlap
+  // constraints (exclusion constraints) would need the btree_gist
+  // extension - not worth the extra dependency for something a normal
+  // application-level check already covers cleanly.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_price_ranges (
+      id          TEXT PRIMARY KEY,
+      shop_id     TEXT NOT NULL REFERENCES shops(id),
+      min_pages   INTEGER NOT NULL CHECK (min_pages >= 1),
+      max_pages   INTEGER NOT NULL CHECK (max_pages >= min_pages),
+      price_bw    INTEGER NOT NULL CHECK (price_bw >= 1),
+      price_color INTEGER NOT NULL CHECK (price_color >= 1),
+      created_at  TIMESTAMPTZ NOT NULL,
+      updated_at  TIMESTAMPTZ NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS shop_price_ranges_shop_id_idx ON shop_price_ranges (shop_id);
+  `);
 }
 
 module.exports = { pool, migrate };

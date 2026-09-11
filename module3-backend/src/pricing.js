@@ -38,6 +38,21 @@ function parseColorPages(input, maxPages) {
 }
 
 /**
+ * Volume/range pricing: given the TOTAL number of pages that will actually
+ * be printed across every copy (pages x copies for one document), finds
+ * the shop-defined range it falls into, if any. Ranges are inclusive on
+ * both ends and shouldn't overlap (enforced at write time - see
+ * routes/priceRanges.js) - if totalPages doesn't fall inside any
+ * configured range (below the lowest, above the highest, or the shop
+ * hasn't set any ranges at all), returns null, and the caller falls back
+ * to normal per-page pricing.
+ */
+function pickPriceRange(totalPages, priceRanges) {
+  if (!Array.isArray(priceRanges) || priceRanges.length === 0) return null;
+  return priceRanges.find((r) => totalPages >= r.minPages && totalPages <= r.maxPages) || null;
+}
+
+/**
  * Flat per-page rate x pages x copies for single-sided "bw"/"color". For
  * "mixed", the pages listed in colorPages are billed at the color rate and
  * every other page at the bw rate. colorMode is already validated by the
@@ -56,6 +71,22 @@ function parseColorPages(input, maxPages) {
  * shops use, so any color content makes the whole sheet a color sheet. A
  * leftover final page (odd total) is billed single-sided at its own page's
  * actual color rate.
+ *
+ * Volume/range pricing (`priceRanges`, single-sided only - see
+ * pickPriceRange above and routes/priceRanges.js): a shop can define
+ * pricing tiers by TOTAL printable pages across all copies of a document
+ * (pages x copies), each with its own flat per-page bw/color rate that
+ * REPLACES the shop's normal per-page rate entirely for jobs whose total
+ * falls in that range - e.g. 2 copies of a 5-page document (10 total
+ * pages) might land in a "10-19 pages" tier priced at a lower per-page
+ * rate than a single 5-page copy would get. This only applies to
+ * single-sided jobs; a double-sided job always uses the double-sided sheet
+ * pricing above, untouched, regardless of any configured ranges - combining
+ * both tiered systems at once wasn't asked for and adds a lot of
+ * complexity for a combination that may never come up. If the job's total
+ * printable pages don't fall inside any configured range (including when
+ * the shop has no ranges configured at all), pricing falls straight back
+ * to the shop's normal per-page rate, same as before this feature existed.
  *
  * `rates` is the shop's own per-page pricing (see shops.price_bw /
  * price_color / price_bw_double / price_color_double, editable anytime
@@ -76,7 +107,7 @@ function parseColorPages(input, maxPages) {
  * it (there were none before double-sided pricing existed) keeps billing
  * exactly as before.
  */
-function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides = 'single' }) {
+function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides = 'single', priceRanges }) {
   const effectiveRates = rates || PRICING;
   const double = sides === 'double';
   const bwSingle = effectiveRates.bw;
@@ -84,12 +115,23 @@ function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides
   const bwDouble = effectiveRates.bwDouble != null ? effectiveRates.bwDouble : effectiveRates.bw;
   const colorDouble = effectiveRates.colorDouble != null ? effectiveRates.colorDouble : effectiveRates.color;
 
+  // Volume pricing only applies single-sided - see the big comment above.
+  // Computed once up front so both the mixed and non-mixed paths below can
+  // use it without duplicating the "which range, if any" lookup.
+  const matchedRange = !double ? pickPriceRange(pages * copies, priceRanges) : null;
+
   if (colorMode === 'mixed') {
     const { pageSet } = parseColorPages(colorPages, pages); // 1-indexed color page numbers
+    const colorPageCount = pageSet.size;
+    const bwPageCount = Math.max(0, pages - colorPageCount);
+
+    if (matchedRange) {
+      // Total printable pages already includes copies, so the split below
+      // does too - no separate "* copies" at the end here.
+      return colorPageCount * copies * matchedRange.priceColor + bwPageCount * copies * matchedRange.priceBw;
+    }
 
     if (!double) {
-      const colorPageCount = pageSet.size;
-      const bwPageCount = Math.max(0, pages - colorPageCount);
       return (colorPageCount * colorSingle + bwPageCount * bwSingle) * copies;
     }
 
@@ -107,6 +149,11 @@ function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides
     return total * copies;
   }
 
+  if (matchedRange) {
+    const rangeRate = colorMode === 'color' ? matchedRange.priceColor : matchedRange.priceBw;
+    return rangeRate * pages * copies;
+  }
+
   if (!double) {
     return (colorMode === 'color' ? colorSingle : bwSingle) * pages * copies;
   }
@@ -118,7 +165,7 @@ function calculateAmountDue({ pages, copies, colorMode, colorPages, rates, sides
   return (fullSheets * doubleRate + (hasOddPage ? singleRate : 0)) * copies;
 }
 
-module.exports = { calculateAmountDue, parseColorPages };
+module.exports = { calculateAmountDue, parseColorPages, pickPriceRange };
 // parseColorPages is a general "1-3,5,8-10" range parser with nothing
 // color-specific about it - the same function also validates which pages
 // a student wants printed at all (see routes/shops.js's pageSelection

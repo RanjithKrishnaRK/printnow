@@ -252,6 +252,7 @@ router.post('/:shopId/jobs', async (req, res, next) => {
         bwDouble: shop.priceBwDouble,
         colorDouble: shop.priceColorDouble,
       },
+      priceRanges: await getShopPriceRanges(shopId),
     });
 
     let resolvedName;
@@ -328,6 +329,7 @@ router.post('/:shopId/batches', async (req, res, next) => {
     // Validate every document up front (same rules as the single-job route)
     // before inserting anything, so a bad 4th document doesn't leave 3
     // half-created jobs behind.
+    const priceRanges = await getShopPriceRanges(shopId);
     const prepared = [];
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i] || {};
@@ -401,6 +403,7 @@ router.post('/:shopId/batches', async (req, res, next) => {
           bwDouble: shop.priceBwDouble,
           colorDouble: shop.priceColorDouble,
         },
+        priceRanges,
       });
 
       prepared.push({
@@ -798,6 +801,163 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
   }
 });
 
+// ---------------------------------------------------------------------------
+// Volume/range pricing - shop-owner-managed pricing tiers by total printable
+// pages (pages x copies), single-sided only. See pricing.js's
+// calculateAmountDue for the full billing logic; these routes are purely
+// CRUD for the ranges themselves.
+
+// Shared by both order-creation routes (POST .../jobs, POST .../batches) to
+// fetch a shop's ranges once before pricing a document - pricing.js's
+// calculateAmountDue takes plain { minPages, maxPages, priceBw, priceColor }
+// objects, same shape as what the CRUD routes below already return.
+async function getShopPriceRanges(shopId) {
+  const { rows } = await pool.query(
+    `SELECT min_pages AS "minPages", max_pages AS "maxPages",
+            price_bw AS "priceBw", price_color AS "priceColor"
+     FROM shop_price_ranges WHERE shop_id = $1 ORDER BY min_pages ASC`,
+    [shopId]
+  );
+  return rows;
+}
+
+function overlapsExistingRange(newRange, existingRanges, excludeId) {
+  return existingRanges.some(
+    (r) => r.id !== excludeId && newRange.minPages <= r.maxPages && newRange.maxPages >= r.minPages
+  );
+}
+
+function validatePriceRangeBody(body) {
+  const { minPages, maxPages, priceBw, priceColor } = body || {};
+  if (!Number.isInteger(minPages) || minPages < 1) {
+    return 'minPages must be a positive integer';
+  }
+  if (!Number.isInteger(maxPages) || maxPages < minPages) {
+    return 'maxPages must be an integer greater than or equal to minPages';
+  }
+  if (!Number.isInteger(priceBw) || priceBw < 1) {
+    return 'priceBw must be a positive integer (INR per page)';
+  }
+  if (!Number.isInteger(priceColor) || priceColor < 1) {
+    return 'priceColor must be a positive integer (INR per page)';
+  }
+  return null;
+}
+
+// GET /api/shops/:shopId/price-ranges
+// Shop-owner-only. -> [{ id, minPages, maxPages, priceBw, priceColor }],
+// sorted by minPages so the shop's Settings screen can just render them in
+// order without re-sorting client-side.
+router.get('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, min_pages AS "minPages", max_pages AS "maxPages",
+              price_bw AS "priceBw", price_color AS "priceColor"
+       FROM shop_price_ranges WHERE shop_id = $1 ORDER BY min_pages ASC`,
+      [req.params.shopId]
+    );
+    return res.status(200).json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/shops/:shopId/price-ranges
+// Shop-owner-only. body: { minPages, maxPages, priceBw, priceColor } -> the created row
+// Rejected if it overlaps any of this shop's existing ranges - two ranges
+// both claiming to cover "12 total pages" would make pricing ambiguous, so
+// this is caught here rather than silently picking whichever one the SQL
+// query happens to return first.
+router.post('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId } = req.params;
+    const validationError = validatePriceRangeBody(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+    const { minPages, maxPages, priceBw, priceColor } = req.body;
+
+    const { rows: existing } = await pool.query(
+      `SELECT id, min_pages AS "minPages", max_pages AS "maxPages" FROM shop_price_ranges WHERE shop_id = $1`,
+      [shopId]
+    );
+    if (overlapsExistingRange({ minPages, maxPages }, existing, null)) {
+      return res.status(409).json({ error: 'This range overlaps one of your existing price ranges' });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO shop_price_ranges (id, shop_id, min_pages, max_pages, price_bw, price_color, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages",
+                 price_bw AS "priceBw", price_color AS "priceColor"`,
+      [randomUUID(), shopId, minPages, maxPages, priceBw, priceColor]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/shops/:shopId/price-ranges/:rangeId
+// Shop-owner-only. body: { minPages, maxPages, priceBw, priceColor } (all
+// required - editing a range replaces its bounds and prices wholesale
+// rather than patching individual fields, since a partial bounds edit
+// would need the same overlap re-check anyway).
+router.patch('/:shopId/price-ranges/:rangeId', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId, rangeId } = req.params;
+    const validationError = validatePriceRangeBody(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+    const { minPages, maxPages, priceBw, priceColor } = req.body;
+
+    const { rows: existing } = await pool.query(
+      `SELECT id, min_pages AS "minPages", max_pages AS "maxPages" FROM shop_price_ranges WHERE shop_id = $1`,
+      [shopId]
+    );
+    if (!existing.some((r) => r.id === rangeId)) {
+      return res.status(404).json({ error: 'Price range not found' });
+    }
+    if (overlapsExistingRange({ minPages, maxPages }, existing, rangeId)) {
+      return res.status(409).json({ error: 'This range overlaps one of your existing price ranges' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE shop_price_ranges
+       SET min_pages = $1, max_pages = $2, price_bw = $3, price_color = $4, updated_at = NOW()
+       WHERE id = $5 AND shop_id = $6
+       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages",
+                 price_bw AS "priceBw", price_color AS "priceColor"`,
+      [minPages, maxPages, priceBw, priceColor, rangeId, shopId]
+    );
+    return res.status(200).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/shops/:shopId/price-ranges/:rangeId
+// Shop-owner-only. Jobs already priced under a range keep their already-
+// computed amountDue (amountDue is stamped onto the job at creation time,
+// not re-derived later) - deleting a range only affects pricing for orders
+// placed after the deletion.
+router.delete('/:shopId/price-ranges/:rangeId', requireShopAuth, requireOwnShop, async (req, res, next) => {
+  try {
+    const { shopId, rangeId } = req.params;
+    const { rowCount } = await pool.query(
+      'DELETE FROM shop_price_ranges WHERE id = $1 AND shop_id = $2',
+      [rangeId, shopId]
+    );
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Price range not found' });
+    }
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 const IFSC_REGEX = /^[A-Z]{4}0[A-Z0-9]{6}$/;
 const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
 const BANK_ACCOUNT_REGEX = /^\d{9,18}$/;
@@ -1039,7 +1199,12 @@ router.get('/:shopId/public', async (req, res, next) => {
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Shop not found' });
     }
-    return res.status(200).json(rows[0]);
+    // priceRanges: volume pricing tiers (see calculateAmountDue), included
+    // here so the student app's checkout estimate can compute the exact
+    // same total the server will actually charge - an empty array just
+    // means this shop hasn't set any up, same as any other optional field.
+    const priceRanges = await getShopPriceRanges(shopId);
+    return res.status(200).json({ ...rows[0], priceRanges });
   } catch (err) {
     next(err);
   }
