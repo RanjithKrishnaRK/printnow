@@ -2008,14 +2008,58 @@ function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, onEdit
           <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-stone-500">
             Copies
           </label>
-          <input
-            type="number"
-            inputMode="numeric"
-            min={1}
-            value={doc.copies}
-            onChange={(e) => onChange({ copies: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3.5 py-2.5 text-sm shadow-sm shadow-stone-900/[0.03] focus:border-stone-500 focus:outline-none"
-          />
+          <div className="flex items-stretch rounded-lg border border-stone-300 bg-white shadow-sm shadow-stone-900/[0.03] overflow-hidden">
+            <button
+              type="button"
+              onClick={() => onChange({ copies: Math.max(1, doc.copies - 1) })}
+              disabled={doc.copies <= 1}
+              aria-label="Decrease copies"
+              className="w-10 shrink-0 text-lg font-medium text-stone-600 disabled:opacity-30 disabled:cursor-not-allowed active:bg-stone-100"
+            >
+              −
+            </button>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              value={doc.copies}
+              // select() on focus, not just click, so tapping straight into
+              // this field on mobile highlights the existing digit(s) -
+              // without it, typing "3" over a value of "1" appends instead
+              // of replacing (giving "13"), since number inputs don't
+              // select their text by default the way most native "amount"
+              // fields do.
+              onFocus={(e) => e.target.select()}
+              onChange={(e) => {
+                // Allow the field to go empty mid-edit (e.g. selecting all
+                // and starting to type a new number) without immediately
+                // snapping back to 1 - only clamped once there's an actual
+                // value, or on blur if it's left empty.
+                if (e.target.value === "") {
+                  onChange({ copies: "" });
+                  return;
+                }
+                const parsed = parseInt(e.target.value, 10);
+                if (Number.isFinite(parsed)) {
+                  onChange({ copies: Math.max(1, parsed) });
+                }
+              }}
+              onBlur={(e) => {
+                if (e.target.value === "" || Number(e.target.value) < 1) {
+                  onChange({ copies: 1 });
+                }
+              }}
+              className="w-full min-w-0 border-x border-stone-200 px-2 py-2.5 text-center text-sm focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => onChange({ copies: (doc.copies || 0) + 1 })}
+              aria-label="Increase copies"
+              className="w-10 shrink-0 text-lg font-medium text-stone-600 active:bg-stone-100"
+            >
+              +
+            </button>
+          </div>
         </div>
       </div>
 
