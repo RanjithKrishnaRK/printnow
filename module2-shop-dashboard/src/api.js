@@ -237,6 +237,58 @@ async function realUpdateSettings(shopId, token, patch) {
   return res.json(); // { autoPrintEnabled, priceBw, priceColor, maxPagesPerHour }
 }
 
+async function realGetPriceRanges(shopId, token) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/price-ranges`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Could not load your volume pricing.");
+  return res.json(); // [{ id, minPages, maxPages, priceBw, priceColor }]
+}
+
+async function realCreatePriceRange(shopId, token, range) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/price-ranges`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(range),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not add that price range.");
+  }
+  return res.json();
+}
+
+async function realUpdatePriceRange(shopId, token, rangeId, range) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/price-ranges/${rangeId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(range),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not update that price range.");
+  }
+  return res.json();
+}
+
+async function realDeletePriceRange(shopId, token, rangeId) {
+  const res = await fetch(`${BASE_URL}/api/shops/${shopId}/price-ranges/${rangeId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Could not remove that price range.");
+  }
+  return res.json();
+}
+
 // -----------------------------
 // Mock backend (used when USE_MOCK = true)
 // -----------------------------
@@ -661,6 +713,63 @@ async function mockGetCommissionPayments(token) {
   return [...mockCommissionPayments].sort((a, b) => (a.paidDate < b.paidDate ? 1 : -1));
 }
 
+let mockPriceRanges = [];
+let mockPriceRangeIdCounter = 1;
+
+function mockRangesOverlap(a, b) {
+  return a.minPages <= b.maxPages && a.maxPages >= b.minPages;
+}
+
+function validateMockPriceRange(range) {
+  const { minPages, maxPages, priceBw, priceColor } = range || {};
+  if (!Number.isInteger(minPages) || minPages < 1) throw new Error("minPages must be a positive integer");
+  if (!Number.isInteger(maxPages) || maxPages < minPages) {
+    throw new Error("maxPages must be an integer greater than or equal to minPages");
+  }
+  if (!Number.isInteger(priceBw) || priceBw < 1) throw new Error("priceBw must be a positive integer");
+  if (!Number.isInteger(priceColor) || priceColor < 1) throw new Error("priceColor must be a positive integer");
+}
+
+async function mockGetPriceRanges(token) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  return [...mockPriceRanges].sort((a, b) => a.minPages - b.minPages);
+}
+
+async function mockCreatePriceRange(token, range) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  validateMockPriceRange(range);
+  if (mockPriceRanges.some((r) => mockRangesOverlap(r, range))) {
+    throw new Error("This range overlaps one of your existing price ranges");
+  }
+  const created = { id: `mock-range-${mockPriceRangeIdCounter++}`, ...range };
+  mockPriceRanges.push(created);
+  return created;
+}
+
+async function mockUpdatePriceRange(token, rangeId, range) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  validateMockPriceRange(range);
+  const existing = mockPriceRanges.find((r) => r.id === rangeId);
+  if (!existing) throw new Error("Price range not found");
+  if (mockPriceRanges.some((r) => r.id !== rangeId && mockRangesOverlap(r, range))) {
+    throw new Error("This range overlaps one of your existing price ranges");
+  }
+  Object.assign(existing, range);
+  return existing;
+}
+
+async function mockDeletePriceRange(token, rangeId) {
+  await wait(150);
+  if (!isValidMockToken(token)) throw new Error("Session expired. Please log in again.");
+  const before = mockPriceRanges.length;
+  mockPriceRanges = mockPriceRanges.filter((r) => r.id !== rangeId);
+  if (mockPriceRanges.length === before) throw new Error("Price range not found");
+  return { ok: true };
+}
+
 // -----------------------------
 // Exported functions - these are what components call
 // -----------------------------
@@ -732,6 +841,24 @@ export function getSettlements(shopId, token) {
 
 export function getCommissionPayments(shopId, token) {
   return USE_MOCK ? mockGetCommissionPayments(token) : realGetCommissionPayments(shopId, token);
+}
+
+export function getPriceRanges(shopId, token) {
+  return USE_MOCK ? mockGetPriceRanges(token) : realGetPriceRanges(shopId, token);
+}
+
+export function createPriceRange(shopId, token, range) {
+  return USE_MOCK ? mockCreatePriceRange(token, range) : realCreatePriceRange(shopId, token, range);
+}
+
+export function updatePriceRange(shopId, token, rangeId, range) {
+  return USE_MOCK
+    ? mockUpdatePriceRange(token, rangeId, range)
+    : realUpdatePriceRange(shopId, token, rangeId, range);
+}
+
+export function deletePriceRange(shopId, token, rangeId) {
+  return USE_MOCK ? mockDeletePriceRange(token, rangeId) : realDeletePriceRange(shopId, token, rangeId);
 }
 
 export function updateSettings(shopId, token, patch) {
