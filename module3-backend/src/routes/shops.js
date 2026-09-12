@@ -809,12 +809,11 @@ router.patch('/:shopId/settings', requireShopAuth, requireOwnShop, async (req, r
 
 // Shared by both order-creation routes (POST .../jobs, POST .../batches) to
 // fetch a shop's ranges once before pricing a document - pricing.js's
-// calculateAmountDue takes plain { minPages, maxPages, priceBw, priceColor }
-// objects, same shape as what the CRUD routes below already return.
+// calculateAmountDue takes plain { minPages, maxPages, price } objects,
+// same shape as what the CRUD routes below already return.
 async function getShopPriceRanges(shopId) {
   const { rows } = await pool.query(
-    `SELECT min_pages AS "minPages", max_pages AS "maxPages",
-            price_bw AS "priceBw", price_color AS "priceColor"
+    `SELECT min_pages AS "minPages", max_pages AS "maxPages", price
      FROM shop_price_ranges WHERE shop_id = $1 ORDER BY min_pages ASC`,
     [shopId]
   );
@@ -828,31 +827,28 @@ function overlapsExistingRange(newRange, existingRanges, excludeId) {
 }
 
 function validatePriceRangeBody(body) {
-  const { minPages, maxPages, priceBw, priceColor } = body || {};
+  const { minPages, maxPages, price } = body || {};
   if (!Number.isInteger(minPages) || minPages < 1) {
     return 'minPages must be a positive integer';
   }
   if (!Number.isInteger(maxPages) || maxPages < minPages) {
     return 'maxPages must be an integer greater than or equal to minPages';
   }
-  if (!Number.isInteger(priceBw) || priceBw < 1) {
-    return 'priceBw must be a positive integer (INR per page)';
-  }
-  if (!Number.isInteger(priceColor) || priceColor < 1) {
-    return 'priceColor must be a positive integer (INR per page)';
+  if (!Number.isInteger(price) || price < 1) {
+    return 'price must be a positive integer (INR) - the flat total for any job in this range';
   }
   return null;
 }
 
 // GET /api/shops/:shopId/price-ranges
-// Shop-owner-only. -> [{ id, minPages, maxPages, priceBw, priceColor }],
-// sorted by minPages so the shop's Settings screen can just render them in
-// order without re-sorting client-side.
+// Shop-owner-only. -> [{ id, minPages, maxPages, price }], sorted by
+// minPages so the shop's Settings screen can just render them in order
+// without re-sorting client-side. `price` is a flat total for the whole
+// job (not per-page) - see pricing.js's calculateAmountDue.
 router.get('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, min_pages AS "minPages", max_pages AS "maxPages",
-              price_bw AS "priceBw", price_color AS "priceColor"
+      `SELECT id, min_pages AS "minPages", max_pages AS "maxPages", price
        FROM shop_price_ranges WHERE shop_id = $1 ORDER BY min_pages ASC`,
       [req.params.shopId]
     );
@@ -863,7 +859,10 @@ router.get('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req,
 });
 
 // POST /api/shops/:shopId/price-ranges
-// Shop-owner-only. body: { minPages, maxPages, priceBw, priceColor } -> the created row
+// Shop-owner-only. body: { minPages, maxPages, price } -> the created row
+// Only ever applies to a job that's purely B&W and single-sided - any
+// color content or double-sided printing always uses the shop's normal
+// per-page pricing instead, regardless of ranges (see calculateAmountDue).
 // Rejected if it overlaps any of this shop's existing ranges - two ranges
 // both claiming to cover "12 total pages" would make pricing ambiguous, so
 // this is caught here rather than silently picking whichever one the SQL
@@ -875,7 +874,7 @@ router.post('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req
     if (validationError) {
       return res.status(400).json({ error: validationError });
     }
-    const { minPages, maxPages, priceBw, priceColor } = req.body;
+    const { minPages, maxPages, price } = req.body;
 
     const { rows: existing } = await pool.query(
       `SELECT id, min_pages AS "minPages", max_pages AS "maxPages" FROM shop_price_ranges WHERE shop_id = $1`,
@@ -886,11 +885,10 @@ router.post('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO shop_price_ranges (id, shop_id, min_pages, max_pages, price_bw, price_color, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages",
-                 price_bw AS "priceBw", price_color AS "priceColor"`,
-      [randomUUID(), shopId, minPages, maxPages, priceBw, priceColor]
+      `INSERT INTO shop_price_ranges (id, shop_id, min_pages, max_pages, price, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages", price`,
+      [randomUUID(), shopId, minPages, maxPages, price]
     );
     return res.status(201).json(rows[0]);
   } catch (err) {
@@ -899,10 +897,10 @@ router.post('/:shopId/price-ranges', requireShopAuth, requireOwnShop, async (req
 });
 
 // PATCH /api/shops/:shopId/price-ranges/:rangeId
-// Shop-owner-only. body: { minPages, maxPages, priceBw, priceColor } (all
-// required - editing a range replaces its bounds and prices wholesale
-// rather than patching individual fields, since a partial bounds edit
-// would need the same overlap re-check anyway).
+// Shop-owner-only. body: { minPages, maxPages, price } (all required -
+// editing a range replaces its bounds and price wholesale rather than
+// patching individual fields, since a partial bounds edit would need the
+// same overlap re-check anyway).
 router.patch('/:shopId/price-ranges/:rangeId', requireShopAuth, requireOwnShop, async (req, res, next) => {
   try {
     const { shopId, rangeId } = req.params;
@@ -910,7 +908,7 @@ router.patch('/:shopId/price-ranges/:rangeId', requireShopAuth, requireOwnShop, 
     if (validationError) {
       return res.status(400).json({ error: validationError });
     }
-    const { minPages, maxPages, priceBw, priceColor } = req.body;
+    const { minPages, maxPages, price } = req.body;
 
     const { rows: existing } = await pool.query(
       `SELECT id, min_pages AS "minPages", max_pages AS "maxPages" FROM shop_price_ranges WHERE shop_id = $1`,
@@ -925,11 +923,10 @@ router.patch('/:shopId/price-ranges/:rangeId', requireShopAuth, requireOwnShop, 
 
     const { rows } = await pool.query(
       `UPDATE shop_price_ranges
-       SET min_pages = $1, max_pages = $2, price_bw = $3, price_color = $4, updated_at = NOW()
-       WHERE id = $5 AND shop_id = $6
-       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages",
-                 price_bw AS "priceBw", price_color AS "priceColor"`,
-      [minPages, maxPages, priceBw, priceColor, rangeId, shopId]
+       SET min_pages = $1, max_pages = $2, price = $3, updated_at = NOW()
+       WHERE id = $4 AND shop_id = $5
+       RETURNING id, min_pages AS "minPages", max_pages AS "maxPages", price`,
+      [minPages, maxPages, price, rangeId, shopId]
     );
     return res.status(200).json(rows[0]);
   } catch (err) {

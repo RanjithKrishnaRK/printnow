@@ -733,28 +733,54 @@ async function migrate() {
 
   // Migration: volume/range pricing - customizable per-shop pricing tiers
   // based on TOTAL printable pages across a document's copies (pages x
-  // copies), single-sided only (see pricing.js's calculateAmountDue for
-  // the full reasoning). A shop with no rows in this table just keeps
-  // billing every job at their normal flat per-page rate, exactly as
-  // before this feature existed - ranges are entirely opt-in.
+  // copies), for pure B&W jobs only. A shop with no rows in this table
+  // just keeps billing every job at their normal flat per-page rate,
+  // exactly as before this feature existed - ranges are entirely opt-in.
+  //
+  // Each range holds one FLAT price for the whole job, not a per-page
+  // rate - a job whose total lands anywhere in a "2-3 pages" range costs
+  // exactly that range's price, whether it's 2 pages or 3. Any job with
+  // color in it (pure color, or mixed bw+color) skips ranges entirely and
+  // always uses the shop's normal per-page bw/color pricing - see
+  // pricing.js's calculateAmountDue for the full reasoning. Single-sided
+  // only, same as before - a double-sided job also always uses the
+  // existing double-sided sheet pricing, untouched by any ranges.
   //
   // min_pages/max_pages are inclusive; overlapping ranges for the same
-  // shop are rejected at the API layer (routes/priceRanges.js), not
-  // enforced here at the DB level, since Postgres range-overlap
-  // constraints (exclusion constraints) would need the btree_gist
-  // extension - not worth the extra dependency for something a normal
-  // application-level check already covers cleanly.
+  // shop are rejected at the API layer (routes/shops.js), not enforced
+  // here at the DB level, since Postgres range-overlap constraints
+  // (exclusion constraints) would need the btree_gist extension - not
+  // worth the extra dependency for something a normal application-level
+  // check already covers cleanly.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shop_price_ranges (
       id          TEXT PRIMARY KEY,
       shop_id     TEXT NOT NULL REFERENCES shops(id),
       min_pages   INTEGER NOT NULL CHECK (min_pages >= 1),
       max_pages   INTEGER NOT NULL CHECK (max_pages >= min_pages),
-      price_bw    INTEGER NOT NULL CHECK (price_bw >= 1),
-      price_color INTEGER NOT NULL CHECK (price_color >= 1),
+      price       INTEGER NOT NULL CHECK (price >= 1),
       created_at  TIMESTAMPTZ NOT NULL,
       updated_at  TIMESTAMPTZ NOT NULL
     );
+  `);
+  // Defensive reshape, in case this table was already created earlier this
+  // session with the previous per-page-per-color-mode shape (price_bw +
+  // price_color) before the design changed to a single flat price -
+  // backfills `price` from whatever price_bw had, then drops both old
+  // columns. A no-op on a fresh database where the table was just created
+  // above with the right shape already.
+  await pool.query(`
+    ALTER TABLE shop_price_ranges ADD COLUMN IF NOT EXISTS price INTEGER;
+  `);
+  await pool.query(`
+    UPDATE shop_price_ranges SET price = price_bw
+    WHERE price IS NULL AND price_bw IS NOT NULL;
+  `).catch(() => {}); // price_bw may not exist on a fresh table - fine either way
+  await pool.query(`
+    ALTER TABLE shop_price_ranges DROP COLUMN IF EXISTS price_bw;
+  `);
+  await pool.query(`
+    ALTER TABLE shop_price_ranges DROP COLUMN IF EXISTS price_color;
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS shop_price_ranges_shop_id_idx ON shop_price_ranges (shop_id);
