@@ -4,10 +4,12 @@ import { getPriceRanges, createPriceRange, updatePriceRange, deletePriceRange } 
 // Shop-customizable pricing tiers by TOTAL printable pages across a
 // document's copies (pages x copies) - e.g. 2 copies of a 5-page document
 // (10 total pages) can be priced differently than a single 5-page copy.
-// A matching range's rate REPLACES the shop's normal per-page rate
-// entirely for that job - it's not an add-on. Single-sided only: a
-// double-sided job always uses the double-sided pricing from the section
-// above, completely unaffected by anything set here.
+// A matching range's price is a FLAT total for the whole job, not a
+// per-page rate - any order whose total lands inside a "2-3 pages" range
+// costs exactly that range's price, whether it's 2 pages or 3. Only
+// applies to jobs that are purely black & white, single-sided - any color
+// content, or double-sided printing, always uses the normal pricing above
+// instead, untouched.
 export default function VolumePricing({ shopId, token }) {
   const [ranges, setRanges] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -16,8 +18,7 @@ export default function VolumePricing({ shopId, token }) {
 
   const [minPages, setMinPages] = useState("");
   const [maxPages, setMaxPages] = useState("");
-  const [priceBw, setPriceBw] = useState("");
-  const [priceColor, setPriceColor] = useState("");
+  const [price, setPrice] = useState("");
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState(null);
@@ -38,8 +39,7 @@ export default function VolumePricing({ shopId, token }) {
   function resetForm() {
     setMinPages("");
     setMaxPages("");
-    setPriceBw("");
-    setPriceColor("");
+    setPrice("");
     setFormError("");
   }
 
@@ -55,8 +55,7 @@ export default function VolumePricing({ shopId, token }) {
   function startEdit(r) {
     setMinPages(String(r.minPages));
     setMaxPages(String(r.maxPages));
-    setPriceBw(String(r.priceBw));
-    setPriceColor(String(r.priceColor));
+    setPrice(String(r.price));
     setFormError("");
     setEditingId(r.id);
   }
@@ -66,24 +65,20 @@ export default function VolumePricing({ shopId, token }) {
     setFormError("");
     const min = parseInt(minPages, 10);
     const max = parseInt(maxPages, 10);
-    const bw = parseInt(priceBw, 10);
-    const color = parseInt(priceColor, 10);
+    const flatPrice = parseInt(price, 10);
     if (!Number.isInteger(min) || min < 1) {
       return setFormError("Minimum pages must be a whole number of at least 1.");
     }
     if (!Number.isInteger(max) || max < min) {
       return setFormError("Maximum pages must be a whole number greater than or equal to the minimum.");
     }
-    if (!Number.isInteger(bw) || bw < 1) {
-      return setFormError("B&W price must be a whole number of at least ₹1.");
-    }
-    if (!Number.isInteger(color) || color < 1) {
-      return setFormError("Color price must be a whole number of at least ₹1.");
+    if (!Number.isInteger(flatPrice) || flatPrice < 1) {
+      return setFormError("Price must be a whole number of at least ₹1.");
     }
 
     setSaving(true);
     try {
-      const range = { minPages: min, maxPages: max, priceBw: bw, priceColor: color };
+      const range = { minPages: min, maxPages: max, price: flatPrice };
       if (editingId === "new") {
         await createPriceRange(shopId, token, range);
       } else {
@@ -118,10 +113,12 @@ export default function VolumePricing({ shopId, token }) {
     <div className="bg-card rounded-xl shadow-sm border border-black/5 p-6 max-w-xl">
       <h2 className="font-display font-bold text-lg text-ink mb-1">Volume pricing</h2>
       <p className="text-sm text-collected mb-4">
-        Price by total pages printed (pages × copies) - e.g. 2 copies of a 5-page document counts
-        as 10 total pages. A matching range replaces your normal per-page price for that order.
-        Single-sided only; double-sided pricing above is unaffected. Orders outside every range
-        below use your normal pricing.
+        A flat price for black &amp; white orders, by total pages printed (pages × copies) - e.g.
+        2 copies of a 5-page document counts as 10 total pages. Any order whose total lands in a
+        range costs exactly that range's price, no matter where in the range it falls. Only
+        applies to purely black &amp; white, single-sided orders - any order with color, or any
+        double-sided order, always uses your normal pricing above instead. Orders outside every
+        range below also use your normal pricing.
       </p>
 
       {loading ? (
@@ -146,7 +143,7 @@ export default function VolumePricing({ shopId, token }) {
               >
                 <div>
                   <p className="text-sm font-medium text-ink">{r.minPages}-{r.maxPages} total pages</p>
-                  <p className="text-xs text-collected">₹{r.priceBw}/page b&amp;w · ₹{r.priceColor}/page color</p>
+                  <p className="text-xs text-collected">₹{r.price} flat, black &amp; white only</p>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
                   <button
@@ -197,31 +194,20 @@ export default function VolumePricing({ shopId, token }) {
                   />
                 </div>
               </div>
-              <div className="grid grid-cols-2 gap-3 mb-3">
-                <div>
-                  <label className="block text-xs font-medium text-ink mb-1">₹/page, B&amp;W</label>
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    required
-                    value={priceBw}
-                    onChange={(e) => setPriceBw(e.target.value)}
-                    className="w-full rounded-lg border border-black/10 px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-ink mb-1">₹/page, color</label>
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    required
-                    value={priceColor}
-                    onChange={(e) => setPriceColor(e.target.value)}
-                    className="w-full rounded-lg border border-black/10 px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal"
-                  />
-                </div>
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-ink mb-1">
+                  Flat price for this range (₹) - b&amp;w only
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  required
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value)}
+                  placeholder="e.g. 10"
+                  className="w-full rounded-lg border border-black/10 px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-teal/40 focus:border-teal"
+                />
               </div>
 
               {formError && <p className="text-xs text-red-600 mb-3">{formError}</p>}

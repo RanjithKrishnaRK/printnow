@@ -721,13 +721,12 @@ function mockRangesOverlap(a, b) {
 }
 
 function validateMockPriceRange(range) {
-  const { minPages, maxPages, priceBw, priceColor } = range || {};
+  const { minPages, maxPages, price } = range || {};
   if (!Number.isInteger(minPages) || minPages < 1) throw new Error("minPages must be a positive integer");
   if (!Number.isInteger(maxPages) || maxPages < minPages) {
     throw new Error("maxPages must be an integer greater than or equal to minPages");
   }
-  if (!Number.isInteger(priceBw) || priceBw < 1) throw new Error("priceBw must be a positive integer");
-  if (!Number.isInteger(priceColor) || priceColor < 1) throw new Error("priceColor must be a positive integer");
+  if (!Number.isInteger(price) || price < 1) throw new Error("price must be a positive integer");
 }
 
 async function mockGetPriceRanges(token) {
