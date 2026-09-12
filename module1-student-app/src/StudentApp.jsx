@@ -870,7 +870,27 @@ function parsePageRange(input, maxPages) {
 // time. `colorPageSet` (not just a count) is required for the mixed +
 // double-sided case, which needs to know WHICH pages are color to pair
 // them into sheets correctly - see deriveDocument's call site.
-function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides }) {
+// Mirrors module3-backend/src/pricing.js's pickPriceRange: finds the
+// shop-defined volume-pricing range (if any) that a given total page count
+// falls into. Ranges are inclusive on both ends.
+function pickPriceRange(totalPages, priceRanges) {
+  if (!Array.isArray(priceRanges) || priceRanges.length === 0) return null;
+  return priceRanges.find((r) => totalPages >= r.minPages && totalPages <= r.maxPages) || null;
+}
+
+// Mirrors module3-backend/src/pricing.js's calculateAmountDue exactly -
+// same bw/color x single/double resolution, the same per-SHEET billing for
+// double-sided (two pages share one physical sheet, so a 6-page
+// double-sided document costs 3x the double rate, not 6x; an odd page
+// count leaves one unpaired final page, billed single-sided at the
+// ordinary single-sided rate), and the same volume/range pricing (a shop's
+// custom per-page rate for a given TOTAL page count across all copies,
+// single-sided only - see pickPriceRange above) - so this preview can
+// never show a different total than what the server actually charges at
+// order-creation time. `colorPageSet` (not just a count) is required for
+// the mixed + double-sided case, which needs to know WHICH pages are
+// color to pair them into sheets correctly - see deriveDocument's call site.
+function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides, priceRanges }) {
   const r = rates || RATE_PER_PAGE;
   const double = sides === "double";
   const bwSingle = r.bw;
@@ -878,11 +898,20 @@ function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides 
   const bwDouble = r.bwDouble != null ? r.bwDouble : r.bw;
   const colorDouble = r.colorDouble != null ? r.colorDouble : r.color;
 
+  // Volume pricing only applies single-sided - see pricing.js for the
+  // full reasoning. Computed once so both the mixed and non-mixed paths
+  // below can use it.
+  const matchedRange = !double ? pickPriceRange(pages * copies, priceRanges) : null;
+
   if (colorMode === "mixed") {
     const set = colorPageSet || new Set();
+    const colorPageCount = set.size;
+    const bwPages = Math.max(0, pages - colorPageCount);
+
+    if (matchedRange) {
+      return colorPageCount * copies * matchedRange.priceColor + bwPages * copies * matchedRange.priceBw;
+    }
     if (!double) {
-      const colorPageCount = set.size;
-      const bwPages = Math.max(0, pages - colorPageCount);
       return (colorPageCount * colorSingle + bwPages * bwSingle) * copies;
     }
     const fullSheets = Math.floor(pages / 2);
@@ -897,6 +926,11 @@ function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides 
       total += set.has(pages) ? colorSingle : bwSingle;
     }
     return total * copies;
+  }
+
+  if (matchedRange) {
+    const rangeRate = colorMode === "color" ? matchedRange.priceColor : matchedRange.priceBw;
+    return rangeRate * pages * copies;
   }
 
   if (!double) {
@@ -953,6 +987,12 @@ const MOCK_SHOP_PUBLIC_INFO = {
     priceColorDouble: 18,
     maxPagesPerHour: 500,
     upiId: "sharmaxerox@okhdfcbank",
+    // Seeded volume-pricing tiers, to demo the feature - real shops set
+    // these in their own Settings (VolumePricing.jsx).
+    priceRanges: [
+      { minPages: 1, maxPages: 9, priceBw: 4, priceColor: 15 },
+      { minPages: 10, maxPages: 19, priceBw: 2, priceColor: 12 },
+    ],
   },
   "demo-shop-2": {
     shopId: "demo-shop-2",
@@ -965,6 +1005,8 @@ const MOCK_SHOP_PUBLIC_INFO = {
     priceColorDouble: 12,
     maxPagesPerHour: null,
     upiId: null,
+    // No volume pricing set - every order uses the normal rate above.
+    priceRanges: [],
   },
 };
 
@@ -988,6 +1030,7 @@ const mockApi = {
         priceBwDouble: RATE_PER_PAGE.bw,
         priceColorDouble: RATE_PER_PAGE.color,
         maxPagesPerHour: null,
+        priceRanges: [],
       }
     );
   },
@@ -1354,7 +1397,7 @@ const realApi = {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.error || "Could not load this shop's pricing");
     }
-    return res.json(); // { shopId, name, priceBw, priceColor, maxPagesPerHour, upiId, address, latitude, longitude }
+    return res.json(); // { shopId, name, priceBw, priceColor, priceBwDouble, priceColorDouble, priceRanges, maxPagesPerHour, upiId, address, latitude, longitude }
   },
   // Module 3 (src/routes/uploads.js) expects multipart/form-data with a
   // "file" field, not a pre-signed URL flow - this sends the PDF directly.
@@ -1860,7 +1903,7 @@ function ratesFromShopInfo(shopInfo) {
 // Derives pagesNum/colorPageCount/rangeError/estimate for one document -
 // shared between DocumentSettingsCard (per-doc display) and UploadStep
 // (total estimate, submit validation).
-function deriveDocument(doc, rates) {
+function deriveDocument(doc, rates, priceRanges) {
   const totalPages = parseInt(doc.pages, 10) || 0;
 
   // "Print only some pages" - if set, this (not totalPages) is what
@@ -1888,6 +1931,7 @@ function deriveDocument(doc, rates) {
           colorPageSet: rangeResult ? rangeResult.pages : null,
           rates,
           sides: doc.sides,
+          priceRanges,
         })
       : 0;
   return { pagesNum: totalPages, printPagesNum, selectionError, colorPageCount, rangeError, estimate };
@@ -1902,7 +1946,8 @@ function deriveDocument(doc, rates) {
 function DocumentSettingsCard({ doc, index, shopInfo, onChange, onRemove, onEdit, showRemove }) {
   const { pagesNum, printPagesNum, selectionError, colorPageCount, rangeError, estimate } = deriveDocument(
     doc,
-    ratesFromShopInfo(shopInfo)
+    ratesFromShopInfo(shopInfo),
+    shopInfo?.priceRanges
   );
   const [previewOpen, setPreviewOpen] = useState(false);
   const [selectingPages, setSelectingPages] = useState(!!doc.pageSelection.trim());
@@ -2542,7 +2587,7 @@ function UploadStep({ shopId, order, setOrder, onOrderCreated, onOpenRecent, onB
   }
 
   const rates = ratesFromShopInfo(shopInfo);
-  const derivedDocs = documents.map((d) => deriveDocument(d, rates));
+  const derivedDocs = documents.map((d) => deriveDocument(d, rates, shopInfo?.priceRanges));
   const totalEstimate = derivedDocs.reduce((sum, d) => sum + d.estimate, 0);
 
   const allDocsValid =
