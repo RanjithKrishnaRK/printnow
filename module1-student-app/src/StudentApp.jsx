@@ -860,16 +860,6 @@ function parsePageRange(input, maxPages) {
   return { pages, error: null };
 }
 
-// Mirrors module3-backend/src/pricing.js's calculateAmountDue exactly -
-// same bw/color x single/double resolution AND the same per-SHEET billing
-// for double-sided (two pages share one physical sheet, so a 6-page
-// double-sided document costs 3x the double rate, not 6x; an odd page
-// count leaves one unpaired final page, billed single-sided at the
-// ordinary single-sided rate) - so this preview can never show a
-// different total than what the server actually charges at order-creation
-// time. `colorPageSet` (not just a count) is required for the mixed +
-// double-sided case, which needs to know WHICH pages are color to pair
-// them into sheets correctly - see deriveDocument's call site.
 // Mirrors module3-backend/src/pricing.js's pickPriceRange: finds the
 // shop-defined volume-pricing range (if any) that a given total page count
 // falls into. Ranges are inclusive on both ends.
@@ -883,13 +873,16 @@ function pickPriceRange(totalPages, priceRanges) {
 // double-sided (two pages share one physical sheet, so a 6-page
 // double-sided document costs 3x the double rate, not 6x; an odd page
 // count leaves one unpaired final page, billed single-sided at the
-// ordinary single-sided rate), and the same volume/range pricing (a shop's
-// custom per-page rate for a given TOTAL page count across all copies,
-// single-sided only - see pickPriceRange above) - so this preview can
-// never show a different total than what the server actually charges at
-// order-creation time. `colorPageSet` (not just a count) is required for
-// the mixed + double-sided case, which needs to know WHICH pages are
-// color to pair them into sheets correctly - see deriveDocument's call site.
+// ordinary single-sided rate), and the same volume/range pricing - a
+// matched range (see pickPriceRange above) is a FLAT price for the whole
+// job, not a per-page rate, and only ever applies to a job that's purely
+// black & white AND single-sided; any color content ("color" or "mixed")
+// or double-sided printing always uses the normal per-page pricing below
+// instead, untouched - so this preview can never show a different total
+// than what the server actually charges at order-creation time.
+// `colorPageSet` (not just a count) is required for the mixed +
+// double-sided case, which needs to know WHICH pages are color to pair
+// them into sheets correctly - see deriveDocument's call site.
 function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides, priceRanges }) {
   const r = rates || RATE_PER_PAGE;
   const double = sides === "double";
@@ -898,19 +891,21 @@ function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides,
   const bwDouble = r.bwDouble != null ? r.bwDouble : r.bw;
   const colorDouble = r.colorDouble != null ? r.colorDouble : r.color;
 
-  // Volume pricing only applies single-sided - see pricing.js for the
-  // full reasoning. Computed once so both the mixed and non-mixed paths
-  // below can use it.
-  const matchedRange = !double ? pickPriceRange(pages * copies, priceRanges) : null;
+  // Volume pricing only applies to a job that's purely bw, single-sided -
+  // see the comment above. "mixed" and "color" always fall through to the
+  // normal per-page pricing further down, same as if no ranges existed.
+  if (colorMode === "bw" && !double) {
+    const matchedRange = pickPriceRange(pages * copies, priceRanges);
+    if (matchedRange) {
+      return matchedRange.price;
+    }
+  }
 
   if (colorMode === "mixed") {
     const set = colorPageSet || new Set();
     const colorPageCount = set.size;
     const bwPages = Math.max(0, pages - colorPageCount);
 
-    if (matchedRange) {
-      return colorPageCount * copies * matchedRange.priceColor + bwPages * copies * matchedRange.priceBw;
-    }
     if (!double) {
       return (colorPageCount * colorSingle + bwPages * bwSingle) * copies;
     }
@@ -926,11 +921,6 @@ function computeEstimate({ pages, copies, colorMode, colorPageSet, rates, sides,
       total += set.has(pages) ? colorSingle : bwSingle;
     }
     return total * copies;
-  }
-
-  if (matchedRange) {
-    const rangeRate = colorMode === "color" ? matchedRange.priceColor : matchedRange.priceBw;
-    return rangeRate * pages * copies;
   }
 
   if (!double) {
@@ -988,10 +978,11 @@ const MOCK_SHOP_PUBLIC_INFO = {
     maxPagesPerHour: 500,
     upiId: "sharmaxerox@okhdfcbank",
     // Seeded volume-pricing tiers, to demo the feature - real shops set
-    // these in their own Settings (VolumePricing.jsx).
+    // these in their own Settings (VolumePricing.jsx). Flat prices, b&w
+    // only - a job with any color skips these entirely.
     priceRanges: [
-      { minPages: 1, maxPages: 9, priceBw: 4, priceColor: 15 },
-      { minPages: 10, maxPages: 19, priceBw: 2, priceColor: 12 },
+      { minPages: 1, maxPages: 3, price: 10 },
+      { minPages: 4, maxPages: 9, price: 20 },
     ],
   },
   "demo-shop-2": {
